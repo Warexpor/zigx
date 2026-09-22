@@ -1926,7 +1926,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         d.fade = saved_fade;
     }
     d.clip = None;
-    draw_header(d, &cols, header, state.sort);
+    draw_header(d, &cols, header, state.sort, state.held.is_some());
     d.hairline(Rect::new(inner.x, hair_y, inner.w, 1.0));
     scrollbar(
         d,
@@ -1992,27 +1992,48 @@ enum Row<'a> {
 }
 
 fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
-    let q = state.query.to_ascii_lowercase();
-    let mut procs: Vec<&Proc> = snap
-        .procs
-        .iter()
-        .filter(|p| match state.view {
-            ProcView::User => p.is_user,
-            ProcView::System => !p.is_user,
-            _ => true,
-        })
-        .filter(|p| {
-            if q.is_empty() {
-                return true;
-            }
-            p.name.to_ascii_lowercase().contains(&q)
-                || p.user.to_ascii_lowercase().contains(&q)
-                || p.pid.to_string().contains(q.trim())
-        })
-        .collect();
-    sort_procs(&mut procs, state.sort.col, state.sort.desc);
+    // A held Space replays the last arrangement. Live values still come from
+    // the snapshot; only the order is frozen. New processes wait until release.
+    let (procs, pin) = if let Some(order) = &state.held {
+        let by_pid: std::collections::HashMap<i32, &Proc> =
+            snap.procs.iter().map(|p| (p.pid, p)).collect();
+        let procs = order
+            .iter()
+            .filter_map(|pid| by_pid.get(pid).copied())
+            .collect();
+        (procs, false)
+    } else {
+        let q = state.query.to_ascii_lowercase();
+        let mut procs: Vec<&Proc> = snap
+            .procs
+            .iter()
+            .filter(|p| match state.view {
+                ProcView::User => p.is_user,
+                ProcView::System => !p.is_user,
+                _ => true,
+            })
+            .filter(|p| {
+                if q.is_empty() {
+                    return true;
+                }
+                p.name.to_ascii_lowercase().contains(&q)
+                    || p.user.to_ascii_lowercase().contains(&q)
+                    || p.pid.to_string().contains(q.trim())
+            })
+            .collect();
+        sort_procs(&mut procs, state.sort.col, state.sort.desc);
+        (procs, true)
+    };
+    arrange_rows(state, procs, pin)
+}
+
+fn arrange_rows<'a>(state: &AppState, procs: Vec<&'a Proc>, pin: bool) -> Vec<Row<'a>> {
     if state.view != ProcView::Grouped {
-        let procs = pin_procs(procs, &state.pinned, 0);
+        let procs = if pin {
+            pin_procs(procs, &state.pinned, 0)
+        } else {
+            procs
+        };
         return procs.into_iter().map(Row::Proc).collect();
     }
     let mut user: Vec<&Proc> = Vec::new();
@@ -2034,7 +2055,11 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
     let mut pin_base = 0usize;
     if state.user_open {
         let n = user.len();
-        let user = pin_procs(user, &state.pinned, pin_base);
+        let user = if pin {
+            pin_procs(user, &state.pinned, pin_base)
+        } else {
+            user
+        };
         pin_base += n;
         rows.extend(user.into_iter().map(Row::Proc));
     }
@@ -2045,7 +2070,11 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
         user: false,
     });
     if state.system_open {
-        let system = pin_procs(system, &state.pinned, pin_base);
+        let system = if pin {
+            pin_procs(system, &state.pinned, pin_base)
+        } else {
+            system
+        };
         rows.extend(system.into_iter().map(Row::Proc));
     }
     rows
@@ -2151,11 +2180,24 @@ fn columns(density: Density, prefs: &Settings, width: f32) -> Vec<ColSpec> {
             (Col::Cpu, 72.0, true, true),
         ]
     };
-    let spec: Vec<(Col, f32, bool, bool)> = all
+    let mut spec: Vec<(Col, f32, bool, bool)> = all
         .iter()
         .copied()
         .filter(|(c, ..)| prefs.shows(*c))
         .collect();
+    // The slice is stored right to left. Drop optional columns from the right
+    // until Name still has room; CPU and Memory always stay. Without this, a
+    // narrow window places CPU at a negative x, under the name or off the pane.
+    const NAME_MIN: f32 = 96.0;
+    while spec.iter().map(|(_, w, _, _)| *w).sum::<f32>() + 14.0 + NAME_MIN > width {
+        let Some(i) = spec
+            .iter()
+            .position(|(c, ..)| !matches!(*c, Col::Cpu | Col::Memory))
+        else {
+            break;
+        };
+        spec.remove(i);
+    }
     let fixed: f32 = spec.iter().map(|(_, w, _, _)| *w).sum();
     let x = width - fixed;
     let mut cols = vec![ColSpec {
@@ -2194,7 +2236,7 @@ fn col_title(col: Col) -> &'static str {
 
 /// Column titles. The sorted column brightens and shows a caret that
 /// flattens and flips when the direction changes.
-fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
+fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort, held: bool) {
     for c in cols {
         let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
         let active = c.col == sort.col;
@@ -2205,6 +2247,15 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
             d.text_r(title, r, MICRO, color);
         } else {
             d.text(title, r, MICRO, color);
+        }
+        // The hold flag sits in the name cell, opposite the title, so a frozen
+        // list does not look like a stalled sort.
+        if held && c.col == Col::Name {
+            let flag = measure("HELD", MICRO);
+            let title_w = measure(&title.to_uppercase(), MICRO);
+            if r.w > title_w + flag + 16.0 {
+                d.text_r("held", r, MICRO, theme::INK_4);
+            }
         }
         if on > 0.0 {
             let tw = measure(&title.to_uppercase(), MICRO);
@@ -3477,8 +3528,9 @@ fn switch(d: &mut DrawList, r: Rect, on: bool, id: Key) {
 
 #[cfg(test)]
 mod tests {
-    use super::{animating, build, sample_hist};
-    use crate::model::{AppState, Page, Proc, Snap};
+    use super::{animating, build, columns, sample_hist};
+    use crate::model::{AppState, Col, Density, Page, Proc, Snap};
+    use crate::settings::Settings;
 
     fn proc(pid: i32, cpu: f32) -> Proc {
         Proc {
@@ -3507,6 +3559,64 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
         false
+    }
+
+    #[test]
+    fn space_holds_the_process_arrangement() {
+        use crate::interact::{end_hold, on_key, KeyIn};
+        use crate::model::ProcView;
+
+        let mut snap = Snap::placeholder();
+        snap.procs = vec![proc(1, 10.0), proc(2, 50.0), proc(3, 30.0)];
+        let mut state = AppState::new(1240.0, 780.0);
+        state.view = ProcView::Flat;
+        state.settings.animations = false;
+        build(&mut state, &snap, &[], [0.0, 0.0]);
+        let order = state.visible_pids.clone();
+        assert_eq!(order, vec![2, 3, 1]);
+
+        on_key(&mut state, KeyIn::Char(' '), false);
+        assert_eq!(state.held.as_deref(), Some(order.as_slice()));
+        snap.procs.iter_mut().find(|p| p.pid == 1).unwrap().cpu = 99.0;
+        snap.procs.retain(|p| p.pid != 3);
+        // A repeat must keep the original capture, not the list after a death.
+        on_key(&mut state, KeyIn::Char(' '), false);
+        build(&mut state, &snap, &[], [0.0, 0.0]);
+        assert_eq!(state.visible_pids, vec![2, 1]);
+        assert_eq!(state.held.as_deref(), Some(order.as_slice()));
+
+        assert!(end_hold(&mut state));
+        build(&mut state, &snap, &[], [0.0, 0.0]);
+        assert_eq!(state.visible_pids, vec![1, 2]);
+    }
+
+    #[test]
+    fn narrow_list_drops_columns_from_the_right() {
+        let prefs = Settings::default();
+        let wide: Vec<Col> = columns(Density::Comfortable, &prefs, 900.0)
+            .iter()
+            .map(|c| c.col)
+            .collect();
+        assert_eq!(
+            wide,
+            vec![
+                Col::Name,
+                Col::Cpu,
+                Col::Gpu,
+                Col::Memory,
+                Col::Disk,
+                Col::Pid,
+                Col::User,
+                Col::Threads,
+            ]
+        );
+        let narrow = columns(Density::Comfortable, &prefs, 420.0);
+        let cols: Vec<Col> = narrow.iter().map(|c| c.col).collect();
+        assert_eq!(cols, vec![Col::Name, Col::Cpu, Col::Gpu, Col::Memory]);
+        assert!(
+            narrow.iter().all(|c| c.x >= 0.0),
+            "columns stay inside the list"
+        );
     }
 
     #[test]

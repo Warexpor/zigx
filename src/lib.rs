@@ -19,8 +19,8 @@ pub use frame::{
     animating, build, hit_at, wake_at, DrawList, Hit, HitKind, Label, Layer, Rect, Slab, Stroke,
 };
 pub use interact::{
-    clear_selection, close_menu, expire, note_drag_origin, on_key, on_move, on_press, on_release,
-    on_wheel, open_menu, send_signal, Effect, KeyIn, Sig,
+    clear_selection, close_menu, end_hold, expire, note_drag_origin, on_key, on_move, on_press,
+    on_release, on_wheel, open_menu, send_signal, Effect, KeyIn, Sig,
 };
 pub use model::*;
 pub use persist::{load_ui, save_ui};

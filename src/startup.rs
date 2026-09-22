@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::model::StartupEntry;
@@ -68,6 +69,7 @@ fn load_dir(dir: &Path) -> Vec<(String, Loaded)> {
 /// with the same name, even when the override only says `Hidden=true`.
 pub fn load_startup() -> Vec<StartupEntry> {
     let user_dir = autostart_dir();
+    let desktops = current_desktops();
     let mut system: HashMap<String, Loaded> = HashMap::new();
     for dir in system_autostart_dirs() {
         for (file, loaded) in load_dir(&dir) {
@@ -97,6 +99,17 @@ pub fn load_startup() -> Vec<StartupEntry> {
             .unwrap_or_else(|| file.strip_suffix(".desktop").unwrap_or(&file).to_string());
         let exec = pick(|f| f.exec.as_ref()).unwrap_or_default();
         let enabled = effective.is_none_or(|f| f.enabled);
+        let only_show = pick(|f| f.only_show.as_ref());
+        let not_show = pick(|f| f.not_show.as_ref());
+        let try_exec = pick(|f| f.try_exec.as_ref());
+        if !session_shows(
+            only_show.as_deref(),
+            not_show.as_deref(),
+            try_exec.as_deref(),
+            &desktops,
+        ) {
+            continue;
+        }
         out.push(StartupEntry {
             name,
             exec,
@@ -160,6 +173,9 @@ struct DesktopFields {
     exec: Option<String>,
     kind: Option<String>,
     enabled: bool,
+    only_show: Option<String>,
+    not_show: Option<String>,
+    try_exec: Option<String>,
 }
 
 fn parse_desktop(text: &str) -> DesktopFields {
@@ -168,6 +184,9 @@ fn parse_desktop(text: &str) -> DesktopFields {
     let mut kind = None;
     let mut hidden = false;
     let mut gnome_off = false;
+    let mut only_show = None;
+    let mut not_show = None;
+    let mut try_exec = None;
     let mut in_entry = false;
     let mut seen_group = false;
     for line in text.lines() {
@@ -196,6 +215,9 @@ fn parse_desktop(text: &str) -> DesktopFields {
             "Type" => kind = Some(v.to_string()),
             "Hidden" => hidden = v.eq_ignore_ascii_case("true"),
             "X-GNOME-Autostart-enabled" => gnome_off = v.eq_ignore_ascii_case("false"),
+            "OnlyShowIn" => only_show = Some(v.to_string()),
+            "NotShowIn" => not_show = Some(v.to_string()),
+            "TryExec" => try_exec = Some(v.to_string()),
             _ => {}
         }
     }
@@ -204,7 +226,84 @@ fn parse_desktop(text: &str) -> DesktopFields {
         exec,
         kind,
         enabled: !hidden && !gnome_off,
+        only_show,
+        not_show,
+        try_exec,
     }
+}
+
+fn current_desktops() -> Vec<String> {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn desktop_list(raw: &str) -> Vec<&str> {
+    raw.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Whether the session would consider this entry. `OnlyShowIn` / `NotShowIn`
+/// are skipped when the desktop is unknown, so a missing `XDG_CURRENT_DESKTOP`
+/// does not hide the whole list.
+fn session_shows(
+    only_show: Option<&str>,
+    not_show: Option<&str>,
+    try_exec: Option<&str>,
+    desktops: &[String],
+) -> bool {
+    if let Some(cmd) = try_exec {
+        if !command_exists(cmd) {
+            return false;
+        }
+    }
+    if desktops.is_empty() {
+        return true;
+    }
+    if let Some(not_show) = not_show {
+        if desktop_list(not_show)
+            .iter()
+            .any(|d| desktops.iter().any(|c| c == d))
+        {
+            return false;
+        }
+    }
+    if let Some(only_show) = only_show {
+        if !desktop_list(only_show)
+            .iter()
+            .any(|d| desktops.iter().any(|c| c == d))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn command_exists(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+    let path = Path::new(cmd);
+    if path.is_absolute() {
+        return is_exec_file(path);
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| is_exec_file(&dir.join(cmd)))
+}
+
+fn is_exec_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
 }
 
 fn set_key(text: &str, key: &str, value: &str) -> String {
@@ -259,6 +358,23 @@ fn set_key(text: &str, key: &str, value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_skips_other_desktops_and_missing_binaries() {
+        let here = ["Hyprland".to_string()];
+        assert!(session_shows(None, None, None, &here));
+        assert!(!session_shows(Some("KDE;GNOME;"), None, None, &here));
+        assert!(session_shows(Some("Hyprland;KDE;"), None, None, &here));
+        assert!(!session_shows(None, Some("Hyprland;"), None, &here));
+        assert!(session_shows(Some("KDE;"), None, None, &[],));
+        assert!(!session_shows(
+            None,
+            None,
+            Some("/no/such/zigx-tryexec"),
+            &here,
+        ));
+        assert!(session_shows(None, None, Some("/bin/true"), &here));
+    }
 
     #[test]
     fn parses_and_toggles_hidden() {

@@ -212,6 +212,7 @@ struct Prepared {
 }
 
 pub struct Gfx {
+    instance: Instance,
     surface: Surface<'static>,
     device: Device,
     queue: Queue,
@@ -373,6 +374,7 @@ impl Gfx {
         ];
 
         Self {
+            instance,
             surface,
             device,
             queue,
@@ -398,10 +400,12 @@ impl Gfx {
         }
     }
 
-    pub fn render(&mut self, window: &Window, draw: &DrawList, scale: f32) {
+    /// Draw one frame. Returns true when the swapchain was recreated and the
+    /// caller should paint again; the frame just attempted was not presented.
+    pub fn render(&mut self, window: &Arc<Window>, draw: &DrawList, scale: f32) -> bool {
         let physical = window.inner_size();
         if physical.width == 0 || physical.height == 0 {
-            return;
+            return false;
         }
         if self.config.width != physical.width || self.config.height != physical.height {
             self.config.width = physical.width.max(1);
@@ -435,15 +439,29 @@ impl Gfx {
             self.prepare_text(i, &layer.labels, scale);
         }
 
+        let mut configure_after = false;
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => frame,
-            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return,
-            CurrentSurfaceTexture::Outdated | CurrentSurfaceTexture::Suboptimal(_) => {
-                self.surface.configure(&self.device, &self.config);
-                return;
+            // The texture is still presentable. Configure afterwards so the
+            // next frame matches the surface.
+            CurrentSurfaceTexture::Suboptimal(frame) => {
+                configure_after = true;
+                frame
             }
-            CurrentSurfaceTexture::Lost => return,
-            CurrentSurfaceTexture::Validation => return,
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return false,
+            CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                return true;
+            }
+            // Lost is not fixed by configure: the surface itself has to be
+            // created again or the window stays blank until a resize.
+            CurrentSurfaceTexture::Lost => {
+                if self.recreate_surface(window) {
+                    return true;
+                }
+                return false;
+            }
+            CurrentSurfaceTexture::Validation => return false,
         };
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
         let device = &self.device;
@@ -508,6 +526,19 @@ impl Gfx {
         window.pre_present_notify();
         self.queue.present(frame);
         self.atlas.trim();
+        if configure_after {
+            self.surface.configure(&self.device, &self.config);
+        }
+        false
+    }
+
+    fn recreate_surface(&mut self, window: &Arc<Window>) -> bool {
+        let Ok(surface) = self.instance.create_surface(window.clone()) else {
+            return false;
+        };
+        surface.configure(&self.device, &self.config);
+        self.surface = surface;
+        true
     }
 
     fn push_shapes(&mut self, slabs: &[zigx::Slab], scale: f32) {

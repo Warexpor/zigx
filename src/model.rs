@@ -284,6 +284,9 @@ pub struct AppState {
     pub selected: BTreeSet<i32>,
     /// Selected PIDs stay at these `visible_pids` indices until deselected.
     pub pinned: BTreeMap<i32, usize>,
+    /// Order captured when Space is held on Processes. Rows stay in this
+    /// arrangement until the key is released; numbers keep updating.
+    pub held: Option<Vec<i32>>,
     pub anchor: Option<i32>,
     pub scroll: f32,
     pub perf_scroll: f32,
@@ -509,6 +512,7 @@ impl AppState {
             search_focused: false,
             selected: BTreeSet::new(),
             pinned: BTreeMap::new(),
+            held: None,
             anchor: None,
             scroll: 0.0,
             perf_scroll: 0.0,

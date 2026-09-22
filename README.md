@@ -29,6 +29,7 @@ Keys, when the search box is not focused:
 
 - `1` `2` `3` `4` switch pages (Processes, Performance, Startup, Settings). `Ctrl+,` opens Settings.
 - On Performance, `c` `m` `g` `d` `n` select CPU, memory, GPU, disk, and network, and `Space` pauses or resumes sampling.
+- Hold `Space` on Processes to freeze the list in the order on screen. Counts keep updating in place; letting go sorts again. Space still types into search while that field is focused.
 - Typing starts a search. `Ctrl+F` jumps to it from any page, `Esc` clears it, `Ctrl+Backspace` empties it.
 - Click selects a process; `Ctrl` and `Shift` extend the selection.
 - Right-click a process for its menu: End task, Force kill (click twice), Suspend or Resume, Open file location, Copy command line, and Copy PID. It acts on the whole selection when the row is part of it. Arrow keys and `Enter` drive it, `Esc` closes it. Copying uses `wl-copy` (or `xclip` / `xsel`).

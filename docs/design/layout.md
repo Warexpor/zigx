@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.5.0    |                                                      |
+| v0.5.1    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -67,6 +67,10 @@ columns drop out of the table below and Name takes their width.
 
 Selected rows stay pinned at their index while the list re-sorts under them.
 Clicking empty list space clears the selection and unpins them.
+
+Holding `Space` freezes every row in the arrangement currently on screen. The
+name column reads `HELD`. Numbers keep updating. Releasing `Space`, or the
+window losing focus, sorts again. A key repeat does not recapture.
 
 ## Performance
 

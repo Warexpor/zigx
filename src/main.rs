@@ -112,7 +112,9 @@ impl App {
         };
         if let Some(gfx) = self.gfx.as_mut() {
             let scale = pixel_scale(&window, self.zoom.value);
-            gfx.render(&window, &draw, scale);
+            if gfx.render(&window, &draw, scale) {
+                self.redraw();
+            }
         }
     }
 
@@ -196,7 +198,9 @@ impl App {
     fn open_location(&mut self, pid: i32) {
         let dir = std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
-            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+            .map(strip_unlinked)
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            .filter(|dir| dir.is_dir());
         let Some(dir) = dir else {
             self.notify("Executable path is not readable", 4);
             return;
@@ -213,6 +217,7 @@ impl App {
             ("xclip", &["-selection", "clipboard"]),
             ("xsel", &["--clipboard", "--input"]),
         ];
+        let mut spawned = false;
         for (bin, args) in tools {
             let child = Command::new(bin)
                 .args(args)
@@ -221,8 +226,17 @@ impl App {
                 .stderr(Stdio::null())
                 .spawn();
             let Ok(mut child) = child else { continue };
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
+            spawned = true;
+            let wrote = match child.stdin.take() {
+                Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(),
+                None => false,
+            };
+            if !wrote {
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                continue;
             }
             std::thread::spawn(move || {
                 let _ = child.wait();
@@ -230,7 +244,11 @@ impl App {
             self.notify(format!("Copied {what}"), 3);
             return;
         }
-        self.notify("No clipboard tool found (install wl-clipboard)", 5);
+        if spawned {
+            self.notify("Could not copy to the clipboard", 5);
+        } else {
+            self.notify("No clipboard tool found (install wl-clipboard)", 5);
+        }
     }
 
     fn flip_startup(&mut self, index: usize) {
@@ -412,13 +430,21 @@ impl ApplicationHandler<UserEvent> for App {
                 on_wheel(&mut self.state, over, dy);
                 self.redraw();
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
+            WindowEvent::Focused(false) => {
+                if end_hold(&mut self.state) {
+                    self.redraw();
                 }
-                let Some(key) = map_key(event.logical_key) else {
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let Some(key) = map_key(&event.logical_key) else {
                     return;
                 };
+                if event.state != ElementState::Pressed {
+                    if matches!(key, KeyIn::Char(' ')) && end_hold(&mut self.state) {
+                        self.redraw();
+                    }
+                    return;
+                }
                 let effects = on_key(&mut self.state, key, self.mods.control_key());
                 self.apply(effects, event_loop);
                 self.redraw();
@@ -428,7 +454,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-fn map_key(key: Key) -> Option<KeyIn> {
+fn map_key(key: &Key) -> Option<KeyIn> {
     Some(match key {
         Key::Named(NamedKey::Escape) => KeyIn::Escape,
         Key::Named(NamedKey::Backspace) => KeyIn::Backspace,
@@ -442,6 +468,18 @@ fn map_key(key: Key) -> Option<KeyIn> {
         Key::Character(s) => KeyIn::Char(s.chars().next()?),
         _ => return None,
     })
+}
+
+/// `/proc/<pid>/exe` appends " (deleted)" once the inode is unlinked. That
+/// suffix is not part of the path on disk.
+fn strip_unlinked(path: std::path::PathBuf) -> std::path::PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    match text.strip_suffix(" (deleted)") {
+        Some(rest) => std::path::PathBuf::from(rest),
+        None => path,
+    }
 }
 
 /// Run a helper without blocking the UI, and reap it so it never lingers as a zombie.
@@ -466,6 +504,19 @@ fn read_cmdline(pid: i32) -> Option<String> {
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect();
     (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_unlinked;
+
+    #[test]
+    fn deleted_exe_suffix_is_not_part_of_the_path() {
+        let path = strip_unlinked("/usr/bin/foo (deleted)".into());
+        assert_eq!(path, std::path::PathBuf::from("/usr/bin/foo"));
+        let live = strip_unlinked("/usr/bin/foo".into());
+        assert_eq!(live, std::path::PathBuf::from("/usr/bin/foo"));
+    }
 }
 
 fn main() {

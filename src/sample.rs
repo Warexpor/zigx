@@ -80,7 +80,7 @@ pub fn spawn(period_ms: u64, wake: impl Fn() + Send + 'static) -> Hub {
                     thread::sleep(wait);
                 }
                 let priming = !engine.primed;
-                let snap = engine.tick();
+                let snap = engine.tick(ms);
                 {
                     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
                     *guard = Arc::new(snap);
@@ -105,6 +105,12 @@ pub fn spawn(period_ms: u64, wake: impl Fn() + Send + 'static) -> Hub {
 
 struct ProcPrev {
     ticks: u64,
+    /// `/proc` starttime. A reused pid has a new one.
+    start: u64,
+    /// When `ticks` and the io counters were read. The next rate uses this,
+    /// not the clock at the start of the scan: a long walk would otherwise
+    /// shrink the divisor and report thousands of percent.
+    at: Instant,
     read_bytes: Option<u64>,
     write_bytes: Option<u64>,
     io_denied: bool,
@@ -129,15 +135,19 @@ pub struct Engine {
     net_hist: HashMap<String, (VecDeque<f32>, VecDeque<f32>)>,
     gpu_hist: Vec<VecDeque<f32>>,
     users: HashMap<u32, String>,
-    names: HashMap<i32, String>,
+    /// Process title cache, keyed by pid and `starttime` so a recycled pid
+    /// cannot keep the previous process's name.
+    names: HashMap<i32, (u64, String)>,
     kthreads: u32,
-    last_proc: Instant,
     last_cpu_total: f32,
     last_cpu_per: Vec<f32>,
     cached_proc_gpu: HashMap<i32, f32>,
     sample_avg: f32,
     hist_at: Instant,
     hist_seq: u64,
+    /// Sampling period the rings were recorded at. A speed change drops them:
+    /// the graphs treat every sample as one current period wide.
+    hist_period: u64,
     nvml: Option<Nvml>,
     text: String,
     bytes: Vec<u8>,
@@ -169,13 +179,13 @@ impl Engine {
             users: HashMap::new(),
             names: HashMap::new(),
             kthreads: 0,
-            last_proc: Instant::now(),
             last_cpu_total: 0.0,
             last_cpu_per: Vec::new(),
             cached_proc_gpu: HashMap::new(),
             sample_avg: 0.0,
             hist_at: Instant::now(),
             hist_seq: 0,
+            hist_period: 0,
             nvml: Nvml::open(),
             text: String::new(),
             bytes: Vec::new(),
@@ -189,7 +199,8 @@ impl Engine {
         self.primed = false;
     }
 
-    pub fn tick(&mut self) -> Snap {
+    pub fn tick(&mut self, period_ms: u64) -> Snap {
+        self.align_period(period_ms);
         let started = Instant::now();
         let now = Instant::now();
         let dt = now.duration_since(self.prev_at).as_secs_f64();
@@ -201,9 +212,9 @@ impl Engine {
         // same 1 s tick so the whole app changes in lockstep.
         let gpu_raw = self.read_gpus();
         self.cached_proc_gpu = self.read_proc_gpus();
-        let proc_dt = self.last_proc.elapsed().as_secs_f64();
-        let procs = self.read_procs(proc_dt);
-        self.last_proc = Instant::now();
+        // cpu_lines[0] is the aggregate; the rest are one entry per core.
+        let cores = cpu_lines.len().saturating_sub(1).max(1) as u32;
+        let procs = self.read_procs(cores);
 
         let mut cpu_total = 0.0;
         let mut cpu_per = Vec::new();
@@ -251,6 +262,9 @@ impl Engine {
         if advance {
             self.hist_at = now;
             self.hist_seq += 1;
+            if period_ms != 0 {
+                self.hist_period = period_ms;
+            }
         }
 
         self.prev_cpu = cpu_lines.iter().map(|(i, t)| (*i, *t)).collect();
@@ -387,7 +401,7 @@ impl Engine {
         HashMap::new()
     }
 
-    fn read_procs(&mut self, dt: f64) -> Vec<Proc> {
+    fn read_procs(&mut self, cores: u32) -> Vec<Proc> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut kthreads = 0u32;
@@ -419,38 +433,47 @@ impl Engine {
             }
             seen.insert(pid);
             let ticks = stat.utime + stat.stime;
-            let prev_ticks = self.prev_proc.get(&pid).map(|p| p.ticks);
-            let prev_read = self.prev_proc.get(&pid).and_then(|p| p.read_bytes);
-            let prev_write = self.prev_proc.get(&pid).and_then(|p| p.write_bytes);
-            let prev_denied = self.prev_proc.get(&pid).is_some_and(|p| p.io_denied);
-            let cpu = if self.primed && dt > 0.05 {
-                if let Some(was) = prev_ticks {
-                    if ticks >= was {
-                        ((ticks - was) as f64 / self.clk_tck / dt * 100.0) as f32
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
+            // A recycled pid must not inherit the previous process's counters.
+            let (prev_ticks, prev_at, prev_read, prev_write, prev_denied) =
+                match self.prev_proc.get(&pid) {
+                    Some(p) if p.start == stat.start => (
+                        Some(p.ticks),
+                        Some(p.at),
+                        p.read_bytes,
+                        p.write_bytes,
+                        p.io_denied,
+                    ),
+                    _ => (None, None, None, None, false),
+                };
             let (read_bps, write_bps, read_bytes, write_bytes, io_denied) = if prev_denied {
                 (None, None, None, None, true)
             } else {
-                self.proc_io(pid, prev_read, prev_write, dt)
+                self.proc_io(pid, prev_read, prev_write, prev_at)
+            };
+            let at = Instant::now();
+            let dt = prev_at
+                .map(|t| at.saturating_duration_since(t).as_secs_f64())
+                .unwrap_or(0.0);
+            let cpu = if self.primed {
+                match prev_ticks {
+                    Some(was) if ticks >= was => proc_cpu_pct(ticks - was, self.clk_tck, dt, cores),
+                    _ => 0.0,
+                }
+            } else {
+                0.0
             };
             self.prev_proc.insert(
                 pid,
                 ProcPrev {
                     ticks,
+                    start: stat.start,
+                    at,
                     read_bytes,
                     write_bytes,
                     io_denied,
                 },
             );
-            let name = self.proc_name(pid, &stat.comm);
+            let name = self.proc_name(pid, &stat.comm, stat.start);
             out.push(Proc {
                 pid,
                 uid,
@@ -477,7 +500,7 @@ impl Engine {
         pid: i32,
         prev_read: Option<u64>,
         prev_write: Option<u64>,
-        dt: f64,
+        prev_at: Option<Instant>,
     ) -> (Option<f64>, Option<f64>, Option<u64>, Option<u64>, bool) {
         if !self.read_proc_file(pid, "io") {
             return (None, None, None, None, true);
@@ -492,7 +515,8 @@ impl Engine {
                 write_b = v.trim().parse().ok();
             }
         }
-        if !self.primed || dt <= 0.05 {
+        let dt = prev_at.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        if !self.primed || dt <= MIN_DT_SECS {
             return (None, None, read_b, write_b, false);
         }
         let rate = |now: Option<u64>, was: Option<u64>| -> Option<f64> {
@@ -507,13 +531,33 @@ impl Engine {
         )
     }
 
-    fn proc_name(&mut self, pid: i32, comm: &str) -> String {
-        if let Some(name) = self.names.get(&pid) {
-            return name.clone();
+    fn proc_name(&mut self, pid: i32, comm: &str, start: u64) -> String {
+        if let Some((born, name)) = self.names.get(&pid) {
+            if *born == start {
+                return name.clone();
+            }
         }
         let name = self.read_proc_name(pid, comm);
-        self.names.insert(pid, name.clone());
+        self.names.insert(pid, (start, name.clone()));
         name
+    }
+
+    /// Drop graph rings when the sample interval changes. Old samples are not
+    /// one current period apart, so leaving them in would compress or stretch
+    /// the time axis.
+    fn align_period(&mut self, period_ms: u64) {
+        if period_ms == 0 || self.hist_period == 0 || period_ms == self.hist_period {
+            return;
+        }
+        self.cpu_hist.clear();
+        self.cpu_per_hist.clear();
+        self.mem_hist.clear();
+        self.swap_hist.clear();
+        self.disk_hist.clear();
+        self.net_hist.clear();
+        self.gpu_hist.clear();
+        self.hist_seq = 0;
+        self.hist_period = period_ms;
     }
 
     fn read_proc_name(&mut self, pid: i32, comm: &str) -> String {
@@ -713,6 +757,8 @@ struct ParsedStat {
     utime: u64,
     stime: u64,
     threads: u32,
+    /// Clock ticks since boot when the process started.
+    start: u64,
     rss_pages: u64,
 }
 
@@ -725,6 +771,21 @@ fn push_hist(h: &mut VecDeque<f32>, v: f32) {
 
 fn dump(h: &VecDeque<f32>) -> Vec<f32> {
     h.iter().copied().collect()
+}
+
+/// Percent of one core. `cores` caps it at the whole machine: a process
+/// cannot have used more CPU than every core running flat out. Per-core mode
+/// still shows past 100% when more than one core is busy.
+fn proc_cpu_pct(delta_ticks: u64, clk_tck: f64, dt: f64, cores: u32) -> f32 {
+    if dt <= MIN_DT_SECS || clk_tck <= 0.0 {
+        return 0.0;
+    }
+    let pct = delta_ticks as f64 / clk_tck / dt * 100.0;
+    if !pct.is_finite() {
+        return 0.0;
+    }
+    let cap = cores.max(1) as f64 * 100.0;
+    pct.clamp(0.0, cap) as f32
 }
 
 fn pct_busy(idle: u64, total: u64, prev_idle: u64, prev_total: u64) -> f32 {
@@ -838,6 +899,7 @@ fn parse_proc_stat(s: &str) -> Option<ParsedStat> {
         utime: num(11)?,
         stime: num(12)?,
         threads: num(17)? as u32,
+        start: num(19)?,
         rss_pages: num(21)?,
     })
 }
@@ -887,25 +949,55 @@ fn read_uptime_load() -> (u64, [f32; 3]) {
 }
 
 fn lookup_user(uid: u32) -> String {
-    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
-    let mut buf = vec![0u8; 4096];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let rc = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut pwd,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            &mut result,
-        )
-    };
-    if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
-        let c = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
-        if let Ok(s) = c.to_str() {
-            return s.to_string();
+    // NSS can need more than a page (ERANGE). A short buffer used to be cached
+    // as the numeric uid for the rest of the session.
+    let mut buf_len = 4096usize;
+    for _ in 0..6 {
+        let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut buf = vec![0u8; buf_len];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut pwd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            buf_len = buf_len.saturating_mul(2);
+            continue;
         }
+        if rc == 0 && !result.is_null() && !pwd.pw_name.is_null() {
+            let c = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) };
+            if let Ok(s) = c.to_str() {
+                return s.to_string();
+            }
+        }
+        break;
     }
     uid.to_string()
+}
+
+/// Newest SM sample per pid. `samples` is one device's ring.
+fn accumulate_proc_utils(map: &mut HashMap<i32, f32>, samples: &[NvmlProcSample]) {
+    let mut latest: HashMap<i32, (u64, f32)> = HashMap::new();
+    for sample in samples {
+        if sample.pid == 0 {
+            continue;
+        }
+        let pid = sample.pid as i32;
+        match latest.get(&pid) {
+            Some((ts, _)) if *ts >= sample.time_stamp => {}
+            _ => {
+                latest.insert(pid, (sample.time_stamp, sample.sm_util as f32));
+            }
+        }
+    }
+    for (pid, (_, util)) in latest {
+        *map.entry(pid).or_insert(0.0) += util;
+    }
 }
 
 fn read_int(path: &Path) -> Option<u64> {
@@ -1142,7 +1234,7 @@ impl Nvml {
                 let mut count = 0u32;
                 // Size probe: INSUFFICIENT_SIZE (7) fills `count`.
                 let _ = proc_util(dev, std::ptr::null_mut(), &mut count, 0);
-                if count == 0 {
+                if count == 0 || count > 4096 {
                     continue;
                 }
                 // Over-allocate; NVML sometimes under-reports the needed size.
@@ -1161,13 +1253,11 @@ impl Nvml {
                 if proc_util(dev, buf.as_mut_ptr(), &mut n, 0) != 0 {
                     continue;
                 }
-                for sample in buf.iter().take(n as usize) {
-                    if sample.pid == 0 {
-                        continue;
-                    }
-                    let entry = map.entry(sample.pid as i32).or_insert(0.0);
-                    *entry += sample.sm_util as f32;
-                }
+                // Timestamp 0 returns the driver's whole ring, several rows
+                // per pid. Keep the newest row; summing the ring reports
+                // hundreds of percent. Across devices, add the latest sample
+                // from each.
+                accumulate_proc_utils(&mut map, &buf[..(n as usize).min(buf.len())]);
             }
         }
         map
@@ -1273,6 +1363,7 @@ mod tests {
         assert_eq!(p.utime, 10);
         assert_eq!(p.stime, 20);
         assert_eq!(p.threads, 3);
+        assert_eq!(p.start, 1);
         assert_eq!(p.rss_pages, 99);
         assert_eq!(
             display_name("/opt/google/chrome/chrome --type=zygote --no-sandbox"),
@@ -1285,11 +1376,84 @@ mod tests {
     }
 
     #[test]
+    fn proc_cpu_matches_the_time_between_samples() {
+        // 100 ticks at 100 Hz across one second is one core, 100%.
+        assert!((proc_cpu_pct(100, 100.0, 1.0, 8) - 100.0).abs() < 0.01);
+        // Two busy cores.
+        assert!((proc_cpu_pct(200, 100.0, 1.0, 8) - 200.0).abs() < 0.01);
+        // The same ticks squeezed into a short divisor used to read as
+        // thousands of percent. A gap that short is not a rate.
+        assert_eq!(proc_cpu_pct(100, 100.0, 0.05, 8), 0.0);
+        // And a process cannot outrun the machine.
+        assert!((proc_cpu_pct(5_000, 100.0, 1.0, 8) - 800.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn gpu_process_util_keeps_the_newest_sample() {
+        let ring = [
+            NvmlProcSample {
+                pid: 5,
+                time_stamp: 10,
+                sm_util: 20,
+                mem_util: 0,
+                enc_util: 0,
+                dec_util: 0,
+            },
+            NvmlProcSample {
+                pid: 5,
+                time_stamp: 30,
+                sm_util: 40,
+                mem_util: 0,
+                enc_util: 0,
+                dec_util: 0,
+            },
+            NvmlProcSample {
+                pid: 5,
+                time_stamp: 20,
+                sm_util: 90,
+                mem_util: 0,
+                enc_util: 0,
+                dec_util: 0,
+            },
+        ];
+        let mut map = HashMap::new();
+        accumulate_proc_utils(&mut map, &ring);
+        assert_eq!(map.get(&5).copied(), Some(40.0));
+        // A second device adds its own latest sample.
+        accumulate_proc_utils(
+            &mut map,
+            &[NvmlProcSample {
+                pid: 5,
+                time_stamp: 1,
+                sm_util: 15,
+                mem_util: 0,
+                enc_util: 0,
+                dec_util: 0,
+            }],
+        );
+        assert_eq!(map.get(&5).copied(), Some(55.0));
+    }
+
+    #[test]
+    fn speed_change_drops_history_from_the_old_interval() {
+        let mut eng = Engine::new();
+        push_hist(&mut eng.cpu_hist, 10.0);
+        eng.hist_period = 1000;
+        eng.hist_seq = 4;
+        eng.align_period(1000);
+        assert_eq!(eng.cpu_hist.len(), 1, "same period keeps the ring");
+        eng.align_period(500);
+        assert!(eng.cpu_hist.is_empty());
+        assert_eq!(eng.hist_seq, 0);
+        assert_eq!(eng.hist_period, 500);
+    }
+
+    #[test]
     fn live_sample_sees_this_machine() {
         let mut eng = Engine::new();
-        let _ = eng.tick();
+        let _ = eng.tick(0);
         thread::sleep(Duration::from_millis(PRIME_MS));
-        let snap = eng.tick();
+        let snap = eng.tick(0);
         assert!(snap.mem_total > 0, "meminfo");
         assert!(!snap.cpu_per.is_empty(), "cores");
         assert!(snap.proc_count > 0, "processes");
@@ -1304,7 +1468,7 @@ mod tests {
             return;
         }
         let mut eng = Engine::new();
-        let snap = eng.tick();
+        let snap = eng.tick(0);
         assert!(
             !snap.gpus.is_empty(),
             "NVML is installed but no GPU was reported"

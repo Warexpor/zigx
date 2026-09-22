@@ -284,6 +284,14 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                         state.paused = !state.paused;
                         return vec![Effect::Persist];
                     }
+                    // Hold freezes the list. Repeats must not recapture, or a
+                    // process that exited mid-hold would lock in the gap.
+                    ' ' if state.page == Page::Processes => {
+                        if state.held.is_none() && !state.visible_pids.is_empty() {
+                            state.held = Some(state.visible_pids.clone());
+                        }
+                        return vec![];
+                    }
                     'c' | 'C' if state.page == Page::Performance => {
                         state.section = crate::model::Section::Cpu;
                         state.perf_scroll = 0.0;
@@ -366,6 +374,11 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
         }
         KeyIn::Up | KeyIn::Down => vec![],
     }
+}
+
+/// Space went up, or the window lost focus. The list sorts again.
+pub fn end_hold(state: &mut AppState) -> bool {
+    state.held.take().is_some()
 }
 
 /// Open the process menu at the pointer. A row outside the selection becomes
@@ -790,6 +803,17 @@ mod tests {
         let kill = HitKind::MenuItem(MenuAction::ForceKill);
         let fx = on_press(&mut state, kill, false, false, [0.0, 0.0]);
         assert!(matches!(fx.as_slice(), [Effect::Signal(_, Sig::Kill)]));
+    }
+
+    #[test]
+    fn space_in_search_types_instead_of_holding() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.visible_pids = vec![10, 20];
+        state.search_focused = true;
+        on_key(&mut state, KeyIn::Char(' '), false);
+        assert!(state.held.is_none());
+        assert_eq!(state.query, " ");
     }
 
     #[test]

@@ -56,7 +56,8 @@ A pill-shaped field with a search glyph at 12 and text from 34.
 | Focused | `ACCENT_LINE` | `GHOST` | Query in `NUM`, `INK`, with a caret |
 
 Typing anywhere on the Processes page starts a search. `Ctrl+F` focuses it,
-`Esc` clears it, and `Ctrl+Backspace` empties it.
+`Esc` clears it, and `Ctrl+Backspace` empties it. `Space` is the hold-to-freeze
+bind instead of a search character, until the field is already focused.
 
 ## End task
 

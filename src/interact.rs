@@ -18,7 +18,6 @@ pub enum KeyIn {
 pub enum Effect {
     Exit,
     Minimize,
-    AlwaysOnTop(bool),
     DragWindow,
     Kill(Vec<i32>),
     FlipStartup(usize),
@@ -44,10 +43,6 @@ pub fn on_press(state: &mut AppState, kind: HitKind, ctrl: bool, shift: bool) ->
         HitKind::DragWindow => vec![Effect::DragWindow],
         HitKind::Close => vec![Effect::Exit],
         HitKind::Minimize => vec![Effect::Minimize],
-        HitKind::ToggleTop => {
-            state.always_on_top = !state.always_on_top;
-            vec![Effect::AlwaysOnTop(state.always_on_top), Effect::Persist]
-        }
         HitKind::Page(page) => {
             state.page = page;
             state.search_focused = false;
@@ -165,6 +160,15 @@ pub fn on_wheel(
 pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
     match key {
         KeyIn::Char(c) => {
+            if ctrl && (c == '+' || c == '=') {
+                return zoom(state, 1);
+            }
+            if ctrl && c == '-' {
+                return zoom(state, -1);
+            }
+            if ctrl && c == '0' {
+                return zoom_reset(state);
+            }
             if ctrl && (c == 'f' || c == 'F') {
                 state.search_focused = true;
                 return vec![];
@@ -264,6 +268,23 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
             vec![]
         }
     }
+}
+
+fn zoom(state: &mut AppState, delta: i32) -> Vec<Effect> {
+    let next = crate::model::step_ui_scale(state.ui_scale, delta);
+    if (next - state.ui_scale).abs() < 0.001 {
+        return vec![];
+    }
+    state.ui_scale = next;
+    vec![Effect::Persist]
+}
+
+fn zoom_reset(state: &mut AppState) -> Vec<Effect> {
+    if (state.ui_scale - 1.0).abs() < 0.001 {
+        return vec![];
+    }
+    state.ui_scale = 1.0;
+    vec![Effect::Persist]
 }
 
 fn nudge_scroll(state: &mut AppState, dy: f32) {

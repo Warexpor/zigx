@@ -28,6 +28,7 @@ Keys, when the search box is not focused:
 - `1` `2` `3` switch pages.
 - On Performance, `c` `m` `g` `d` `n` select CPU, memory, GPU, disk, and network.
 - Typing starts a search. `Ctrl+F` focuses it, `Esc` clears it, `Ctrl+Backspace` empties it.
+- `Ctrl++` and `Ctrl+-` scale the interface (80% to 180%). `Ctrl+0` returns it to 100%. `Ctrl+=` zooms in too, so the plus key works without Shift.
 - Click selects a process; `Ctrl` and `Shift` extend the selection.
 - `Delete` arms End task and a second press (or `Enter`) sends SIGTERM.
 - `PageUp` `PageDown` scroll the current page.

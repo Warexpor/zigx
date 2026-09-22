@@ -59,6 +59,8 @@ pub struct Stroke {
     pub width: f32,
     pub color: theme::Rgba,
     pub baseline: Option<f32>,
+    /// Round capsule ends. Off for graph traces, which run edge to edge.
+    pub round: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -81,7 +83,6 @@ pub enum HitKind {
     DragWindow,
     Close,
     Minimize,
-    ToggleTop,
     Page(Page),
     Section(Section),
     View(ProcView),
@@ -231,12 +232,14 @@ impl DrawList {
         }
     }
 
+    /// Glyph stroke: joined polyline with round ends.
     fn line(&mut self, pts: &[[f32; 2]], width: f32, color: theme::Rgba) {
         self.strokes.push(Stroke {
             pts: pts.to_vec(),
             width,
             color,
             baseline: None,
+            round: true,
         });
     }
 
@@ -268,13 +271,17 @@ impl DrawList {
             return;
         }
         let tw = measure(&fitted, t);
-        let lh = t.size * 1.3;
+        // Center on the em box. A tall 1.3 line box left unused descender
+        // room that lifted labels; glyphon still paints ink a hair low in the
+        // em, so nudge up to land on the geometric mid of the pill.
+        let em = t.size;
+        let lh = em * 1.2;
         let x = match align {
             Align::Left => r.x,
             Align::Right => r.right() - tw,
             Align::Center => r.x + (r.w - tw) * 0.5,
         };
-        let y = r.y + (r.h - lh) * 0.5;
+        let y = r.y + (r.h - em) * 0.5 - em * 0.08;
         self.labels.push(Label {
             text: fitted,
             x,
@@ -321,6 +328,7 @@ impl DrawList {
                 width: 1.25,
                 color: *color,
                 baseline: Some(r.bottom()),
+                round: false,
             });
             if dot && si == 0 {
                 if let Some(p) = pts.last() {
@@ -344,91 +352,169 @@ pub fn hit_at(hits: &[Hit], x: f32, y: f32) -> Option<HitKind> {
 enum Icon {
     List,
     Pulse,
-    Launch,
+    Power,
     Chip,
     Mem,
     Gpu,
     Disk,
     Net,
     Search,
-    Pin,
     Min,
     Close,
     ChevronDown,
     ChevronRight,
+    /// Row density: three open rules.
+    Loose,
+    /// Row density: four tight rules.
+    Dense,
 }
 
-const ICON_W: f32 = 1.25;
+/// Hairline glyph weight: rules, chevrons, pins.
+const ICON_W: f32 = 1.35;
+/// Nav glyph weight. Matches the list dots so the three pages read as one set.
+const GLYPH_W: f32 = 2.4;
+/// Slab border that lands at `GLYPH_W` on screen. The border band straddles
+/// the edge, so its ink is about twice the requested width plus the fringe.
+const RING_W: f32 = 1.0;
+
+/// Outlined rounded box at glyph weight.
+fn ring(d: &mut DrawList, r: Rect, radius: f32, c: theme::Rgba) {
+    d.slab(r, radius, NONE, c, RING_W);
+}
+
+/// Soft disc. Slabs already antialias.
+fn cap(d: &mut DrawList, x: f32, y: f32, diameter: f32, c: theme::Rgba) {
+    d.fill(
+        Rect::new(x - diameter * 0.5, y - diameter * 0.5, diameter, diameter),
+        diameter * 0.5,
+        c,
+    );
+}
+
+/// Axis-aligned bar with round ends. Prefer this over a stroke for H/V ink.
+fn bar(d: &mut DrawList, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, c: theme::Rgba) {
+    let t = thickness;
+    if (y0 - y1).abs() < 0.01 {
+        let (a, b) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+        d.fill(Rect::new(a, y0 - t * 0.5, (b - a).max(t), t), t * 0.5, c);
+    } else if (x0 - x1).abs() < 0.01 {
+        let (a, b) = if y0 <= y1 { (y0, y1) } else { (y1, y0) };
+        d.fill(Rect::new(x0 - t * 0.5, a, t, (b - a).max(t)), t * 0.5, c);
+    } else {
+        d.line(&[[x0, y0], [x1, y1]], t, c);
+    }
+}
+
+/// Vertical arrow: a chevron head and a shaft that starts exactly where it
+/// leaves the head's inner edge, so the two never stack ink.
+fn arrow(d: &mut DrawList, cx: f32, tip: f32, tail: f32, half: f32, t: f32, c: theme::Rgba) {
+    let up = tail > tip;
+    let dir = if up { 1.0 } else { -1.0 };
+    d.line(
+        &[
+            [cx - half, tip + half * dir],
+            [cx, tip],
+            [cx + half, tip + half * dir],
+        ],
+        t,
+        c,
+    );
+    // Inner crotch sits t/2 * sqrt(2) behind the tip; the shaft's corners meet
+    // the inner edges another t/2 further on. Overlap by a hair, not a cap.
+    let start = tip + dir * (t * 0.5 * std::f32::consts::SQRT_2 + t * 0.5 - 0.4);
+    bar(d, cx, start, cx, tail, t, c);
+}
 
 /// Draw a 14x14 line icon at (x, y).
 fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
     let w = ICON_W;
     match kind {
+        // Pages. Same grid as the resources: ink from 0.2 to 13.2, mass in
+        // the body, one hairline detail.
+
+        // Three records: a marker and a rule each. Rules carry weight so the
+        // silhouette is the list, not the dots; uneven lengths keep it from
+        // collapsing into a menu mark.
         Icon::List => {
-            for i in 0..3 {
-                let yy = y + 2.5 + i as f32 * 4.0;
-                d.line(&[[x + 1.0, yy], [x + 3.0, yy]], w, c);
-                d.line(&[[x + 5.5, yy], [x + 13.0, yy]], w, c);
+            let rows = [(2.6_f32, 12.4_f32), (7.0, 9.8), (11.4, 11.4)];
+            for (yy, x1) in rows {
+                cap(d, x + 2.6, y + yy, GLYPH_W, c);
+                bar(d, x + 5.6, y + yy, x + x1, y + yy, 2.0, c);
             }
         }
-        Icon::Pulse => d.line(
-            &[
-                [x + 1.0, y + 8.5],
-                [x + 4.0, y + 8.5],
-                [x + 6.0, y + 3.0],
-                [x + 8.5, y + 11.5],
-                [x + 10.5, y + 8.5],
-                [x + 13.0, y + 8.5],
-            ],
-            w,
-            c,
-        ),
-        Icon::Launch => {
-            d.line(&[[x + 3.0, y + 11.0], [x + 11.0, y + 3.0]], w, c);
+        // A trend over its axis: one dip, then the climb. One mitered ribbon
+        // with round ends; the hairline baseline makes it a chart.
+        Icon::Pulse => {
             d.line(
-                &[[x + 5.5, y + 3.0], [x + 11.0, y + 3.0], [x + 11.0, y + 8.5]],
-                w,
+                &[
+                    [x + 1.6, y + 9.4],
+                    [x + 5.2, y + 4.8],
+                    [x + 8.2, y + 7.2],
+                    [x + 12.4, y + 1.4],
+                ],
+                GLYPH_W,
                 c,
             );
+            bar(d, x + 0.8, y + 12.5, x + 13.2, y + 12.5, w, c);
         }
+        // Power: an open ring with the switch bar standing in its gap.
+        Icon::Power => {
+            let (cx, cy, r) = (x + 7.0, y + 7.2, 4.8);
+            let (from, to) = (50.0_f32, 310.0_f32);
+            let n = 20;
+            let arc: Vec<[f32; 2]> = (0..=n)
+                .map(|i| {
+                    let a = (from + (to - from) * i as f32 / n as f32).to_radians();
+                    [cx + r * a.sin(), cy - r * a.cos()]
+                })
+                .collect();
+            d.line(&arc, GLYPH_W, c);
+            bar(d, cx, y + 0.6, cx, y + 6.4, GLYPH_W, c);
+        }
+        // Resources. Five silhouettes that cannot be confused for each other:
+        // a square with pins, a bar with legs, a card with a fan, a platter,
+        // and a pair of arrows. Bodies at glyph weight, pins at hairline,
+        // like the list's dots and rules.
+
+        // Package: square die, two pins a side. Pins stop at the ink edge.
         Icon::Chip => {
-            d.slab(Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 2.0, NONE, c, w);
-            d.fill(Rect::new(x + 5.75, y + 5.75, 2.5, 2.5), 0.5, c);
+            ring(d, Rect::new(x + 3.5, y + 3.5, 7.0, 7.0), 1.9, c);
+            for k in [5.3_f32, 8.7] {
+                bar(d, x + k, y + 0.9, x + k, y + 2.3, w, c);
+                bar(d, x + k, y + 11.7, x + k, y + 13.1, w, c);
+                bar(d, x + 0.9, y + k, x + 2.3, y + k, w, c);
+                bar(d, x + 11.7, y + k, x + 13.1, y + k, w, c);
+            }
         }
+        // Module: long body over three contacts.
         Icon::Mem => {
-            d.fill(Rect::new(x + 2.0, y + 7.0, 2.2, 5.0), 0.6, c);
-            d.fill(Rect::new(x + 5.9, y + 4.5, 2.2, 7.5), 0.6, c);
-            d.fill(Rect::new(x + 9.8, y + 2.0, 2.2, 10.0), 0.6, c);
+            ring(d, Rect::new(x + 1.4, y + 2.2, 11.2, 6.0), 1.6, c);
+            for k in [4.0_f32, 7.0, 10.0] {
+                bar(d, x + k, y + 9.9, x + k, y + 12.7, w, c);
+            }
         }
+        // Card: wide body, open fan toward the back, bracket along the front.
         Icon::Gpu => {
-            d.slab(Rect::new(x + 1.0, y + 3.5, 12.0, 8.0), 2.0, NONE, c, w);
-            d.fill(Rect::new(x + 6.0, y + 6.5, 2.0, 2.0), 0.5, c);
+            ring(d, Rect::new(x + 1.0, y + 1.6, 12.0, 8.4), 1.9, c);
+            cap(d, x + 9.1, y + 5.8, 2.6, c);
+            bar(d, x + 1.9, y + 12.2, x + 8.2, y + 12.2, w, c);
         }
+        // Platter with a spindle.
         Icon::Disk => {
-            d.slab(Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 5.0, NONE, c, w);
-            d.fill(Rect::new(x + 6.0, y + 6.0, 2.0, 2.0), 1.0, c);
+            ring(d, Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 5.0, c);
+            cap(d, x + 7.0, y + 7.0, GLYPH_W, c);
         }
+        // Down on the left, up on the right: receive and transmit. The heads
+        // sit at opposite ends so the pair fits at glyph weight.
         Icon::Net => {
-            d.line(&[[x + 4.0, y + 2.5], [x + 4.0, y + 9.5]], w, c);
-            d.line(
-                &[[x + 1.8, y + 7.0], [x + 4.0, y + 9.5], [x + 6.2, y + 7.0]],
-                w,
-                c,
-            );
-            d.line(&[[x + 10.0, y + 4.5], [x + 10.0, y + 11.5]], w, c);
-            d.line(
-                &[[x + 7.8, y + 7.0], [x + 10.0, y + 4.5], [x + 12.2, y + 7.0]],
-                w,
-                c,
-            );
+            let t = 2.0;
+            arrow(d, x + 3.7, y + 12.0, y + 2.4, 2.7, t, c);
+            arrow(d, x + 10.3, y + 2.0, y + 11.6, 2.7, t, c);
         }
+        // Ring plus handle. Thin stroke so the lens hole reads open, not a bead.
         Icon::Search => {
-            d.slab(Rect::new(x + 2.0, y + 2.0, 8.0, 8.0), 4.0, NONE, c, w);
-            d.line(&[[x + 8.8, y + 8.8], [x + 12.5, y + 12.5]], w, c);
-        }
-        Icon::Pin => {
-            d.slab(Rect::new(x + 4.5, y + 1.5, 5.0, 5.0), 2.5, NONE, c, w);
-            d.line(&[[x + 7.0, y + 6.5], [x + 7.0, y + 12.5]], w, c);
+            d.slab(Rect::new(x + 1.85, y + 1.85, 8.3, 8.3), 4.15, NONE, c, 1.0);
+            d.line(&[[x + 9.85, y + 9.85], [x + 12.6, y + 12.6]], w, c);
         }
         Icon::Min => d.line(&[[x + 3.0, y + 7.0], [x + 11.0, y + 7.0]], w, c),
         Icon::Close => {
@@ -445,6 +531,16 @@ fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
             w,
             c,
         ),
+        Icon::Loose => {
+            for yy in [2.75_f32, 7.0, 11.25] {
+                bar(d, x + 2.0, y + yy, x + 12.0, y + yy, w, c);
+            }
+        }
+        Icon::Dense => {
+            for yy in [2.75_f32, 5.5, 8.25, 11.0] {
+                bar(d, x + 2.0, y + yy, x + 12.0, y + yy, w, c);
+            }
+        }
     }
 }
 
@@ -458,24 +554,44 @@ fn heat(v: f32) -> theme::Rgba {
     }
 }
 
-/// Ghost pill: transparent, 1px outline, label centered. The only button.
+// --- Toolbar pills ----------------------------------------------------------
+//
+// One height, one outline weight, one horizontal rhythm. Text-only pills pad
+// 16 each side; a leading glyph sits 12 in with an 8 gap to its label.
+
+const PILL_H: f32 = 32.0;
+const PILL_PAD: f32 = 16.0;
+const PILL_GAP: f32 = 10.0;
+
+fn pill_w(label: &str, glyph: bool) -> f32 {
+    // Ceil so the fitted label never loses its last glyph to rounding.
+    let text = measure(label, PILL).ceil() + 1.0;
+    if glyph {
+        12.0 + 14.0 + 8.0 + text + PILL_PAD
+    } else {
+        text + PILL_PAD * 2.0
+    }
+}
+
+/// Ghost pill: transparent, 1px outline, optional glyph, label. The only button.
 fn ghost_pill(
     d: &mut DrawList,
     r: Rect,
+    glyph: Option<Icon>,
     label: &str,
     mouse: [f32; 2],
     enabled: bool,
     danger: bool,
 ) {
     let hot = enabled && r.contains(mouse[0], mouse[1]);
-    let (line, ink) = if danger {
-        (theme::DANGER_LINE, theme::DANGER_INK)
+    let (line, ink, glyph_ink) = if danger {
+        (theme::DANGER_LINE, theme::DANGER_INK, theme::DANGER_INK)
     } else if !enabled {
-        (theme::HAIRLINE, theme::INK_4)
+        (theme::HAIRLINE, theme::INK_4, theme::INK_4)
     } else if hot {
-        (theme::ACCENT_LINE, theme::INK)
+        (theme::ACCENT_LINE, theme::INK, theme::INK)
     } else {
-        (theme::GHOST_LINE, theme::INK_2)
+        (theme::GHOST_LINE, theme::INK_2, theme::INK_3)
     };
     d.slab(
         r,
@@ -484,7 +600,18 @@ fn ghost_pill(
         line,
         1.0,
     );
-    d.text_c(label, r, PILL, ink);
+    match glyph {
+        Some(ic) => {
+            icon(d, ic, r.x + 12.0, r.y + (r.h - 14.0) * 0.5, glyph_ink);
+            d.text(
+                label,
+                Rect::new(r.x + 34.0, r.y, r.w - 34.0 - PILL_PAD + 2.0, r.h),
+                PILL,
+                ink,
+            );
+        }
+        None => d.text_c(label, r, PILL, ink),
+    }
 }
 
 /// Stat: mono value over a tracked micro label. No box.
@@ -549,7 +676,7 @@ pub fn build(
         d.hairline(Rect::new(sub.right(), body.y, 1.0, body.h));
     }
 
-    title_bar(&mut d, state, snap, bar, mouse);
+    title_bar(&mut d, snap, bar, mouse);
     nav_items(&mut d, state, nav, mouse, snap.sample_ms);
 
     d.hit(
@@ -574,7 +701,7 @@ pub fn build(
     d
 }
 
-fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
+fn title_bar(d: &mut DrawList, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
     d.hit(bar, HitKind::DragWindow);
 
     d.text(
@@ -586,31 +713,28 @@ fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: 
 
     // Window controls: bare glyphs, ghost disc only on hover.
     let specs = [
-        (Icon::Pin, HitKind::ToggleTop),
         (Icon::Min, HitKind::Minimize),
         (Icon::Close, HitKind::Close),
     ];
     let cy = bar.y + bar.h * 0.5;
+    let n = specs.len() as f32;
     let mut left_edge = bar.right();
     for (i, (ic, kind)) in specs.iter().enumerate() {
         let r = Rect::new(
-            bar.right() - 12.0 - (3 - i) as f32 * 32.0,
+            bar.right() - 12.0 - (n - i as f32) * 32.0,
             cy - 14.0,
             28.0,
             28.0,
         );
         left_edge = left_edge.min(r.x);
         let hot = r.contains(mouse[0], mouse[1]);
-        let on = matches!(kind, HitKind::ToggleTop) && state.always_on_top;
         let is_close = matches!(kind, HitKind::Close);
-        if on {
-            d.fill(r, 14.0, theme::SELECTED);
-        } else if hot {
+        if hot {
             d.fill(r, 14.0, theme::HOVER);
         }
         let color = if hot && is_close {
             theme::DANGER_INK
-        } else if on || hot {
+        } else if hot {
             theme::INK
         } else {
             theme::INK_3
@@ -645,9 +769,9 @@ fn side_item(
     } else if hot {
         d.fill(r, 6.0, theme::HOVER);
     }
+    // Glyph and label share one ink, so no page reads as disabled.
     let ink = if on || hot { theme::INK } else { theme::INK_2 };
-    let glyph = if on { theme::INK } else { theme::INK_3 };
-    icon(d, ic, r.x + 12.0, r.y + (r.h - 14.0) * 0.5, glyph);
+    icon(d, ic, r.x + 12.0, r.y + (r.h - 14.0) * 0.5, ink);
     d.text(label, Rect::new(r.x + 36.0, r.y, r.w * 0.55, r.h), NAV, ink);
     if let Some(detail) = detail {
         d.text_r(
@@ -664,7 +788,7 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2], sam
     let items = [
         (Icon::List, "Processes", Page::Processes),
         (Icon::Pulse, "Performance", Page::Performance),
-        (Icon::Launch, "Startup", Page::Startup),
+        (Icon::Power, "Startup", Page::Startup),
     ];
     let mut y = nav.y + 44.0;
     for (ic, label, page) in items {
@@ -708,29 +832,44 @@ fn toast(d: &mut DrawList, state: &AppState, main: Rect) {
 // --- Processes --------------------------------------------------------------
 
 fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mouse: [f32; 2]) {
-    let inner = Rect::new(main.x + 24.0, main.y + 20.0, main.w - 48.0, main.h - 44.0);
+    let inner = Rect::new(main.x + 24.0, main.y + 18.0, main.w - 48.0, main.h - 42.0);
     let y = inner.y;
-    let ctl_h = 30.0;
+    let ctl_h = PILL_H;
 
-    // Segmented control: one ghost outline, the active segment is the white pill.
+    // Two clusters on one line. Left narrows the list: scope, then search.
+    // Right acts on it: density, then End task at the far edge.
     let views = [
         ("Grouped", ProcView::Grouped),
         ("Flat", ProcView::Flat),
         ("User", ProcView::User),
         ("System", ProcView::System),
     ];
-    let pad = 3.0;
+    // Inset from the outer ring; equal side padding inside each cell so every
+    // label — short "Flat" or long "Grouped" — sits on the same rhythm.
+    let seg_inset = 3.0;
+    let seg_pad_x = 16.0;
     let seg_w: f32 = views
         .iter()
-        .map(|(l, _)| measure(l, PILL) + 26.0)
+        .map(|(l, _)| measure(l, PILL) + seg_pad_x * 2.0)
         .sum::<f32>()
-        + pad * 2.0;
+        + seg_inset * 2.0;
+
+    let end = selection_label(state);
+    let ew = pill_w(&end, false);
+    let (dense_icon, dense) = if state.density == Density::Compact {
+        (Icon::Dense, "Compact")
+    } else {
+        (Icon::Loose, "Comfortable")
+    };
+    let dw = pill_w(dense, true);
+
+    // Segmented control: one ghost outline, the active segment is the white pill.
     let seg = Rect::new(inner.x, y, seg_w, ctl_h);
     d.outline(seg, ctl_h * 0.5, theme::GHOST_LINE);
-    let mut x = seg.x + pad;
+    let mut x = seg.x + seg_inset;
     for (label, view) in views {
-        let w = measure(label, PILL) + 26.0;
-        let r = Rect::new(x, y + pad, w, ctl_h - pad * 2.0);
+        let w = measure(label, PILL) + seg_pad_x * 2.0;
+        let r = Rect::new(x, y + seg_inset, w, ctl_h - seg_inset * 2.0);
         let on = state.view == view;
         let hot = r.contains(mouse[0], mouse[1]);
         if on {
@@ -743,50 +882,37 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         x += w;
     }
 
-    // Right cluster: End task, density, search.
-    let end = selection_label(state);
-    let ew = measure(&end, PILL) + 32.0;
+    // Right cluster anchors the trailing edge; search fills the mid band so the
+    // gap matches PILL_GAP on both sides (a 240px cap left a dead hole before).
     let er = Rect::new(inner.right() - ew, y, ew, ctl_h);
-    let armed = state
-        .armed
-        .as_ref()
-        .is_some_and(|a| a.until > Instant::now() && a.pids == state.selected);
-    ghost_pill(d, er, &end, mouse, !state.selected.is_empty(), armed);
-    d.hit(er, HitKind::EndTask);
-
-    let dense = if state.density == Density::Compact {
-        "Compact"
-    } else {
-        "Comfortable"
-    };
-    let dw = measure(dense, PILL) + 32.0;
-    let dr = Rect::new(er.x - 8.0 - dw, y, dw, ctl_h);
-    ghost_pill(d, dr, dense, mouse, true, false);
-    d.hit(dr, HitKind::Density);
-
-    let search_w = 200.0_f32.min((dr.x - seg.right() - 16.0).max(90.0));
-    let sr = Rect::new(dr.x - 8.0 - search_w, y, search_w, ctl_h);
+    let dr = Rect::new(er.x - PILL_GAP - dw, y, dw, ctl_h);
+    let search_x = seg.right() + PILL_GAP;
+    let search_w = (dr.x - PILL_GAP - search_x).max(96.0);
+    let sr = Rect::new(search_x, y, search_w, ctl_h);
     let focus = state.search_focused;
+    let typing = focus || !state.query.is_empty();
     let hot = sr.contains(mouse[0], mouse[1]);
     d.slab(
         sr,
         ctl_h * 0.5,
         if focus { theme::GHOST } else { NONE },
-        if focus {
+        if focus || hot {
             theme::ACCENT_LINE
-        } else if hot {
-            theme::GHOST_LINE
         } else {
-            theme::HAIRLINE
+            theme::GHOST_LINE
         },
         1.0,
     );
     icon(
         d,
         Icon::Search,
-        sr.x + 11.0,
-        sr.y + 8.0,
-        if focus { theme::INK } else { theme::INK_4 },
+        sr.x + 12.0,
+        sr.y + (ctl_h - 14.0) * 0.5,
+        if typing || hot {
+            theme::INK
+        } else {
+            theme::INK_3
+        },
     );
     let q = if state.query.is_empty() && !focus {
         "Search".to_string()
@@ -795,14 +921,29 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     } else {
         state.query.clone()
     };
-    let typing = focus || !state.query.is_empty();
     d.text(
         &q,
-        Rect::new(sr.x + 32.0, sr.y, sr.w - 42.0, sr.h),
+        Rect::new(sr.x + 34.0, sr.y, sr.w - 34.0 - PILL_PAD, sr.h),
         if typing { NUM } else { PILL },
-        if typing { theme::INK } else { theme::INK_4 },
+        if typing {
+            theme::INK
+        } else if hot {
+            theme::INK_2
+        } else {
+            theme::INK_3
+        },
     );
     d.hit(sr, HitKind::Search);
+
+    let armed = state
+        .armed
+        .as_ref()
+        .is_some_and(|a| a.until > Instant::now() && a.pids == state.selected);
+    ghost_pill(d, er, None, &end, mouse, !state.selected.is_empty(), armed);
+    d.hit(er, HitKind::EndTask);
+
+    ghost_pill(d, dr, Some(dense_icon), dense, mouse, true, false);
+    d.hit(dr, HitKind::Density);
 
     // Column header.
     let y = y + ctl_h + 20.0;

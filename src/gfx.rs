@@ -47,8 +47,15 @@ fn vs_main(@builtin(vertex_index) vi: u32, ins: Instance) -> VertexOut {
     );
     let uv = corners[vi];
     let size = ins.rect.zw;
-    // Grow the quad so the fragment shader can paint a soft shadow outside.
-    let pad = select(0.0, ins.params.z + 4.0, ins.params.z > 0.5);
+    // Grow the quad so soft edges are not clipped to the axis-aligned rect.
+    // Fill AA (~0.75px), border band (bw + ~0.9), and optional drop shadow
+    // all paint outside the logical shape — without pad, ghost outlines look
+    // faceted and 1px rings alias hard.
+    let bw = max(ins.params.y, 0.0);
+    let shadow = ins.params.z;
+    let edge_pad = max(1.5, bw + 2.0);
+    let shadow_pad = select(0.0, shadow + 4.0, shadow > 0.5);
+    let pad = max(edge_pad, shadow_pad);
     let pos = ins.rect.xy - pad + uv * (size + 2.0 * pad);
     var out: VertexOut;
     out.clip = ndc(pos);
@@ -106,13 +113,20 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 
 struct Vin {
+    // xy = pixel position. z = signed distance from the centerline in px.
+    // w = solid half-width in px (huge → filled triangle, no fade).
     @location(0) pos: vec4<f32>,
     @location(1) color: vec4<f32>,
+    // Overshoot past the start (x) and end (y) of the segment, in px.
+    // Negative inside. Huge negative means that end has no cap.
+    @location(2) axis: vec2<f32>,
 };
 
 struct Vout {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec4<f32>,
+    @location(1) edge: vec2<f32>,
+    @location(2) axis: vec2<f32>,
 };
 
 @vertex
@@ -122,12 +136,19 @@ fn vs_main(v: Vin) -> Vout {
     var out: Vout;
     out.clip = vec4<f32>(x, y, 0.0, 1.0);
     out.color = v.color;
+    out.edge = v.pos.zw;
+    out.axis = v.axis;
     return out;
 }
 
 @fragment
 fn fs_main(v: Vout) -> @location(0) vec4<f32> {
-    return v.color;
+    // Capsule distance: perpendicular inside the run, radial past a capped end.
+    let over = max(max(v.axis.x, v.axis.y), 0.0);
+    let dist = length(vec2<f32>(over, abs(v.edge.x)));
+    // Soft 1px fringe past the solid half-width. Matches the SDF slab AA.
+    let cover = 1.0 - smoothstep(v.edge.y - 0.55, v.edge.y + 0.55, dist);
+    return v.color * cover;
 }
 "#;
 
@@ -152,6 +173,7 @@ struct ShapeInstance {
 struct Vert {
     pos: [f32; 4],
     color: [f32; 4],
+    axis: [f32; 2],
 }
 
 struct Prepared {
@@ -349,9 +371,8 @@ impl Gfx {
         }
     }
 
-    pub fn render(&mut self, window: &Window, draw: &DrawList) {
+    pub fn render(&mut self, window: &Window, draw: &DrawList, scale: f32) {
         let physical = window.inner_size();
-        let scale = window.scale_factor() as f32;
         if physical.width == 0 || physical.height == 0 {
             return;
         }
@@ -493,6 +514,7 @@ impl Gfx {
             stroke_line(
                 &pts,
                 (stroke.width * scale).max(1.0),
+                stroke.round,
                 color,
                 &mut self.vertex_cpu,
             );
@@ -802,7 +824,7 @@ fn pipeline(
     let stroke_layout = [Some(VertexBufferLayout {
         array_stride: std::mem::size_of::<Vert>() as u64,
         step_mode: VertexStepMode::Vertex,
-        attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+        attributes: &vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x2],
     })];
     let buffers: &[Option<VertexBufferLayout>] = if instanced {
         &shape_layout
@@ -881,45 +903,155 @@ fn fill_under(
     }
 }
 
+/// Sentinel for "this end has no cap": the fragment never sees it go positive.
+const NO_CAP: f32 = -1.0e6;
+
 fn vert(out: &mut Vec<Vert>, p: [f32; 2], color: [f32; 4]) {
+    // Filled triangle: distance 0, half-width huge → cover stays 1.
     out.push(Vert {
-        pos: [p[0], p[1], 0.0, 1.0],
+        pos: [p[0], p[1], 0.0, 1.0e6],
         color,
+        axis: [NO_CAP, NO_CAP],
     });
 }
 
-fn stroke_line(pts: &[[f32; 2]], width: f32, color: [f32; 4], out: &mut Vec<Vert>) {
-    let hw = width * 0.5;
-    for w in pts.windows(2) {
-        let (x0, y0) = (w[0][0], w[0][1]);
-        let (x1, y1) = (w[1][0], w[1][1]);
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        let len = (dx * dx + dy * dy).sqrt().max(0.001);
-        let nx = -dy / len * hw;
-        let ny = dx / len * hw;
-        tri(
-            out,
-            [x0 + nx, y0 + ny],
-            [x1 + nx, y1 + ny],
-            [x0 - nx, y0 - ny],
-            color,
-        );
-        tri(
-            out,
-            [x1 + nx, y1 + ny],
-            [x1 - nx, y1 - ny],
-            [x0 - nx, y0 - ny],
-            color,
-        );
-    }
+/// One ribbon vertex. `dist` is the signed perpendicular distance from the
+/// centerline; `sa`/`sb` are overshoots past the segment's start and end.
+fn stroke_vert(
+    out: &mut Vec<Vert>,
+    p: [f32; 2],
+    dist: f32,
+    half_w: f32,
+    sa: f32,
+    sb: f32,
+    color: [f32; 4],
+) {
+    out.push(Vert {
+        pos: [p[0], p[1], dist, half_w],
+        color,
+        axis: [sa, sb],
+    });
 }
 
-fn tri(out: &mut Vec<Vert>, a: [f32; 2], b: [f32; 2], c: [f32; 2], color: [f32; 4]) {
-    for p in [a, b, c] {
-        out.push(Vert {
-            pos: [p[0], p[1], 0.0, 1.0],
-            color,
-        });
+/// Polyline as one joined ribbon. Consecutive segments meet at miter points
+/// instead of overlapping, so semi-transparent ink stays even through the
+/// corners, and `round` grows capsule ends in the fragment shader rather
+/// than stacking a second primitive on top.
+fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: &mut Vec<Vert>) {
+    let hw = (width * 0.5).max(0.5);
+    // Grow the ribbon so the fragment soft-edge has pixels to fade across.
+    let aa = 0.75_f32;
+    let outer = hw + aa;
+
+    // Collapse repeated points so every segment has a direction.
+    let mut p: Vec<[f32; 2]> = Vec::with_capacity(pts.len());
+    for q in pts {
+        let dup = p
+            .last()
+            .is_some_and(|l: &[f32; 2]| (l[0] - q[0]).abs() < 1e-3 && (l[1] - q[1]).abs() < 1e-3);
+        if !dup {
+            p.push(*q);
+        }
+    }
+    let n = p.len();
+    if n < 2 {
+        return;
+    }
+    let dirs: Vec<[f32; 2]> = p
+        .windows(2)
+        .map(|w| {
+            let dx = w[1][0] - w[0][0];
+            let dy = w[1][1] - w[0][1];
+            let l = (dx * dx + dy * dy).sqrt();
+            [dx / l, dy / l]
+        })
+        .collect();
+    let normal = |d: [f32; 2]| [-d[1], d[0]];
+
+    // Left-side offset at every point: plain normal at the ends, miter inside.
+    let offs: Vec<[f32; 2]> = (0..n)
+        .map(|i| {
+            if i == 0 {
+                let nn = normal(dirs[0]);
+                return [nn[0] * outer, nn[1] * outer];
+            }
+            if i == n - 1 {
+                let nn = normal(dirs[n - 2]);
+                return [nn[0] * outer, nn[1] * outer];
+            }
+            let n0 = normal(dirs[i - 1]);
+            let n1 = normal(dirs[i]);
+            let mx = n0[0] + n1[0];
+            let my = n0[1] + n1[1];
+            let ml = (mx * mx + my * my).sqrt();
+            if ml < 1e-3 {
+                // Full reversal: no meaningful miter, fall back to the normal.
+                return [n0[0] * outer, n0[1] * outer];
+            }
+            let m = [mx / ml, my / ml];
+            // cos of the half turn. Clamp so a sharp spike cannot throw a
+            // miter far past the line; the AA is slightly off there, and the
+            // only sharp joins are 1px graph traces.
+            let cos = (m[0] * n0[0] + m[1] * n0[1]).max(0.35);
+            let len = outer / cos;
+            [m[0] * len, m[1] * len]
+        })
+        .collect();
+
+    for i in 0..n - 1 {
+        let a = p[i];
+        let b = p[i + 1];
+        let d = dirs[i];
+        let len = (b[0] - a[0]) * d[0] + (b[1] - a[1]) * d[1];
+        let cap_a = round && i == 0;
+        let cap_b = round && i == n - 2;
+        let ext_a = if cap_a { outer } else { 0.0 };
+        let ext_b = if cap_b { outer } else { 0.0 };
+        let corners = [
+            (
+                [
+                    a[0] + offs[i][0] - d[0] * ext_a,
+                    a[1] + offs[i][1] - d[1] * ext_a,
+                ],
+                outer,
+            ),
+            (
+                [
+                    a[0] - offs[i][0] - d[0] * ext_a,
+                    a[1] - offs[i][1] - d[1] * ext_a,
+                ],
+                -outer,
+            ),
+            (
+                [
+                    b[0] + offs[i + 1][0] + d[0] * ext_b,
+                    b[1] + offs[i + 1][1] + d[1] * ext_b,
+                ],
+                outer,
+            ),
+            (
+                [
+                    b[0] - offs[i + 1][0] + d[0] * ext_b,
+                    b[1] - offs[i + 1][1] + d[1] * ext_b,
+                ],
+                -outer,
+            ),
+        ];
+        // Along-axis projection of each corner gives exact overshoot varyings.
+        let along = |q: [f32; 2]| (q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1];
+        let emit = |out: &mut Vec<Vert>, k: usize| {
+            let (q, dist) = corners[k];
+            let t = along(q);
+            let sa = if cap_a { -t } else { NO_CAP };
+            let sb = if cap_b { t - len } else { NO_CAP };
+            stroke_vert(out, q, dist, hw, sa, sb, color);
+        };
+        // Two triangles: (a_l, b_l, a_r) and (b_l, b_r, a_r).
+        emit(out, 0);
+        emit(out, 2);
+        emit(out, 1);
+        emit(out, 2);
+        emit(out, 3);
+        emit(out, 1);
     }
 }

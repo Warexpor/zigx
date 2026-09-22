@@ -223,7 +223,8 @@ pub struct AppState {
     pub system_open: bool,
     pub width: f32,
     pub height: f32,
-    pub always_on_top: bool,
+    /// Interface zoom. Layout stays in design pixels; this scales them onto the window.
+    pub ui_scale: f32,
     pub visible_pids: Vec<i32>,
 }
 
@@ -254,10 +255,36 @@ impl AppState {
             system_open: true,
             width,
             height,
-            always_on_top: false,
+            ui_scale: 1.0,
             visible_pids: Vec::new(),
         }
     }
+}
+
+/// Discrete zoom stops. Geometric so each Ctrl++ step is a similar jump.
+const UI_STEPS: [f32; 8] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.4, 1.6, 1.8];
+
+pub fn snap_ui_scale(scale: f32) -> f32 {
+    UI_STEPS
+        .into_iter()
+        .min_by(|a, b| {
+            (*a - scale)
+                .abs()
+                .partial_cmp(&(*b - scale).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(1.0)
+}
+
+/// `delta` is +1 to enlarge, -1 to shrink. The ends of the stop list clamp.
+pub fn step_ui_scale(scale: f32, delta: i32) -> f32 {
+    let current = snap_ui_scale(scale);
+    let i = UI_STEPS
+        .iter()
+        .position(|s| (*s - current).abs() < 0.001)
+        .unwrap_or(2);
+    let next = (i as i32 + delta).clamp(0, UI_STEPS.len() as i32 - 1) as usize;
+    UI_STEPS[next]
 }
 
 pub mod theme {
@@ -305,4 +332,18 @@ pub mod theme {
 
     // Floating notice: solid black glass, ghost edge.
     pub const TOAST: Rgba = [0, 0, 0, 230];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{snap_ui_scale, step_ui_scale};
+
+    #[test]
+    fn zoom_steps_and_clamps() {
+        assert!((step_ui_scale(1.0, 1) - 1.1).abs() < 0.001);
+        assert!((step_ui_scale(1.0, -1) - 0.9).abs() < 0.001);
+        assert!((step_ui_scale(0.8, -1) - 0.8).abs() < 0.001);
+        assert!((step_ui_scale(1.8, 1) - 1.8).abs() < 0.001);
+        assert!((snap_ui_scale(1.12) - 1.1).abs() < 0.001);
+    }
 }

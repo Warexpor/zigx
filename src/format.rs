@@ -69,46 +69,126 @@ pub fn freq_ghz(mhz: f32) -> String {
     }
 }
 
-/// Estimated advance of one glyph. `tracking` is letter spacing in em.
-/// Uppercase runs are wider than mixed case in every humanist sans.
-fn char_w(size: f32, mono: bool, caps: bool, tracking: f32) -> f32 {
-    let base = if mono {
-        size * 0.60
-    } else if caps {
-        size * 0.66
-    } else {
-        size * 0.51
-    };
-    base + tracking * size
-}
-
-fn is_caps(s: &str) -> bool {
-    let letters: Vec<char> = s.chars().filter(|c| c.is_alphabetic()).collect();
-    !letters.is_empty() && letters.iter().all(|c| c.is_uppercase())
+/// Advance of one glyph in em, tuned to Adwaita/Inter-class humanist sans.
+/// A flat 0.51em average was skewing layout: short words like "Flat" got
+/// oversized cells, while "Grouped"/"System" ran short and sat off-center.
+fn advance_em(c: char, mono: bool) -> f32 {
+    if mono {
+        return 0.60;
+    }
+    match c {
+        'A' => 0.690,
+        'B' => 0.654,
+        'C' => 0.730,
+        'D' => 0.722,
+        'E' => 0.601,
+        'F' => 0.590,
+        'G' => 0.746,
+        'H' => 0.743,
+        'I' => 0.269,
+        'J' => 0.571,
+        'K' => 0.672,
+        'L' => 0.565,
+        'M' => 0.903,
+        'N' => 0.753,
+        'O' => 0.765,
+        'P' => 0.639,
+        'Q' => 0.765,
+        'R' => 0.644,
+        'S' => 0.642,
+        'T' => 0.646,
+        'U' => 0.744,
+        'V' => 0.690,
+        'W' => 0.985,
+        'X' => 0.682,
+        'Y' => 0.679,
+        'Z' => 0.629,
+        'a' => 0.562,
+        'b' => 0.612,
+        'c' => 0.571,
+        'd' => 0.612,
+        'e' => 0.583,
+        'f' => 0.370,
+        'g' => 0.613,
+        'h' => 0.591,
+        'i' => 0.242,
+        'j' => 0.242,
+        'k' => 0.549,
+        'l' => 0.275,
+        'm' => 0.876,
+        'n' => 0.591,
+        'o' => 0.600,
+        'p' => 0.612,
+        'q' => 0.612,
+        'r' => 0.376,
+        's' => 0.528,
+        't' => 0.327,
+        'u' => 0.591,
+        'v' => 0.562,
+        'w' => 0.818,
+        'x' => 0.546,
+        'y' => 0.562,
+        'z' => 0.552,
+        ' ' => 0.281,
+        '0' => 0.631,
+        '1' => 0.407,
+        '2' => 0.610,
+        '3' => 0.618,
+        '4' => 0.646,
+        '5' => 0.593,
+        '6' => 0.620,
+        '7' => 0.566,
+        '8' => 0.619,
+        '9' => 0.620,
+        '.' | ':' => 0.288,
+        '%' => 0.982,
+        '/' => 0.360,
+        '|' => 0.332,
+        '-' => 0.460,
+        '…' => 0.800,
+        _ => 0.56,
+    }
 }
 
 pub fn fit_t(s: &str, max_w: f32, size: f32, mono: bool, tracking: f32) -> String {
-    let cw = char_w(size, mono, is_caps(s), tracking);
-    if cw <= 0.0 || max_w <= 0.0 {
+    if max_w <= 0.0 || size <= 0.0 {
         return String::new();
     }
-    let max_chars = (max_w / cw).floor() as usize;
-    let count = s.chars().count();
-    if count <= max_chars {
+    if text_width_t(s, size, mono, tracking) <= max_w {
         return s.to_string();
     }
-    if max_chars <= 1 {
-        return "…".into();
+    let ell = '…';
+    let ell_w = advance_em(ell, mono) * size;
+    if ell_w > max_w {
+        return ell.to_string();
     }
-    let mut out: String = s.chars().take(max_chars - 1).collect();
-    out.push('…');
+    let mut out = String::new();
+    let mut w = 0.0;
+    for c in s.chars() {
+        let next = advance_em(c, mono) * size + if out.is_empty() { 0.0 } else { tracking * size };
+        if w + next + ell_w + if out.is_empty() { 0.0 } else { tracking * size } > max_w {
+            break;
+        }
+        w += next;
+        out.push(c);
+    }
+    if out.is_empty() {
+        return ell.to_string();
+    }
+    out.push(ell);
     out
 }
 
 pub fn text_width_t(s: &str, size: f32, mono: bool, tracking: f32) -> f32 {
-    let n = s.chars().count() as f32;
-    // Tracking is added after every glyph but the last.
-    (n * char_w(size, mono, is_caps(s), 0.0) + (n - 1.0).max(0.0) * tracking * size).max(0.0)
+    let mut chars = s.chars().peekable();
+    let mut w = 0.0;
+    while let Some(c) = chars.next() {
+        w += advance_em(c, mono) * size;
+        if chars.peek().is_some() {
+            w += tracking * size;
+        }
+    }
+    w.max(0.0)
 }
 
 /// Nice axis ceiling (1, 2, 5 × 10^n).

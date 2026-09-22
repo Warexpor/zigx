@@ -58,6 +58,11 @@ pub fn load_ui(state: &mut AppState) {
                     _ => ProcView::Grouped,
                 };
             }
+            "ui" => {
+                if let Ok(n) = v.parse::<f32>() {
+                    state.ui_scale = crate::model::snap_ui_scale(n / 100.0);
+                }
+            }
             "density" => {
                 state.density = if v == "compact" {
                     Density::Compact
@@ -73,7 +78,6 @@ pub fn load_ui(state: &mut AppState) {
                     };
                 }
             }
-            "top" => state.always_on_top = v == "1",
             _ => {}
         }
     }
@@ -85,7 +89,7 @@ pub fn save_ui(state: &AppState) -> io::Result<()> {
     let path = dir.join("ui.txt");
     let sort_dir = if state.sort.desc { "desc" } else { "asc" };
     let body = format!(
-        "nav_w={}\nsub_w={}\npage={}\nsection={}\nview={}\ndensity={}\nsort={},{sort_dir}\ntop={}\n",
+        "nav_w={}\nsub_w={}\npage={}\nsection={}\nview={}\ndensity={}\nsort={},{sort_dir}\nui={}\n",
         state.nav_w.round() as i32,
         state.sub_w.round() as i32,
         page_name(state.page),
@@ -97,7 +101,7 @@ pub fn save_ui(state: &AppState) -> io::Result<()> {
             "comfortable"
         },
         col_name(state.sort.col),
-        if state.always_on_top { "1" } else { "0" },
+        (state.ui_scale * 100.0).round() as i32,
     );
     atomic_write(&path, &body)
 }

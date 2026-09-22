@@ -8,7 +8,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId, WindowLevel};
+use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::gfx::Gfx;
 use zigx::*;
@@ -57,7 +57,7 @@ impl App {
 
     fn sync_size(&mut self) {
         let Some(window) = &self.window else { return };
-        let scale = window.scale_factor() as f32;
+        let scale = pixel_scale(window, self.state.ui_scale);
         if scale <= 0.0 {
             return;
         }
@@ -79,7 +79,8 @@ impl App {
             return;
         };
         if let Some(gfx) = self.gfx.as_mut() {
-            gfx.render(&window, &draw);
+            let scale = pixel_scale(&window, self.state.ui_scale);
+            gfx.render(&window, &draw, scale);
         }
     }
 
@@ -96,15 +97,6 @@ impl App {
                 Effect::Minimize => {
                     if let Some(window) = &self.window {
                         window.set_minimized(true);
-                    }
-                }
-                Effect::AlwaysOnTop(on) => {
-                    if let Some(window) = &self.window {
-                        window.set_window_level(if on {
-                            WindowLevel::AlwaysOnTop
-                        } else {
-                            WindowLevel::Normal
-                        });
                     }
                 }
                 Effect::DragWindow => {
@@ -183,12 +175,17 @@ impl App {
     }
 
     fn pointer(&self, window: &Window, x: f64, y: f64) -> [f32; 2] {
-        let scale = window.scale_factor() as f32;
+        let scale = pixel_scale(window, self.state.ui_scale);
         if scale <= 0.0 {
             return [x as f32, y as f32];
         }
         [x as f32 / scale, y as f32 / scale]
     }
+}
+
+/// Monitor DPI times the user zoom. Layout is in design pixels; this maps them to the framebuffer.
+fn pixel_scale(window: &Window, ui_scale: f32) -> f32 {
+    window.scale_factor() as f32 * ui_scale
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -206,9 +203,6 @@ impl ApplicationHandler<UserEvent> for App {
             winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "zigx", "zigx");
         attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, "zigx", "zigx");
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
-        if self.state.always_on_top {
-            window.set_window_level(WindowLevel::AlwaysOnTop);
-        }
         self.gfx = Some(Gfx::new(window.clone(), event_loop));
         self.window = Some(window);
         self.redraw();

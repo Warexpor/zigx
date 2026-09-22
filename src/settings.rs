@@ -129,9 +129,10 @@ pub const OPTIONAL_COLS: [Col; 5] = [Col::Gpu, Col::Disk, Col::Pid, Col::User, C
 
 /// One control on the Settings page. The value carried with it in a hit is a
 /// segment index for choices and 0 / 1 for switches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Opt {
     Glass,
+    Animations,
     Motion,
     Density,
     Heat,
@@ -153,6 +154,9 @@ pub enum Opt {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub glass: Glass,
+    /// Interface fades, glides and transitions. Graph playback follows `motion`.
+    pub animations: bool,
+    /// Graph playback: smooth scrolling or whole-sample steps.
     pub motion: Motion,
     /// Amber and red on hot values. Off keeps the whole app monochrome.
     pub heat: bool,
@@ -181,6 +185,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             glass: Glass::Frost,
+            animations: true,
             motion: Motion::Smooth,
             heat: true,
             readout: true,
@@ -261,6 +266,7 @@ impl Settings {
             }
             match k {
                 "glass" => set(&mut s.glass, v),
+                "animations" => s.animations = on(v),
                 "motion" => set(&mut s.motion, v),
                 "heat" => s.heat = on(v),
                 "readout" => s.readout = on(v),
@@ -296,11 +302,12 @@ impl Settings {
             .collect();
         format!(
             "# ZIGX settings. Written by the Settings page; safe to edit by hand.\n\
-             glass={}\nmotion={}\nheat={}\nreadout={}\n\
+             glass={}\nanimations={}\nmotion={}\nheat={}\nreadout={}\n\
              history={}\ncurve={}\nfill={}\ngrid={}\n\
              speed={}\nprocess_cpu={}\nunits={}\ntemperature={}\n\
              columns={}\nconfirm={}\nopen_on={}\n",
             self.glass.key(),
+            flag(self.animations),
             self.motion.key(),
             flag(self.heat),
             flag(self.readout),
@@ -355,6 +362,7 @@ mod tests {
     fn round_trips_every_field() {
         let s = Settings {
             glass: Glass::Solid,
+            animations: false,
             motion: Motion::Reduced,
             heat: false,
             readout: false,
@@ -386,6 +394,7 @@ mod tests {
         let s = Settings::parse("glass=neon\nhistory\n# fill=off\nspeed=2000\n");
         assert_eq!(s.glass, Glass::Frost);
         assert!(s.fill);
+        assert!(s.animations);
         assert_eq!(s.speed, Speed::Slow);
     }
 

@@ -50,12 +50,20 @@ pub enum Effect {
     Notify(String),
 }
 
+/// How long an expired notice may stay on screen while it fades out. The
+/// toast normally clears itself sooner, once the fade settles.
+const NOTICE_LINGER: Duration = Duration::from_millis(600);
+
 pub fn expire(state: &mut AppState) {
     let now = Instant::now();
     if state.armed.as_ref().is_some_and(|a| a.until <= now) {
         state.armed = None;
     }
-    if state.notice.as_ref().is_some_and(|u| u.until <= now) {
+    if state
+        .notice
+        .as_ref()
+        .is_some_and(|u| u.until + NOTICE_LINGER <= now)
+    {
         state.notice = None;
     }
 }
@@ -120,6 +128,7 @@ pub fn on_press(
         }
         HitKind::Search => {
             state.search_focused = true;
+            state.typed_at = Instant::now();
             vec![]
         }
         HitKind::EndTask => end_task(state),
@@ -307,6 +316,7 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
             if !c.is_control() {
                 state.query.push(c);
                 state.scroll = 0.0;
+                state.typed_at = Instant::now();
             }
             vec![]
         }
@@ -318,6 +328,7 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                     state.query.pop();
                 }
                 state.scroll = 0.0;
+                state.typed_at = Instant::now();
             }
             vec![]
         }
@@ -365,6 +376,8 @@ pub fn open_menu(state: &mut AppState, pid: i32, mouse: [f32; 2]) {
     }
     state.armed = None;
     state.search_focused = false;
+    // A menu already open fades out where it was while the new one appears.
+    close_menu(state);
     state.menu = Some(ContextMenu {
         x: mouse[0],
         y: mouse[1],
@@ -377,7 +390,10 @@ pub fn open_menu(state: &mut AppState, pid: i32, mouse: [f32; 2]) {
 }
 
 pub fn close_menu(state: &mut AppState) {
-    state.menu = None;
+    let menu = state.menu.take();
+    if state.settings.animations && menu.is_some() {
+        state.menu_ghost = menu;
+    }
 }
 
 fn menu_key(state: &mut AppState, key: KeyIn) -> Vec<Effect> {
@@ -445,6 +461,7 @@ fn set_option(state: &mut AppState, opt: Opt, v: u8) -> Vec<Effect> {
     let s = &mut state.settings;
     match opt {
         Opt::Glass => pick(&mut s.glass, v),
+        Opt::Animations => s.animations = on,
         Opt::Motion => pick(&mut s.motion, v),
         Opt::Density => {
             state.density = if on {
@@ -481,6 +498,9 @@ fn set_option(state: &mut AppState, opt: Opt, v: u8) -> Vec<Effect> {
             state.armed = None;
         }
         Opt::OpenOn => pick(&mut s.open_on, v),
+    }
+    if !state.settings.animations {
+        state.menu_ghost = None;
     }
     state.reset_armed = None;
     vec![Effect::Persist]
@@ -722,6 +742,31 @@ mod tests {
         let second = on_press(&mut state, kill, false, false, [0.0, 0.0]);
         assert!(matches!(second.as_slice(), [Effect::Signal(p, Sig::Kill)] if p == &vec![10]));
         assert!(state.menu.is_none());
+        assert!(state.menu_ghost.is_some(), "a closed menu fades out");
+    }
+
+    #[test]
+    fn closed_menu_leaves_no_ghost_with_animations_off() {
+        let mut state = menu_state();
+        state.settings.animations = false;
+        open_menu(&mut state, 10, [0.0, 0.0]);
+        close_menu(&mut state);
+        assert!(state.menu.is_none() && state.menu_ghost.is_none());
+    }
+
+    #[test]
+    fn expired_notice_lingers_for_its_fade() {
+        let mut state = menu_state();
+        let now = Instant::now();
+        state.notice = Some(crate::model::Notice {
+            until: now - Duration::from_millis(100),
+            label: "x".into(),
+        });
+        expire(&mut state);
+        assert!(state.notice.is_some());
+        state.notice.as_mut().unwrap().until = now - Duration::from_secs(1);
+        expire(&mut state);
+        assert!(state.notice.is_none());
     }
 
     #[test]

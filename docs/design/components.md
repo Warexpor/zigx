@@ -20,6 +20,8 @@ a 1 px outline.
 - With a leading glyph, the glyph sits 12 in and the label starts at 34.
 - Width comes from the measured label, rounded up so the last glyph is never
   clipped.
+- Every state change cross-fades; a pill whose label changes (End task, row
+  density) glides to its new width.
 
 ## Segmented control
 
@@ -27,7 +29,9 @@ a 1 px outline.
 with 16 side padding each, so short and long labels share one rhythm. The
 active segment is the `ACCENT` pill with a `PILL_ON` label in `ON_ACCENT`.
 Inactive labels are `INK_2`; hover gives a `HOVER` pill and `INK`. It is used
-for the process view and for every one-of-many setting.
+for the process view and for every one-of-many setting. The white pill glides
+between segments, stretching toward the new one, and each label inverts as
+the pill covers it.
 
 ## Chips
 
@@ -72,6 +76,8 @@ in `MICRO_NUM`.
 - Active: `GHOST` fill, `INK` glyph and label, value in `INK_2`.
 - Hover: `HOVER` fill, `INK`.
 - Rest: `INK_2` glyph and label, value in `INK_4`.
+- The active fill is one shape per list (`side_highlight()`) that glides
+  between items rather than jumping.
 
 ## Eyebrow
 
@@ -93,7 +99,8 @@ with a `MICRO` caption. On Memory, a `READOUT_SUB` "/ total" follows the value.
 ## Process row
 
 32 or 26 high and radius 6, with a `HOVER` fill on hover and `SELECTED` when
-selected.
+selected. Rows glide to new slots on a re-sort, filter or group change, and
+new processes fade in; see [Interface animation](motion.md#what-moves).
 
 - The name is `BODY` / `INK`.
 - Numbers are `NUM`, right-aligned.
@@ -101,12 +108,15 @@ selected.
 - Idle cells step down to `INK_4`.
 
 Group header rows show a chevron (`INK_4`), then an eyebrow with the group name
-and count. Clicking a header toggles the group.
+and count. Clicking a header toggles the group, and the chevron turns a
+quarter between right and down.
 
 ## Column header
 
 `MICRO` titles, right-aligned for numeric columns. The sorted column is `INK`
-with a 6 px chevron beside it pointing in the sort direction. Every header cell
+with a 6 px chevron beside it pointing in the sort direction. It flattens and
+flips when the direction changes, and fades across when the sorted column
+changes. Every header cell
 is a sort target with 4 px of extra hit area above and below.
 
 ## Switch
@@ -115,6 +125,8 @@ is a sort target with 4 px of extra hit area above and below.
 
 - On: a filled `ACCENT` track with an `ON_ACCENT` knob at the right.
 - Off: a `GHOST_LINE` outline with an `INK_3` knob at the left.
+- The knob slides between the two while the track fills, stretching to 18 px
+  wide mid-travel.
 - A row that carries a switch (startup entries, setting rows) is clickable end
   to end but shows no hover fill: the switch is the only state on the row.
 
@@ -123,7 +135,9 @@ is a sort target with 4 px of extra hit area above and below.
 `toast()`. A status notice centered at the bottom of the main area, 60 above
 the edge: 38 high, fully rounded, `TOAST` fill, `GHOST_LINE` outline, `BODY`
 label. It reports results (signals sent, copies, errors) and carries no
-actions. It draws on the overlay layer so rows never show through it.
+actions. It draws on the overlay layer so rows never show through it. It rises
+14 px as it fades in, sinks out after it expires, and glides to a new width
+when a new message replaces the old one.
 
 | Notice | Duration |
 | --- | --- |
@@ -146,7 +160,8 @@ pointer on the overlay layer.
   5 gap before the first item so its highlight clears the rule.
 - **Items.** 30 high, radius 6, `BODY` label 10 in, optional right-aligned
   `MICRO_NUM` hint in `INK_4` naming the signal. At rest the label is `INK_2`;
-  hover or keyboard focus gives a `HOVER` fill and `INK`.
+  hover or keyboard focus gives a `HOVER` fill and `INK`. The fill is one
+  highlight that glides between items.
 - **Groups**, split by inset hairlines:
   - End task (SIGTERM) and Force kill (SIGKILL).
   - Suspend (SIGSTOP) and Resume (SIGCONT), each shown only when some target
@@ -161,8 +176,10 @@ pointer on the overlay layer.
   or leaving the page closes it without acting. The menu also closes by itself
   if every target process exits.
 - **Keyboard.** Up and Down move focus, wrapping; `Enter` activates.
-- **Motion.** It fades in and settles 4 px downward over 140 ms with an
-  ease-out cubic. With reduced motion it appears in place at once.
+- **Motion.** It fades in while settling 6 px downward, and fades out the
+  same way when it closes (drawn without hit targets). A menu opened over
+  another replaces it with a cross-fade. With animations off it appears and
+  disappears at once.
 
 Suspended processes show a `MICRO` "suspended" tag after their name in
 `INK_4`, and their name drops to `INK_3`.
@@ -209,4 +226,4 @@ zoom and row density, and confirms with a toast.
 ## Window controls
 
 Minimize and close are bare 14 px hairline glyphs in 28 x 28 hit areas. Hover
-adds a round `HOVER` disc, and close additionally turns `DANGER_INK`.
+fades in a round `HOVER` disc, and close additionally turns `DANGER_INK`.

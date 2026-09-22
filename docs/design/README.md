@@ -10,7 +10,7 @@ these documents the contract for changing it.
 | [Foundations](foundations.md) | Color, type, shape, iconography |
 | [Layout](layout.md) | Window shell, pages, measurements, scaling |
 | [Components](components.md) | Pills, segmented control, chips, stepper, search, rows, switches, setting rows, toast, context menu |
-| [Motion and graphics](motion.md) | Data cadence, graph playback, curves, easing, rendering |
+| [Motion and graphics](motion.md) | Data cadence, graph playback, curves, easing, rendering, interface animation |
 
 ## Principles
 
@@ -45,6 +45,7 @@ information.
 | Type roles, layout, components, graphs | `src/frame.rs` |
 | Shape SDFs, stroke ribbons, wash, text | `src/gfx.rs` |
 | Graph playback clock and easing | `PerfSmooth` in `src/model.rs` |
+| Interface animation store and springs | `src/anim.rs` |
 | Sampling cadence | `spawn` and `Engine::tick` in `src/sample.rs` |
 | Input, drags, zoom | `src/interact.rs`, `src/main.rs` |
 | User preferences and `settings.txt` | `src/settings.rs` |
@@ -62,5 +63,6 @@ round-trips through `settings.txt` with a test.
   role covers.
 - Keep controls on the 32 px pill height and the 10 px gap rhythm.
 - Anything that animates must be time-based (frame-rate independent), must
-  settle, and must not request frames when it has settled.
+  settle, and must not request frames when it has settled. Interface motion
+  goes through `Anim` so the Animations switch turns it off.
 - Update these documents in the same change.

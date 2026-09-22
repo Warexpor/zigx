@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.4.0    |                                                      |
+| v0.5.0    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -121,7 +121,7 @@ gutter on the right (`SCROLL_GUTTER`) keeps the scrollbar clear of the controls.
 
 | Group | Rows |
 | --- | --- |
-| Appearance | Interface scale, Glass, Motion, Row density, Status color, Title bar readout |
+| Appearance | Interface scale, Glass, Animations, Graph motion, Row density, Status color, Title bar readout |
 | Graphs | History, Curves, Fill, Grid |
 | Data | Update speed (with Pause), Process CPU, Byte units, Temperature |
 | Processes | Columns, Confirm ending |

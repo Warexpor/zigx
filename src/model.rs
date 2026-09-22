@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::anim::{Anim, Spring};
 use crate::settings::Settings;
 
 /// Longest graph window in samples: 2 min of history at 0.5 s updates. The
@@ -15,7 +16,7 @@ pub const HIST_CAP: usize = MAX_WINDOW + 6;
 /// reshapes when a new sample lands. The fraction over 2.0 absorbs jitter.
 pub const GRAPH_DELAY: f64 = 2.15;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Page {
     Processes,
     Performance,
@@ -23,7 +24,7 @@ pub enum Page {
     Settings,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Section {
     Cpu,
     Memory,
@@ -32,7 +33,7 @@ pub enum Section {
     Net,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ProcView {
     Grouped,
     Flat,
@@ -46,7 +47,7 @@ pub enum Density {
     Compact,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Col {
     Name,
     Cpu,
@@ -194,7 +195,7 @@ pub struct StartupEntry {
     pub enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScrollBar {
     Processes,
     Performance,
@@ -244,7 +245,7 @@ pub struct Notice {
     pub label: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MenuAction {
     EndTask,
     ForceKill,
@@ -301,6 +302,10 @@ pub struct AppState {
     pub armed: Option<Armed>,
     pub notice: Option<Notice>,
     pub menu: Option<ContextMenu>,
+    /// A menu that just closed, drawn fading out without hit targets.
+    pub menu_ghost: Option<ContextMenu>,
+    /// Last search keystroke or focus; the caret blinks from here.
+    pub typed_at: Instant,
     pub user_open: bool,
     pub system_open: bool,
     pub width: f32,
@@ -310,6 +315,8 @@ pub struct AppState {
     pub visible_pids: Vec<i32>,
     /// Graph playback clock and eased bars; advanced on each paint of that page.
     pub perf_smooth: PerfSmooth,
+    /// Interface animation values, carried from frame to frame.
+    pub anim: Anim,
 }
 
 /// Display-side motion for the Performance page.
@@ -330,15 +337,9 @@ pub struct PerfSmooth {
     /// VRAM fill fraction per GPU.
     pub vram: Vec<f32>,
     /// Graph scale per I/O device, keyed `disk:<name>` / `net:<name>`.
-    io_max: BTreeMap<String, Damp>,
-}
-
-/// Critically damped follower state. I/O scales follow in log space so a
-/// 100x rescale reads as an even zoom instead of an instant squash.
-#[derive(Clone, Copy, Debug)]
-struct Damp {
-    value: f32,
-    vel: f32,
+    /// Followed in log space so a 100x rescale reads as an even zoom
+    /// instead of an instant squash.
+    io_max: BTreeMap<String, Spring>,
 }
 
 impl Default for PerfSmooth {
@@ -421,22 +422,16 @@ impl PerfSmooth {
             );
         for (key, a, b) in devs {
             let goal = io_scale(a, b, head, self.window).ln();
-            let m = self.io_max.entry(key.clone()).or_insert(Damp {
-                value: goal,
-                vel: 0.0,
-            });
+            let m = self.io_max.entry(key.clone()).or_insert(Spring::new(goal));
             if fresh || reduced {
-                *m = Damp {
-                    value: goal,
-                    vel: 0.0,
-                };
+                *m = Spring::new(goal);
             } else {
                 let t = if goal > m.value {
                     SCALE_GROW
                 } else {
                     SCALE_SHRINK
                 };
-                smooth_damp(m, goal, t, dt);
+                m.step(goal, t, dt, 0.0);
             }
             keep.insert(key);
         }
@@ -484,23 +479,6 @@ fn window_peak(h: &[f32], head: f32, window: usize) -> f32 {
     h[lo..=hi].iter().copied().fold(0.0_f32, f32::max)
 }
 
-/// Critically damped approach (no overshoot), frame-rate independent.
-fn smooth_damp(d: &mut Damp, target: f32, smooth_time: f32, dt: f32) {
-    let omega = 2.0 / smooth_time.max(1e-4);
-    let x = omega * dt;
-    let decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
-    let change = d.value - target;
-    let temp = (d.vel + omega * change) * dt;
-    d.vel = (d.vel - omega * temp) * decay;
-    let out = target + (change + temp) * decay;
-    if (target > d.value) == (out > target) {
-        d.value = target;
-        d.vel = 0.0;
-    } else {
-        d.value = out;
-    }
-}
-
 /// Frame-rate independent exponential approach factor.
 fn rate(dt: f32, tau: f32) -> f32 {
     1.0 - (-dt / tau.max(0.001)).exp()
@@ -546,6 +524,8 @@ impl AppState {
             armed: None,
             notice: None,
             menu: None,
+            menu_ghost: None,
+            typed_at: Instant::now(),
             user_open: true,
             system_open: true,
             width,
@@ -553,6 +533,7 @@ impl AppState {
             ui_scale: 1.0,
             visible_pids: Vec::new(),
             perf_smooth: PerfSmooth::default(),
+            anim: Anim::default(),
         }
     }
 }

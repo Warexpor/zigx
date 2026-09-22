@@ -4,6 +4,7 @@
 //! transparent GPU surface; Hyprland (or any compositor with blur) supplies
 //! the frost. Nothing here is a toolkit port.
 
+mod anim;
 mod format;
 mod frame;
 mod interact;
@@ -13,8 +14,9 @@ mod sample;
 mod settings;
 mod startup;
 
+pub use anim::{Spring, ZOOM};
 pub use frame::{
-    animating, build, hit_at, DrawList, Hit, HitKind, Label, Layer, Rect, Slab, Stroke,
+    animating, build, hit_at, wake_at, DrawList, Hit, HitKind, Label, Layer, Rect, Slab, Stroke,
 };
 pub use interact::{
     clear_selection, close_menu, expire, note_drag_origin, on_key, on_move, on_press, on_release,

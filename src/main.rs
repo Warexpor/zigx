@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
@@ -33,6 +33,9 @@ struct App {
     startup_rect: Option<Rect>,
     settings_rect: Option<Rect>,
     cursor: CursorIcon,
+    /// Interface zoom as drawn; glides to `state.ui_scale`.
+    zoom: Spring,
+    zoom_at: Instant,
     gfx: Option<Gfx>,
     window: Option<Arc<Window>>,
 }
@@ -51,15 +54,40 @@ impl App {
             startup_rect: None,
             settings_rect: None,
             cursor: CursorIcon::Default,
+            zoom: Spring::new(state.ui_scale),
+            zoom_at: Instant::now(),
             state,
             gfx: None,
             window: None,
         }
     }
 
+    fn zooming(&self) -> bool {
+        self.zoom.value != self.state.ui_scale
+    }
+
+    fn step_zoom(&mut self) {
+        let now = Instant::now();
+        let target = self.state.ui_scale;
+        if !self.state.settings.animations {
+            self.zoom = Spring::new(target);
+        } else if self.zooming() {
+            // The first step after a still stretch is one frame, not the gap.
+            let dt = if self.zoom.vel == 0.0 {
+                1.0 / 60.0
+            } else {
+                now.saturating_duration_since(self.zoom_at)
+                    .as_secs_f32()
+                    .min(0.05)
+            };
+            self.zoom.step(target, ZOOM, dt, 0.0005);
+        }
+        self.zoom_at = now;
+    }
+
     fn sync_size(&mut self) {
         let Some(window) = &self.window else { return };
-        let scale = pixel_scale(window, self.state.ui_scale);
+        let scale = pixel_scale(window, self.zoom.value);
         if scale <= 0.0 {
             return;
         }
@@ -69,6 +97,7 @@ impl App {
     }
 
     fn paint(&mut self) {
+        self.step_zoom();
         self.sync_size();
         expire(&mut self.state);
         let snap = self.hub.load();
@@ -82,7 +111,7 @@ impl App {
             return;
         };
         if let Some(gfx) = self.gfx.as_mut() {
-            let scale = pixel_scale(&window, self.state.ui_scale);
+            let scale = pixel_scale(&window, self.zoom.value);
             gfx.render(&window, &draw, scale);
         }
     }
@@ -219,7 +248,7 @@ impl App {
     }
 
     fn pointer(&self, window: &Window, x: f64, y: f64) -> [f32; 2] {
-        let scale = pixel_scale(window, self.state.ui_scale);
+        let scale = pixel_scale(window, self.zoom.value);
         if scale <= 0.0 {
             return [x as f32, y as f32];
         }
@@ -269,13 +298,22 @@ impl ApplicationHandler<UserEvent> for App {
         self.redraw();
     }
 
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        // A timed wake (see `wake_at`) means something is due to change.
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.redraw();
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.page == Page::Performance || animating(&self.state) {
+        if self.state.page == Page::Performance || animating(&self.state) || self.zooming() {
             // Keep graph playback and transitions advancing at display rate.
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
             ));
+        } else if let Some(at) = wake_at(&self.state) {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }

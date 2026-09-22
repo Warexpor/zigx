@@ -1,12 +1,13 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::anim::{self, cascade, key, lerp, mix_rgba, Anim, Key};
 use crate::format::{
     bytes, cpu_pct, disk_cell, duration, fit_t, freq_ghz, percent, rate, text_width_t,
 };
 use crate::interact::selection_label;
 use crate::model::{
-    io_scale, theme, AppState, Col, Density, MenuAction, Page, Proc, ProcView, Section, Snap, Sort,
-    StartupEntry,
+    io_scale, theme, AppState, Col, ContextMenu, Density, Drag, MenuAction, Page, Proc, ProcView,
+    ScrollBar, Section, Snap, Sort, StartupEntry,
 };
 use crate::settings::{Choice, Curve, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS};
 
@@ -82,7 +83,7 @@ pub struct Label {
     pub clip: Option<Rect>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HitKind {
     DragWindow,
     Close,
@@ -191,15 +192,18 @@ pub struct DrawList {
     pub settings_rect: Option<Rect>,
     clip: Option<Rect>,
     layer: usize,
-    /// Alpha multiplier for everything drawn, used to fade overlays in.
+    /// Alpha multiplier for everything drawn: entrances, exits, overlays.
     fade: f32,
+    /// Entrance progress of the current page, 0 to 1.
+    enter: f32,
     prefs: Settings,
+    anim: Anim,
 }
 
 const NONE: theme::Rgba = [0, 0, 0, 0];
 
 impl DrawList {
-    fn new(prefs: Settings) -> Self {
+    fn new(prefs: Settings, anim: Anim) -> Self {
         Self {
             layers: [Layer::default(), Layer::default()],
             hits: Vec::new(),
@@ -210,8 +214,19 @@ impl DrawList {
             clip: None,
             layer: BASE,
             fade: 1.0,
+            enter: 1.0,
             prefs,
+            anim,
         }
+    }
+
+    /// Run `f` with everything it draws faded by `a` on top of the current fade.
+    fn faded<R>(&mut self, a: f32, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.fade;
+        self.fade *= a.clamp(0.0, 1.0);
+        let out = f(self);
+        self.fade = saved;
+        out
     }
 
     fn ink(&self, c: theme::Rgba) -> theme::Rgba {
@@ -248,6 +263,9 @@ impl DrawList {
             return;
         }
         let (fill, border) = (self.ink(fill), self.ink(border));
+        if fill[3] == 0 && border[3] == 0 {
+            return;
+        }
         self.layers[self.layer].slabs.push(Slab {
             x: r.x,
             y: r.y,
@@ -324,6 +342,7 @@ impl DrawList {
     }
 
     fn place(&mut self, s: &str, r: Rect, t: Type, color: theme::Rgba, align: Align) {
+        let color = self.ink(color);
         if !self.visible(r) || color[3] == 0 {
             return;
         }
@@ -350,7 +369,6 @@ impl DrawList {
             Align::Center => r.x + (r.w - tw) * 0.5,
         };
         let y = r.y + (r.h - em) * 0.5 - em * 0.08;
-        let color = self.ink(color);
         self.layers[self.layer].labels.push(Label {
             text: fitted,
             x,
@@ -428,10 +446,11 @@ impl DrawList {
             if pts.len() < 2 {
                 continue;
             }
+            let color = self.ink(*color);
             self.layers[self.layer].strokes.push(Stroke {
                 pts,
                 width: 1.25,
-                color: *color,
+                color,
                 baseline: self.prefs.fill.then_some(r.bottom()),
                 round: false,
             });
@@ -580,8 +599,6 @@ enum Icon {
     Search,
     Min,
     Close,
-    ChevronDown,
-    ChevronRight,
     /// Row density: three open rules.
     Loose,
     /// Row density: four tight rules.
@@ -766,16 +783,6 @@ fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
             d.line(&[[x + 3.5, y + 3.5], [x + 10.5, y + 10.5]], w, c);
             d.line(&[[x + 10.5, y + 3.5], [x + 3.5, y + 10.5]], w, c);
         }
-        Icon::ChevronDown => d.line(
-            &[[x + 3.0, y + 5.0], [x + 7.0, y + 9.0], [x + 11.0, y + 5.0]],
-            w,
-            c,
-        ),
-        Icon::ChevronRight => d.line(
-            &[[x + 5.0, y + 3.0], [x + 9.0, y + 7.0], [x + 5.0, y + 11.0]],
-            w,
-            c,
-        ),
         Icon::Loose => {
             for yy in [2.75_f32, 7.0, 11.25] {
                 bar(d, x + 2.0, y + yy, x + 12.0, y + yy, w, c);
@@ -822,8 +829,11 @@ fn pill_w(label: &str, glyph: bool) -> f32 {
 }
 
 /// Ghost pill: transparent, 1px outline, optional glyph, label. The only button.
+/// Hover, enabled and danger each cross-fade; `id` keys that state.
+#[allow(clippy::too_many_arguments)]
 fn ghost_pill(
     d: &mut DrawList,
+    id: HitKind,
     r: Rect,
     glyph: Option<Icon>,
     label: &str,
@@ -832,22 +842,19 @@ fn ghost_pill(
     danger: bool,
 ) {
     let hot = enabled && r.contains(mouse[0], mouse[1]);
-    let (line, ink, glyph_ink) = if danger {
-        (theme::DANGER_LINE, theme::DANGER_INK, theme::DANGER_INK)
-    } else if !enabled {
-        (theme::HAIRLINE, theme::INK_4, theme::INK_4)
-    } else if hot {
-        (theme::ACCENT_LINE, theme::INK, theme::INK)
-    } else {
-        (theme::GHOST_LINE, theme::INK_2, theme::INK_3)
-    };
-    d.slab(
-        r,
-        r.h * 0.5,
-        if hot { theme::HOVER } else { NONE },
-        line,
-        1.0,
-    );
+    let h = d.anim.hover(key("pill-hover", id), hot);
+    let en = d.anim.toggle(key("pill-enabled", id), enabled);
+    let dz = d.anim.toggle(key("pill-danger", id), danger);
+    let mut line = mix_rgba(theme::GHOST_LINE, theme::ACCENT_LINE, h);
+    let mut ink = mix_rgba(theme::INK_2, theme::INK, h);
+    let mut glyph_ink = mix_rgba(theme::INK_3, theme::INK, h);
+    line = mix_rgba(theme::HAIRLINE, line, en);
+    ink = mix_rgba(theme::INK_4, ink, en);
+    glyph_ink = mix_rgba(theme::INK_4, glyph_ink, en);
+    line = mix_rgba(line, theme::DANGER_LINE, dz);
+    ink = mix_rgba(ink, theme::DANGER_INK, dz);
+    glyph_ink = mix_rgba(glyph_ink, theme::DANGER_INK, dz);
+    d.slab(r, r.h * 0.5, mix_rgba(NONE, theme::HOVER, h), line, 1.0);
     match glyph {
         Some(ic) => {
             icon(d, ic, r.x + 12.0, r.y + (r.h - 14.0) * 0.5, glyph_ink);
@@ -876,6 +883,7 @@ fn segmented_w(items: &[(&str, bool, HitKind)]) -> f32 {
 }
 
 /// Segmented control: one ghost outline, the active segment is the white pill.
+/// The pill glides between segments; each label inverts as the pill covers it.
 fn segmented(
     d: &mut DrawList,
     x: f32,
@@ -885,22 +893,54 @@ fn segmented(
 ) -> Rect {
     let seg = Rect::new(x, y, segmented_w(items), PILL_H);
     d.outline(seg, PILL_H * 0.5, theme::GHOST_LINE);
-    let mut x = seg.x + SEG_INSET;
-    for (label, on, kind) in items {
-        let w = measure(label, PILL) + SEG_PAD_X * 2.0;
-        let r = Rect::new(x, y + SEG_INSET, w, PILL_H - SEG_INSET * 2.0);
-        let hot = r.contains(mouse[0], mouse[1]);
-        if *on {
-            d.fill(r, r.h * 0.5, theme::ACCENT);
-            d.text_c(label, r, PILL_ON, theme::ON_ACCENT);
-        } else {
-            if hot {
-                d.fill(r, r.h * 0.5, theme::HOVER);
-            }
-            d.text_c(label, r, PILL, if hot { theme::INK } else { theme::INK_2 });
-        }
-        d.hit(r, *kind);
-        x += w;
+    let Some(first) = items.first() else {
+        return seg;
+    };
+    let id = key("segmented", first.2);
+    let mut cx = seg.x + SEG_INSET;
+    let cells: Vec<Rect> = items
+        .iter()
+        .map(|(label, ..)| {
+            let w = measure(label, PILL) + SEG_PAD_X * 2.0;
+            let r = Rect::new(cx, y + SEG_INSET, w, PILL_H - SEG_INSET * 2.0);
+            cx += w;
+            r
+        })
+        .collect();
+    let active = items.iter().position(|(_, on, _)| *on);
+    // Offsets from the control's left edge, so moving the control (a resize,
+    // a scroll) never drags the pill behind it.
+    let (lo, hi) = match active {
+        Some(a) => (cells[a].x - seg.x, cells[a].right() - seg.x),
+        None => (
+            d.anim.peek(key("lo", id)).unwrap_or(0.0),
+            d.anim.peek(key("hi", id)).unwrap_or(0.0),
+        ),
+    };
+    let (lo, hi) = d.anim.glide(id, lo, hi);
+    let shown = d
+        .anim
+        .toggle(key("segmented-on", first.2), active.is_some());
+    let pill = Rect::new(seg.x + lo, y + SEG_INSET, hi - lo, PILL_H - SEG_INSET * 2.0);
+    let hovers: Vec<f32> = items
+        .iter()
+        .zip(&cells)
+        .map(|((_, on, kind), r)| {
+            let hot = !*on && r.contains(mouse[0], mouse[1]);
+            d.anim.hover(key("segment-hover", *kind), hot)
+        })
+        .collect();
+    for (r, h) in cells.iter().zip(&hovers) {
+        d.fill(*r, r.h * 0.5, mix_rgba(NONE, theme::HOVER, *h));
+    }
+    d.faded(shown, |d| d.fill(pill, pill.h * 0.5, theme::ACCENT));
+    for (((label, _, kind), r), h) in items.iter().zip(&cells).zip(&hovers) {
+        let overlap = (pill.right().min(r.right()) - pill.x.max(r.x)).max(0.0);
+        let cover = (overlap / r.w.max(1.0)).clamp(0.0, 1.0) * shown;
+        let rest = mix_rgba(theme::INK_2, theme::INK, *h);
+        let t = if cover > 0.5 { PILL_ON } else { PILL };
+        d.text_c(label, *r, t, mix_rgba(rest, theme::ON_ACCENT, cover));
+        d.hit(*r, *kind);
     }
     seg
 }
@@ -935,7 +975,9 @@ pub fn build(
     startup: &[StartupEntry],
     mouse: [f32; 2],
 ) -> DrawList {
-    let mut d = DrawList::new(state.settings);
+    let mut d = DrawList::new(state.settings, std::mem::take(&mut state.anim));
+    d.anim
+        .begin(state.settings.animations, (state.width, state.height));
     crate::format::set_decimal(state.settings.units == Units::Decimal);
     // An open menu is modal: nothing beneath it hovers.
     let pointer = mouse;
@@ -978,6 +1020,8 @@ pub fn build(
         None
     };
 
+    // The chrome fades in over the glass at launch.
+    d.fade = d.anim.mix_from(key("intro", ()), 0.0, 1.0, anim::ENTER);
     d.hairline(Rect::new(0.0, bar.bottom(), w, 1.0));
     d.hairline(Rect::new(nav.right(), body.y, 1.0, body.h));
     if let Some((sub, _)) = perf {
@@ -992,30 +1036,61 @@ pub fn build(
         HitKind::DragNav,
     );
 
+    // A page enters by fading up from a short drop; list rows follow in a
+    // cascade (see `stagger`).
+    let enter = d
+        .anim
+        .mix_from(key("page", state.page), 0.0, 1.0, anim::ENTER);
+    d.enter = enter;
+    d.fade = enter;
+    let lift = |r: Rect| Rect::new(r.x, r.y + (1.0 - enter) * PAGE_RISE, r.w, r.h);
     match (state.page, perf) {
         (Page::Performance, Some((sub, detail))) => {
             d.hit(
                 Rect::new(sub.right() - 2.0, body.y, 5.0, body.h),
                 HitKind::DragSub,
             );
-            performance(&mut d, state, snap, sub, detail, mouse)
+            performance(&mut d, state, snap, lift(sub), detail, mouse)
         }
-        (Page::Startup, _) => startup_page(&mut d, state, startup, main, mouse),
-        (Page::Processes, _) => processes(&mut d, state, snap, main, mouse),
-        (Page::Settings, _) => settings_page(&mut d, state, main, mouse),
+        (Page::Startup, _) => startup_page(&mut d, state, startup, lift(main), mouse),
+        (Page::Processes, _) => processes(&mut d, state, snap, lift(main), mouse),
+        (Page::Settings, _) => settings_page(&mut d, state, lift(main), mouse),
         _ => {}
     }
+    d.fade = 1.0;
 
     toast(&mut d, state, main);
     if state.page == Page::Processes {
         context_menu(&mut d, state, snap, Rect::new(0.0, 0.0, w, h), pointer);
     } else {
         state.menu = None;
+        state.menu_ghost = None;
     }
+    d.anim.end();
+    state.anim = std::mem::take(&mut d.anim);
     d
 }
 
-const MENU_FADE_MS: f32 = 140.0;
+/// Drop a page or section rises from as it enters.
+const PAGE_RISE: f32 = 10.0;
+/// Drop each list row rises from in the entrance cascade.
+const ROW_RISE: f32 = 8.0;
+/// Farthest a process row travels when re-sorted, in rows.
+const MAX_ROW_TRAVEL: f32 = 3.0;
+
+/// Extra fade for the `i`th visible row of a list while its page enters, on
+/// top of the page fade, so rows arrive in a quick cascade.
+fn stagger(d: &DrawList, i: usize) -> f32 {
+    let t = d.enter;
+    if t >= 1.0 {
+        1.0
+    } else if t <= 0.0 {
+        0.0
+    } else {
+        (cascade(t, i) / t).min(1.0)
+    }
+}
+
 const MENU_ITEM_H: f32 = 30.0;
 const MENU_PAD: f32 = 6.0;
 const MENU_HEAD_H: f32 = 44.0;
@@ -1025,11 +1100,45 @@ const MENU_SEP_H: f32 = 11.0;
 
 /// True while something on screen is mid-animation and needs frames.
 pub fn animating(state: &AppState) -> bool {
-    !state.settings.reduced()
-        && state
-            .menu
-            .as_ref()
-            .is_some_and(|m| m.opened.elapsed().as_secs_f32() * 1000.0 < MENU_FADE_MS + 20.0)
+    state.anim.busy() || state.menu_ghost.is_some()
+}
+
+const CARET_BLINK: Duration = Duration::from_millis(530);
+
+fn caret_blinks(state: &AppState) -> bool {
+    state.settings.animations && state.search_focused && state.page == Page::Processes
+}
+
+fn caret_on(state: &AppState) -> bool {
+    !caret_blinks(state)
+        || (state.typed_at.elapsed().as_millis() / CARET_BLINK.as_millis()) % 2 == 0
+}
+
+/// Next moment a still screen must repaint without input: a notice or an
+/// armed confirmation expiring (so it can fade out), or the caret blinking.
+pub fn wake_at(state: &AppState) -> Option<Instant> {
+    let now = Instant::now();
+    let mut next: Option<Instant> = None;
+    let mut add = |t: Instant| {
+        if t > now {
+            next = Some(next.map_or(t, |n: Instant| n.min(t)));
+        }
+    };
+    if let Some(n) = &state.notice {
+        add(n.until);
+    }
+    if let Some(a) = &state.armed {
+        add(a.until);
+    }
+    if let Some(t) = state.reset_armed {
+        add(t);
+    }
+    if caret_blinks(state) {
+        let blink = CARET_BLINK.as_millis();
+        let ticks = state.typed_at.elapsed().as_millis() / blink + 1;
+        add(state.typed_at + Duration::from_millis((ticks * blink) as u64));
+    }
+    next
 }
 
 enum MenuRow {
@@ -1042,20 +1151,49 @@ enum MenuRow {
     Sep,
 }
 
-/// Right-click menu for the process list: a floating black-glass panel on the
-/// overlay layer. It fades in and settles 4 px down over `MENU_FADE_MS`.
+/// Right-click menu for the process list, plus the fading ghost of one that
+/// just closed.
 fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, mouse: [f32; 2]) {
-    let Some(menu) = state.menu.as_mut() else {
-        return;
-    };
+    if let Some(mut ghost) = state.menu_ghost.take() {
+        // Leave from wherever the entrance got to.
+        let from = d.anim.peek(key("menu-in", ghost.opened)).unwrap_or(1.0);
+        let a = d
+            .anim
+            .mix_from(key("menu-out", ghost.opened), from, 0.0, anim::MENU_OUT);
+        let off = [f32::NEG_INFINITY; 2];
+        if a > 0.0 && menu_panel(d, &mut ghost, snap, win, off, a, false) {
+            state.menu_ghost = Some(ghost);
+        }
+    }
+    if let Some(mut menu) = state.menu.take() {
+        let a = d
+            .anim
+            .mix_from(key("menu-in", menu.opened), 0.0, 1.0, anim::MENU_IN);
+        if menu_panel(d, &mut menu, snap, win, mouse, a, true) {
+            state.menu = Some(menu);
+        }
+    }
+}
+
+/// A floating black-glass panel on the overlay layer. It fades in while
+/// settling 6 px down, and leaves the same way. Only a `live` menu takes
+/// hits. Returns false once none of its processes exist.
+fn menu_panel(
+    d: &mut DrawList,
+    menu: &mut ContextMenu,
+    snap: &Snap,
+    win: Rect,
+    mouse: [f32; 2],
+    a: f32,
+    live: bool,
+) -> bool {
     let procs: Vec<&Proc> = menu
         .pids
         .iter()
         .filter_map(|pid| snap.procs.iter().find(|p| p.pid == *pid))
         .collect();
     if procs.is_empty() {
-        state.menu = None;
-        return;
+        return false;
     }
     let n = procs.len();
     let single = n == 1;
@@ -1178,21 +1316,19 @@ fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, 
     let x = x.clamp(margin, (win.right() - margin - w).max(margin));
     let y = y.clamp(margin, (win.bottom() - margin - h).max(margin));
 
-    let t = if d.prefs.reduced() {
-        1.0
-    } else {
-        (menu.opened.elapsed().as_secs_f32() * 1000.0 / MENU_FADE_MS).clamp(0.0, 1.0)
-    };
-    let ease = 1.0 - (1.0 - t).powi(3);
-    let y = y - 4.0 * (1.0 - ease);
+    let y = y - 6.0 * (1.0 - a);
     let focus = menu.focus;
     let confirm = menu.confirm_kill;
+    let id = menu.opened;
 
     d.layer = OVERLAY;
-    d.fade = ease;
+    let saved_fade = d.fade;
+    d.fade = a;
     let panel = Rect::new(x, y, w, h);
     d.slab(panel, 10.0, theme::MENU, theme::GHOST_LINE, 1.0);
-    d.hit(panel, HitKind::MenuPanel);
+    if live {
+        d.hit(panel, HitKind::MenuPanel);
+    }
 
     let inner_x = x + MENU_PAD;
     let inner_w = w - MENU_PAD * 2.0;
@@ -1213,6 +1349,50 @@ fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, 
     d.fill(Rect::new(x, cy - 1.0, w, 1.0), 0.0, theme::HAIRLINE);
     cy += MENU_HEAD_GAP;
 
+    // Item rects first, so the highlight can glide under them.
+    let mut item_rects = Vec::new();
+    let mut ry = cy;
+    for row in &rows {
+        match row {
+            MenuRow::Sep => ry += MENU_SEP_H,
+            MenuRow::Item { .. } => {
+                item_rects.push(Rect::new(inner_x, ry, inner_w, MENU_ITEM_H));
+                ry += MENU_ITEM_H;
+            }
+        }
+    }
+    let hot_index = item_rects
+        .iter()
+        .position(|r| r.contains(mouse[0], mouse[1]))
+        .or(focus);
+    let hl = key("menu-highlight", id);
+    let ha = d
+        .anim
+        .hover(key("menu-highlight-on", id), hot_index.is_some());
+    let span = match hot_index.and_then(|i| item_rects.get(i)) {
+        Some(r) => {
+            let (lo, hi) = (r.y - y, r.bottom() - y);
+            // Appearing from nothing: light up in place instead of gliding in
+            // from wherever the pointer last left.
+            if ha < 0.05 {
+                d.anim.place(hl, lo, hi);
+            }
+            Some((lo, hi))
+        }
+        None => d.anim.peek(key("lo", hl)).zip(d.anim.peek(key("hi", hl))),
+    };
+    if let Some((lo, hi)) = span {
+        let (lo, hi) = d.anim.glide(hl, lo, hi);
+        d.faded(ha, |d| {
+            d.fill(
+                Rect::new(inner_x, y + lo, inner_w, hi - lo),
+                6.0,
+                theme::HOVER,
+            )
+        });
+    }
+    let armed_t = d.anim.toggle(key("menu-armed", id), confirm);
+
     let mut index = 0;
     for row in &rows {
         match row {
@@ -1231,19 +1411,21 @@ fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, 
                 danger,
             } => {
                 let r = Rect::new(inner_x, cy, inner_w, MENU_ITEM_H);
-                let hot = r.contains(mouse[0], mouse[1]) || focus == Some(index);
-                let armed = *danger && confirm;
-                if armed {
-                    d.slab(r, 6.0, NONE, theme::DANGER_LINE, 1.0);
-                } else if hot {
-                    d.fill(r, 6.0, theme::HOVER);
+                let hot = hot_index == Some(index);
+                let h = d.anim.hover(key("menu-item", (id, index)), hot);
+                if *danger {
+                    d.slab(
+                        r,
+                        6.0,
+                        NONE,
+                        mix_rgba(NONE, theme::DANGER_LINE, armed_t),
+                        1.0,
+                    );
                 }
-                let ink = if *danger && (hot || armed) {
-                    theme::DANGER_INK
-                } else if hot {
-                    theme::INK
+                let ink = if *danger {
+                    mix_rgba(theme::INK_2, theme::DANGER_INK, h.max(armed_t))
                 } else {
-                    theme::INK_2
+                    mix_rgba(theme::INK_2, theme::INK, h)
                 };
                 d.text(
                     label,
@@ -1259,14 +1441,17 @@ fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, 
                         theme::INK_4,
                     );
                 }
-                d.hit(r, HitKind::MenuItem(*action));
+                if live {
+                    d.hit(r, HitKind::MenuItem(*action));
+                }
                 cy += MENU_ITEM_H;
                 index += 1;
             }
         }
     }
-    d.fade = 1.0;
+    d.fade = saved_fade;
     d.layer = BASE;
+    true
 }
 
 fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
@@ -1297,23 +1482,21 @@ fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: 
         left_edge = left_edge.min(r.x);
         let hot = r.contains(mouse[0], mouse[1]);
         let is_close = matches!(kind, HitKind::Close);
-        if hot {
-            d.fill(r, 14.0, theme::HOVER);
-        }
-        let color = if hot && is_close {
+        let h = d.anim.hover(key("control", *kind), hot);
+        d.fill(r, 14.0, mix_rgba(NONE, theme::HOVER, h));
+        let lit = if is_close {
             theme::DANGER_INK
-        } else if hot {
-            theme::INK
         } else {
-            theme::INK_3
+            theme::INK
         };
-        icon(d, *ic, r.x + 7.0, r.y + 7.0, color);
+        icon(d, *ic, r.x + 7.0, r.y + 7.0, mix_rgba(theme::INK_3, lit, h));
         d.hit(r, *kind);
     }
 
     // Live readout, instrument style, ahead of the controls.
     let mut right = left_edge - 24.0;
-    if state.settings.readout {
+    let shown = d.anim.toggle(key("readout", ()), state.settings.readout);
+    if shown > 0.0 {
         let gpu = snap
             .gpus
             .first()
@@ -1327,28 +1510,39 @@ fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: 
             gpu
         );
         let rw = measure(&readout.to_uppercase(), MICRO_NUM);
-        d.text_r(
-            &readout,
-            Rect::new(right - rw, bar.y, rw + 2.0, bar.h),
-            MICRO_NUM,
-            theme::INK_3,
-        );
-        right -= rw + 24.0;
+        d.faded(shown, |d| {
+            d.text_r(
+                &readout,
+                Rect::new(right - rw, bar.y, rw + 2.0, bar.h),
+                MICRO_NUM,
+                theme::INK_3,
+            )
+        });
+        if state.settings.readout {
+            right -= rw + 24.0;
+        }
     }
     // Frozen numbers must never pass for live ones, so this shows either way.
-    if state.paused {
+    let paused = d.anim.toggle(key("paused", ()), state.paused);
+    if paused > 0.0 {
         let pw = measure("PAUSED", MICRO_NUM);
-        d.text_r(
-            "paused",
-            Rect::new(right - pw, bar.y, pw + 2.0, bar.h),
-            MICRO_NUM,
-            theme::WARN,
-        );
+        d.faded(paused, |d| {
+            d.text_r(
+                "paused",
+                Rect::new(right - pw, bar.y, pw + 2.0, bar.h),
+                MICRO_NUM,
+                theme::WARN,
+            )
+        });
     }
 }
 
+/// Side list entry. The selected fill is drawn by [`side_highlight`], which
+/// glides between entries; this draws hover and ink, both cross-faded.
+#[allow(clippy::too_many_arguments)]
 fn side_item(
     d: &mut DrawList,
+    id: HitKind,
     r: Rect,
     ic: Icon,
     label: &str,
@@ -1356,14 +1550,12 @@ fn side_item(
     on: bool,
     mouse: [f32; 2],
 ) {
-    let hot = r.contains(mouse[0], mouse[1]);
-    if on {
-        d.fill(r, 6.0, theme::GHOST);
-    } else if hot {
-        d.fill(r, 6.0, theme::HOVER);
-    }
+    let hot = !on && r.contains(mouse[0], mouse[1]);
+    let h = d.anim.hover(key("side-hover", id), hot);
+    let o = d.anim.toggle(key("side-on", id), on);
+    d.fill(r, 6.0, mix_rgba(NONE, theme::HOVER, h));
     // Glyph and label share one ink, so no page reads as disabled.
-    let ink = if on || hot { theme::INK } else { theme::INK_2 };
+    let ink = mix_rgba(theme::INK_2, theme::INK, h.max(o));
     icon(d, ic, r.x + 12.0, r.y + (r.h - 14.0) * 0.5, ink);
     d.text(label, Rect::new(r.x + 36.0, r.y, r.w * 0.55, r.h), NAV, ink);
     if let Some(detail) = detail {
@@ -1371,43 +1563,63 @@ fn side_item(
             detail,
             Rect::new(r.x + r.w * 0.5, r.y, r.w * 0.5 - 12.0, r.h),
             MICRO_NUM,
-            if on { theme::INK_2 } else { theme::INK_4 },
+            mix_rgba(theme::INK_4, theme::INK_2, o),
         );
     }
 }
 
+/// Selected fill behind a side list. Offsets are from `origin` (the list's
+/// top), so the fill follows the list but glides between entries.
+fn side_highlight(d: &mut DrawList, tag: &str, origin: f32, sel: Option<Rect>) {
+    let Some(r) = sel else { return };
+    let (lo, hi) = d.anim.glide(
+        key("side-highlight", tag),
+        r.y - origin,
+        r.bottom() - origin,
+    );
+    d.fill(Rect::new(r.x, origin + lo, r.w, hi - lo), 6.0, theme::GHOST);
+}
+
 fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2]) {
     eyebrow(d, nav.x + 20.0, nav.y + 18.0, nav.w - 40.0, "Monitor", None);
-    let items = [
+    let mut entries: Vec<(Icon, &str, Page, Rect)> = [
         (Icon::List, "Processes", Page::Processes),
         (Icon::Pulse, "Performance", Page::Performance),
         (Icon::Power, "Startup", Page::Startup),
-    ];
-    let mut y = nav.y + 44.0;
-    for (ic, label, page) in items {
-        let r = Rect::new(nav.x + 10.0, y, nav.w - 20.0, 34.0);
-        side_item(d, r, ic, label, None, state.page == page, mouse);
-        d.hit(r, HitKind::Page(page));
-        y += 38.0;
-    }
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (ic, label, page))| {
+        let y = nav.y + 44.0 + i as f32 * 38.0;
+        (
+            *ic,
+            *label,
+            *page,
+            Rect::new(nav.x + 10.0, y, nav.w - 20.0, 34.0),
+        )
+    })
+    .collect();
     // Settings is about the app, not the machine: pinned to the foot, clear
     // of the monitor pages, just above the version.
-    let r = Rect::new(
-        nav.x + 10.0,
-        (nav.bottom() - 82.0).max(y + 8.0),
-        nav.w - 20.0,
-        34.0,
-    );
-    side_item(
-        d,
-        r,
+    let y = nav.y + 44.0 + 3.0 * 38.0;
+    entries.push((
         Icon::Cog,
         "Settings",
-        None,
-        state.page == Page::Settings,
-        mouse,
-    );
-    d.hit(r, HitKind::Page(Page::Settings));
+        Page::Settings,
+        Rect::new(
+            nav.x + 10.0,
+            (nav.bottom() - 82.0).max(y + 8.0),
+            nav.w - 20.0,
+            34.0,
+        ),
+    ));
+    let sel = entries.iter().find(|e| e.2 == state.page).map(|e| e.3);
+    side_highlight(d, "nav", nav.y, sel);
+    for (ic, label, page, r) in entries {
+        let id = HitKind::Page(page);
+        side_item(d, id, r, ic, label, None, state.page == page, mouse);
+        d.hit(r, id);
+    }
     d.text(
         &format!("v{}", env!("CARGO_PKG_VERSION")),
         Rect::new(nav.x + 20.0, nav.bottom() - 30.0, nav.w - 40.0, 14.0),
@@ -1416,22 +1628,42 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2]) {
     );
 }
 
-fn toast(d: &mut DrawList, state: &AppState, main: Rect) {
+/// Floating notice. It rises in, re-fits its width when the message
+/// changes, and sinks out after it expires; then it clears the notice.
+fn toast(d: &mut DrawList, state: &mut AppState, main: Rect) {
     let Some(notice) = &state.notice else { return };
-    if notice.until <= Instant::now() {
+    let visible = notice.until > Instant::now();
+    let label = notice.label.clone();
+    let a = d
+        .anim
+        .mix_from(key("toast", ()), 0.0, visible as u8 as f32, anim::TOAST);
+    if !visible && a <= 0.0 {
+        state.notice = None;
         return;
     }
-    let label_w = measure(&notice.label, BODY);
-    let w = (label_w + 36.0).max(120.0);
-    let r = Rect::new(main.x + (main.w - w) * 0.5, main.bottom() - 60.0, w, 38.0);
-    d.layer = OVERLAY;
-    d.slab(r, 19.0, theme::TOAST, theme::GHOST_LINE, 1.0);
-    d.text(
-        &notice.label,
-        Rect::new(r.x + 18.0, r.y, label_w + 4.0, r.h),
-        BODY,
-        theme::INK,
+    let label_w = measure(&label, BODY);
+    let w = d.anim.slide(
+        key("toast-w", ()),
+        (label_w + 36.0).max(120.0),
+        anim::TOGGLE,
     );
+    let rise = (1.0 - a) * 14.0;
+    let r = Rect::new(
+        main.x + (main.w - w) * 0.5,
+        main.bottom() - 60.0 + rise,
+        w,
+        38.0,
+    );
+    d.layer = OVERLAY;
+    d.faded(a, |d| {
+        d.slab(r, 19.0, theme::TOAST, theme::GHOST_LINE, 1.0);
+        d.text(
+            &label,
+            Rect::new(r.x + (r.w - label_w) * 0.5 - 2.0, r.y, label_w + 4.0, r.h),
+            BODY,
+            theme::INK,
+        );
+    });
     d.layer = BASE;
 }
 
@@ -1456,13 +1688,22 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         .collect();
 
     let end = selection_label(state);
-    let ew = pill_w(&end, false);
     let (dense_icon, dense) = if state.density == Density::Compact {
         (Icon::Dense, "Compact")
     } else {
         (Icon::Loose, "Comfortable")
     };
-    let dw = pill_w(dense, true);
+    // Pills re-fit their labels smoothly; search takes up the slack.
+    let ew = d.anim.slide(
+        key("pill-w", HitKind::EndTask),
+        pill_w(&end, false),
+        anim::TOGGLE,
+    );
+    let dw = d.anim.slide(
+        key("pill-w", HitKind::Density),
+        pill_w(dense, true),
+        anim::TOGGLE,
+    );
 
     let seg = segmented(d, inner.x, y, &view_items, mouse);
 
@@ -1476,15 +1717,14 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     let focus = state.search_focused;
     let typing = focus || !state.query.is_empty();
     let hot = sr.contains(mouse[0], mouse[1]);
+    let h = d.anim.hover(key("search-hover", ()), hot);
+    let f = d.anim.toggle(key("search-focus", ()), focus);
+    let t = d.anim.toggle(key("search-typing", ()), typing);
     d.slab(
         sr,
         ctl_h * 0.5,
-        if focus { theme::GHOST } else { NONE },
-        if focus || hot {
-            theme::ACCENT_LINE
-        } else {
-            theme::GHOST_LINE
-        },
+        mix_rgba(NONE, theme::GHOST, f),
+        mix_rgba(theme::GHOST_LINE, theme::ACCENT_LINE, h.max(f)),
         1.0,
     );
     icon(
@@ -1492,16 +1732,14 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         Icon::Search,
         sr.x + 12.0,
         sr.y + (ctl_h - 14.0) * 0.5,
-        if typing || hot {
-            theme::INK
-        } else {
-            theme::INK_3
-        },
+        mix_rgba(theme::INK_3, theme::INK, h.max(t)),
     );
+    // Mono, so the blinking caret swaps with a space without shifting text.
     let q = if state.query.is_empty() && !focus {
         "Search".to_string()
     } else if focus {
-        format!("{}|", state.query)
+        let caret = if caret_on(state) { '|' } else { ' ' };
+        format!("{}{caret}", state.query)
     } else {
         state.query.clone()
     };
@@ -1523,10 +1761,28 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         .armed
         .as_ref()
         .is_some_and(|a| a.until > Instant::now() && a.pids == state.selected);
-    ghost_pill(d, er, None, &end, mouse, !state.selected.is_empty(), armed);
+    ghost_pill(
+        d,
+        HitKind::EndTask,
+        er,
+        None,
+        &end,
+        mouse,
+        !state.selected.is_empty(),
+        armed,
+    );
     d.hit(er, HitKind::EndTask);
 
-    ghost_pill(d, dr, Some(dense_icon), dense, mouse, true, false);
+    ghost_pill(
+        d,
+        HitKind::Density,
+        dr,
+        Some(dense_icon),
+        dense,
+        mouse,
+        true,
+        false,
+    );
     d.hit(dr, HitKind::Density);
 
     // Column header metrics — painted after the list so scrolled row ink
@@ -1555,6 +1811,8 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         }
     }
     let rows = visible_rows(state, snap);
+    // Processes missing from the last list fade in where they land.
+    let known: std::collections::HashSet<i32> = state.visible_pids.iter().copied().collect();
     state.visible_pids = rows
         .iter()
         .filter_map(|r| match r {
@@ -1580,17 +1838,55 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     if state.scroll > max_scroll {
         state.scroll = max_scroll;
     }
-    let first = (state.scroll / row_h).floor() as usize;
-    let nvis = ((list.h / row_h).ceil() as usize) + 2;
+    let scroll = smooth_scroll(d, state, ScrollBar::Processes, (), state.scroll);
+    let drawn_h = d.anim.slide(key("row-h", ()), row_h, anim::REORDER);
     // Under the rows: empty list space clears selection / unfreezes pins.
     d.hit(list, HitKind::Deselect);
     d.clip = Some(list);
-    for (i, row) in rows.iter().enumerate().skip(first).take(nvis) {
-        let ry = list.y + i as f32 * row_h - state.scroll;
-        if ry + row_h < list.y || ry > list.bottom() {
+    let fresh_ok = !known.is_empty();
+    let mut shown = 0;
+    let (near_lo, near_hi) = (scroll - row_h * 2.0, scroll + list.h + row_h * 2.0);
+    let near = |y: f32| y > near_lo && y < near_hi;
+    for (i, row) in rows.iter().enumerate() {
+        // Rows glide to a new slot. One sorted in from far away starts a few
+        // rows short of it instead of streaking across the list, and a move
+        // that starts and ends off screen just lands.
+        let id = match row {
+            Row::Header { user, .. } => key("row-header", *user),
+            Row::Proc(p) => key("row", p.pid),
+        };
+        let target = i as f32 * row_h;
+        if let Some(cur) = d.anim.peek(id) {
+            if !near(cur) && !near(target) {
+                d.anim.set(id, target);
+            } else if (cur - target).abs() > row_h * MAX_ROW_TRAVEL {
+                d.anim.set(
+                    id,
+                    target + (cur - target).signum() * row_h * MAX_ROW_TRAVEL,
+                );
+            }
+        }
+        let slot_y = d.anim.slide(id, target, anim::REORDER);
+        let ry = list.y + slot_y - scroll;
+        if ry + drawn_h < list.y || ry > list.bottom() {
             continue;
         }
-        let rr = Rect::new(list.x, ry, list.w, row_h);
+        let mut a = stagger(d, shown);
+        shown += 1;
+        if let Row::Proc(p) = row {
+            let from = if fresh_ok && !known.contains(&p.pid) {
+                0.0
+            } else {
+                1.0
+            };
+            a *= d
+                .anim
+                .mix_from(key("row-in", p.pid), from, 1.0, anim::ENTER);
+        }
+        let ry = ry + (1.0 - a) * ROW_RISE;
+        let rr = Rect::new(list.x, ry, list.w, drawn_h);
+        let saved_fade = d.fade;
+        d.fade *= a;
         match row {
             Row::Header {
                 title,
@@ -1598,21 +1894,18 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                 open,
                 user,
             } => {
-                icon(
+                let turn = d.anim.toggle(key("chevron", *user), *open);
+                chevron(
                     d,
-                    if *open {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::ChevronRight
-                    },
                     list.x + 2.0,
-                    ry + row_h * 0.5 - 7.0,
+                    ry + drawn_h * 0.5 - 7.0,
+                    turn,
                     theme::INK_4,
                 );
                 eyebrow(
                     d,
                     list.x + 24.0,
-                    ry + (row_h - 14.0) * 0.5,
+                    ry + (drawn_h - 14.0) * 0.5,
                     200.0,
                     title,
                     Some(&count.to_string()),
@@ -1621,16 +1914,16 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
             }
             Row::Proc(p) => {
                 let on = state.selected.contains(&p.pid);
-                let hot = rr.contains(mouse[0], mouse[1]);
-                if on {
-                    d.fill(rr, 6.0, theme::SELECTED);
-                } else if hot {
-                    d.fill(rr, 6.0, theme::HOVER);
-                }
+                let hot = !on && rr.contains(mouse[0], mouse[1]);
+                let h = d.anim.hover(key("row-hover", p.pid), hot);
+                let sel = d.anim.toggle(key("row-selected", p.pid), on);
+                let hover = mix_rgba(NONE, theme::HOVER, h);
+                d.fill(rr, 6.0, mix_rgba(hover, theme::SELECTED, sel));
                 draw_proc(d, &cols, rr, p, cpu_div);
                 d.hit(rr, HitKind::Proc { pid: p.pid });
             }
         }
+        d.fade = saved_fade;
     }
     d.clip = None;
     draw_header(d, &cols, header, state.sort);
@@ -1640,17 +1933,51 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         state,
         list,
         content_h,
-        state.scroll,
-        crate::model::ScrollBar::Processes,
+        scroll,
+        ScrollBar::Processes,
         mouse,
     );
     if rows.is_empty() {
-        d.text(
-            "No matching processes",
-            Rect::new(list.x, list.y + 12.0, list.w, 24.0),
-            BODY,
-            theme::INK_3,
-        );
+        let a = d.anim.mix_from(key("empty", ()), 0.0, 1.0, anim::ENTER);
+        d.faded(a, |d| {
+            d.text(
+                "No matching processes",
+                Rect::new(list.x, list.y + 12.0 + (1.0 - a) * ROW_RISE, list.w, 24.0),
+                BODY,
+                theme::INK_3,
+            )
+        });
+    }
+}
+
+/// Group disclosure chevron: points right when `open` is 0 and turns a
+/// quarter clockwise to point down at 1.
+fn chevron(d: &mut DrawList, x: f32, y: f32, open: f32, c: theme::Rgba) {
+    let (sin, cos) = (open * std::f32::consts::FRAC_PI_2).sin_cos();
+    let (cx, cy) = (x + 7.0, y + 7.0);
+    let pts: Vec<[f32; 2]> = [[-2.0_f32, -4.0], [2.0, 0.0], [-2.0, 4.0]]
+        .iter()
+        .map(|[dx, dy]| [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos])
+        .collect();
+    d.line(&pts, ICON_W, c);
+}
+
+/// Scroll offset to draw a pane at. It glides toward the target set by the
+/// wheel and keys, but follows a dragged thumb exactly. `scope` separates
+/// contents that share a pane, so switching them does not scroll between.
+fn smooth_scroll(
+    d: &mut DrawList,
+    state: &AppState,
+    which: ScrollBar,
+    scope: impl std::hash::Hash,
+    target: f32,
+) -> f32 {
+    let k = key("scroll", (which, scope));
+    if matches!(state.drag, Some(Drag::Scroll { which: w, .. }) if w == which) {
+        d.anim.set(k, target);
+        target
+    } else {
+        d.anim.slide(k, target, anim::SCROLL)
     }
 }
 
@@ -1865,18 +2192,21 @@ fn col_title(col: Col) -> &'static str {
     }
 }
 
+/// Column titles. The sorted column brightens and shows a caret that
+/// flattens and flips when the direction changes.
 fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
     for c in cols {
         let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
         let active = c.col == sort.col;
-        let color = if active { theme::INK } else { theme::INK_3 };
+        let on = d.anim.toggle(key("sort-on", c.col), active);
+        let color = mix_rgba(theme::INK_3, theme::INK, on);
         let title = col_title(c.col);
         if c.right {
             d.text_r(title, r, MICRO, color);
         } else {
             d.text(title, r, MICRO, color);
         }
-        if active {
+        if on > 0.0 {
             let tw = measure(&title.to_uppercase(), MICRO);
             let cx = if c.right {
                 r.right() - tw - 12.0
@@ -1884,19 +2214,16 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
                 r.x + tw + 6.0
             };
             let cy = row.y + row.h * 0.5 - 2.0;
-            if sort.desc {
+            let desc = d.anim.toggle(key("sort-desc", c.col), sort.desc);
+            let edge = lerp(cy + 3.5, cy, desc);
+            let mid = lerp(cy, cy + 3.5, desc);
+            d.faded(on, |d| {
                 d.line(
-                    &[[cx, cy], [cx + 3.0, cy + 3.5], [cx + 6.0, cy]],
+                    &[[cx, edge], [cx + 3.0, mid], [cx + 6.0, edge]],
                     1.1,
                     theme::INK_2,
-                );
-            } else {
-                d.line(
-                    &[[cx, cy + 3.5], [cx + 3.0, cy], [cx + 6.0, cy + 3.5]],
-                    1.1,
-                    theme::INK_2,
-                );
-            }
+                )
+            });
         }
         d.hit(
             Rect::new(row.x + c.x, row.y - 4.0, c.w, row.h + 8.0),
@@ -1978,11 +2305,14 @@ fn scrollbar(
     let hit = Rect::new(viewport.right() - 10.0, viewport.y, 12.0, viewport.h);
     let hot = hit.contains(mouse[0], mouse[1])
         || matches!(state.drag, Some(crate::model::Drag::Scroll { which: w, .. }) if w == which);
-    // Visual thumb stays slim; hit strip is wider so it is easy to grab.
+    // Visual thumb stays slim and thickens a little under the pointer; the
+    // hit strip is wider so it is easy to grab.
+    let h = d.anim.hover(key("thumb", which), hot);
+    let tw = 2.0 + 1.5 * h;
     d.fill(
-        Rect::new(viewport.right() - 3.0, thumb_y, 2.0, thumb_h),
-        1.0,
-        if hot { theme::INK_2 } else { theme::INK_4 },
+        Rect::new(viewport.right() - 1.0 - tw, thumb_y, tw, thumb_h),
+        tw * 0.5,
+        mix_rgba(theme::INK_4, theme::INK_2, h),
     );
     state.scroll_bar = Some(crate::model::ScrollGeom {
         which,
@@ -2030,11 +2360,22 @@ fn performance(
         (Icon::Disk, "Disk", Section::Disk, None),
         (Icon::Net, "Network", Section::Net, None),
     ];
-    let mut y = sub.y + 44.0;
-    for (ic, label, section, extra) in items {
-        let r = Rect::new(sub.x + 10.0, y, sub.w - 20.0, 34.0);
+    let slot = |i: usize| {
+        Rect::new(
+            sub.x + 10.0,
+            sub.y + 44.0 + i as f32 * 38.0,
+            sub.w - 20.0,
+            34.0,
+        )
+    };
+    let sel = items.iter().position(|it| it.2 == state.section).map(slot);
+    side_highlight(d, "section", sub.y, sel);
+    for (i, (ic, label, section, extra)) in items.into_iter().enumerate() {
+        let r = slot(i);
+        let id = HitKind::Section(section);
         side_item(
             d,
+            id,
             r,
             ic,
             label,
@@ -2042,10 +2383,14 @@ fn performance(
             state.section == section,
             mouse,
         );
-        d.hit(r, HitKind::Section(section));
-        y += 38.0;
+        d.hit(r, id);
     }
 
+    // A new section enters like a page, inside the detail pane only.
+    let enter = d
+        .anim
+        .mix_from(key("section", state.section), 0.0, 1.0, anim::ENTER);
+    let rise = (1.0 - enter.min(d.enter)) * PAGE_RISE;
     let view = Rect::new(
         detail.x + 28.0,
         detail.y + 22.0,
@@ -2053,9 +2398,18 @@ fn performance(
         detail.h - 46.0,
     );
     d.detail_rect = Some(view);
-    let y0 = view.y - state.perf_scroll;
+    let scroll = smooth_scroll(
+        d,
+        state,
+        ScrollBar::Performance,
+        state.section,
+        state.perf_scroll,
+    );
+    let y0 = view.y - scroll + rise;
     let head = state.perf_smooth.head();
     d.clip = Some(view);
+    let saved_fade = d.fade;
+    d.fade *= enter;
     let content_bottom = match state.section {
         Section::Cpu => cpu_page(d, snap, view, y0, head),
         Section::Memory => memory_page(d, snap, view, y0, head),
@@ -2063,6 +2417,7 @@ fn performance(
         Section::Disk => io_page(d, state, view, y0, true, snap, head),
         Section::Net => io_page(d, state, view, y0, false, snap, head),
     };
+    d.fade = saved_fade;
     d.clip = None;
     let content_h = (content_bottom - y0).max(0.0);
     let max_scroll = (content_h - view.h).max(0.0);
@@ -2074,8 +2429,8 @@ fn performance(
         state,
         view,
         content_h,
-        state.perf_scroll,
-        crate::model::ScrollBar::Performance,
+        scroll,
+        ScrollBar::Performance,
         mouse,
     );
 }
@@ -2614,16 +2969,27 @@ fn startup_page(
     if state.startup_scroll > max_scroll {
         state.startup_scroll = max_scroll;
     }
-    let first = (state.startup_scroll / row_h).floor() as usize;
+    let scroll = smooth_scroll(d, state, ScrollBar::Startup, (), state.startup_scroll);
+    let first = (scroll / row_h).floor() as usize;
     let nvis = ((list.h / row_h).ceil() as usize) + 2;
     d.clip = Some(list);
     let full = list;
     let list = Rect::new(list.x, list.y, (list.w - SCROLL_GUTTER).max(40.0), list.h);
-    for (i, entry) in startup.iter().enumerate().skip(first).take(nvis) {
-        let ry = list.y + i as f32 * row_h - state.startup_scroll;
+    for (n, (i, entry)) in startup
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(nvis)
+        .enumerate()
+    {
+        let ry = list.y + i as f32 * row_h - scroll;
         if ry + row_h < list.y || ry > list.bottom() {
             continue;
         }
+        let a = stagger(d, n);
+        let ry = ry + (1.0 - a) * ROW_RISE;
+        let saved_fade = d.fade;
+        d.fade *= a;
         let rr = Rect::new(full.x, ry, full.w, row_h);
         let name_ink = if entry.enabled {
             theme::INK
@@ -2664,19 +3030,13 @@ fn startup_page(
             d,
             Rect::new(list.right() - 32.0, ry + 17.0, 32.0, 18.0),
             entry.enabled,
+            key("startup-switch", &entry.path),
         );
         d.hit(rr, HitKind::Startup(i));
+        d.fade = saved_fade;
     }
     d.clip = None;
-    scrollbar(
-        d,
-        state,
-        full,
-        content_h,
-        state.startup_scroll,
-        crate::model::ScrollBar::Startup,
-        mouse,
-    );
+    scrollbar(d, state, full, content_h, scroll, ScrollBar::Startup, mouse);
 }
 
 // --- Settings ---------------------------------------------------------------
@@ -2744,8 +3104,13 @@ fn settings_groups(state: &AppState) -> Vec<(&'static str, Vec<SetRow>)> {
                     choice(Opt::Glass, s.glass),
                 ),
                 row(
-                    "Motion",
-                    "Reduced drops fades and moves graphs in whole samples",
+                    "Animations",
+                    "Fades, glides and transitions across the interface",
+                    Ctl::Switch(Opt::Animations, s.animations),
+                ),
+                row(
+                    "Graph motion",
+                    "Reduced steps graphs once per sample and snaps their meters",
                     choice(Opt::Motion, s.motion),
                 ),
                 row(
@@ -2897,17 +3262,32 @@ fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
         Ctl::Choice(items) => {
             segmented(d, x, y, items, mouse);
         }
-        Ctl::Switch(_, on) => switch(d, Rect::new(x, y + 7.0, 32.0, 18.0), *on),
+        Ctl::Switch(opt, on) => switch(
+            d,
+            Rect::new(x, y + 7.0, 32.0, 18.0),
+            *on,
+            key("switch", *opt),
+        ),
         Ctl::Chips(items) => {
             let mut cx = x;
             for (label, on, kind) in items {
                 let r = Rect::new(cx, y, pill_w(label, false), PILL_H);
-                if *on {
-                    d.fill(r, r.h * 0.5, theme::ACCENT);
-                    d.text_c(label, r, PILL_ON, theme::ON_ACCENT);
-                } else {
-                    ghost_pill(d, r, None, label, mouse, true, false);
-                }
+                // Chip ids flip with their value, so key on the label.
+                let h = d
+                    .anim
+                    .hover(key("chip-hover", label), r.contains(mouse[0], mouse[1]));
+                let o = d.anim.toggle(key("chip-on", label), *on);
+                let rest = mix_rgba(NONE, theme::HOVER, h);
+                let line = mix_rgba(theme::GHOST_LINE, theme::ACCENT_LINE, h);
+                d.slab(
+                    r,
+                    r.h * 0.5,
+                    mix_rgba(rest, theme::ACCENT, o),
+                    mix_rgba(line, theme::ACCENT, o),
+                    1.0,
+                );
+                let ink = mix_rgba(mix_rgba(theme::INK_2, theme::INK, h), theme::ON_ACCENT, o);
+                d.text_c(label, r, if o > 0.5 { PILL_ON } else { PILL }, ink);
                 d.hit(r, *kind);
                 cx += r.w + CHIP_GAP;
             }
@@ -2917,15 +3297,12 @@ fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
             let hi = crate::model::step_ui_scale(*scale, 1) > *scale + 0.001;
             for (dx, delta, enabled) in [(0.0, -1_i8, lo), (STEP_D + STEP_VALUE_W, 1, hi)] {
                 let r = Rect::new(x + dx, y, STEP_D, STEP_D);
-                ghost_pill(d, r, None, "", mouse, enabled, false);
+                let id = HitKind::Zoom(delta);
+                ghost_pill(d, id, r, None, "", mouse, enabled, false);
                 let hot = enabled && r.contains(mouse[0], mouse[1]);
-                let ink = if !enabled {
-                    theme::INK_4
-                } else if hot {
-                    theme::INK
-                } else {
-                    theme::INK_2
-                };
+                let h = d.anim.hover(key("step-hover", delta), hot);
+                let en = d.anim.toggle(key("step-enabled", delta), enabled);
+                let ink = mix_rgba(theme::INK_4, mix_rgba(theme::INK_2, theme::INK, h), en);
                 let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
                 bar(d, cx - 4.5, cy, cx + 4.5, cy, ICON_W, ink);
                 if delta > 0 {
@@ -2945,7 +3322,16 @@ fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
         Ctl::Reset(armed) => {
             let label = reset_label(*armed);
             let r = Rect::new(x, y, pill_w(label, false), PILL_H);
-            ghost_pill(d, r, None, label, mouse, true, *armed);
+            ghost_pill(
+                d,
+                HitKind::ResetSettings,
+                r,
+                None,
+                label,
+                mouse,
+                true,
+                *armed,
+            );
             d.hit(r, HitKind::ResetSettings);
         }
     }
@@ -2995,13 +3381,32 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
     if state.settings_scroll > max_scroll {
         state.settings_scroll = max_scroll;
     }
+    let scroll = smooth_scroll(d, state, ScrollBar::Settings, (), state.settings_scroll);
 
     d.clip = Some(list_full);
-    let mut y = list.y - state.settings_scroll;
+    let mut cursor = list.y - scroll;
+    // Entrance cascade over what is on screen; rows above it count as zero.
+    let mut n = 0;
+    let mut next = |d: &DrawList, top: f32| {
+        let a = if top + SET_ROW_H < list.y {
+            1.0
+        } else {
+            n += 1;
+            stagger(d, n - 1)
+        };
+        (a, (1.0 - a) * ROW_RISE)
+    };
     for (title, rows) in &groups {
-        eyebrow(d, list.x, y + 20.0, list.w, title, None);
-        y += SET_GROUP_H;
+        let (a, drop) = next(d, cursor);
+        d.faded(a, |d| {
+            eyebrow(d, list.x, cursor + 20.0 + drop, list.w, title, None)
+        });
+        cursor += SET_GROUP_H;
         for row in rows {
+            let (a, drop) = next(d, cursor);
+            let saved_fade = d.fade;
+            d.fade *= a;
+            let y = cursor + drop;
             let h = row_h(&row.ctl);
             let rr = Rect::new(list.x, y, list.w, h);
             let cw = ctl_w(&row.ctl);
@@ -3034,7 +3439,8 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
             };
             draw_ctl(d, &row.ctl, cx, cy, mouse);
             d.hairline(Rect::new(list.x, y + h - 1.0, list.w, 1.0));
-            y += h;
+            d.fade = saved_fade;
+            cursor += h;
         }
     }
     d.clip = None;
@@ -3043,33 +3449,102 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
         state,
         list_full,
         content_h,
-        state.settings_scroll,
-        crate::model::ScrollBar::Settings,
+        scroll,
+        ScrollBar::Settings,
         mouse,
     );
 }
 
-fn switch(d: &mut DrawList, r: Rect, on: bool) {
-    if on {
-        d.fill(r, r.h * 0.5, theme::ACCENT);
-        d.fill(
-            Rect::new(r.right() - 15.0, r.y + 3.0, 12.0, 12.0),
-            6.0,
-            theme::ON_ACCENT,
-        );
-    } else {
-        d.outline(r, r.h * 0.5, theme::GHOST_LINE);
-        d.fill(
-            Rect::new(r.x + 3.0, r.y + 3.0, 12.0, 12.0),
-            6.0,
-            theme::INK_3,
-        );
-    }
+/// On/off switch. The track fills as the knob slides across, and the knob
+/// stretches mid-travel so the flip reads as a throw rather than a jump.
+fn switch(d: &mut DrawList, r: Rect, on: bool, id: Key) {
+    let t = d.anim.toggle(id, on);
+    d.slab(
+        r,
+        r.h * 0.5,
+        mix_rgba(NONE, theme::ACCENT, t),
+        mix_rgba(theme::GHOST_LINE, theme::ACCENT, t),
+        1.0,
+    );
+    let kw = 12.0 + 6.0 * 4.0 * t * (1.0 - t);
+    let kx = lerp(r.x + 3.0, r.right() - 3.0 - kw, t);
+    d.fill(
+        Rect::new(kx, r.y + 3.0, kw, 12.0),
+        6.0,
+        mix_rgba(theme::INK_3, theme::ON_ACCENT, t),
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sample_hist;
+    use super::{animating, build, sample_hist};
+    use crate::model::{AppState, Page, Proc, Snap};
+
+    fn proc(pid: i32, cpu: f32) -> Proc {
+        Proc {
+            pid,
+            uid: 1000,
+            user: "me".into(),
+            name: format!("p{pid}"),
+            cpu,
+            gpu: 0.0,
+            rss: 1 << 20,
+            read_bps: None,
+            write_bps: None,
+            threads: 1,
+            is_user: pid % 2 == 0,
+            stopped: false,
+        }
+    }
+
+    /// Paint frames at roughly display rate until nothing moves.
+    fn settles(state: &mut AppState, snap: &Snap) -> bool {
+        for _ in 0..120 {
+            build(state, snap, &[], [0.0, 0.0]);
+            if !animating(state) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        false
+    }
+
+    #[test]
+    fn every_page_entrance_settles_and_goes_idle() {
+        let mut snap = Snap::placeholder();
+        snap.procs = (1..40).map(|p| proc(p, p as f32)).collect();
+        let mut state = AppState::new(1240.0, 780.0);
+        for page in [
+            Page::Processes,
+            Page::Performance,
+            Page::Startup,
+            Page::Settings,
+            Page::Processes,
+        ] {
+            state.page = page;
+            assert!(settles(&mut state, &snap), "{page:?} never settled");
+        }
+        // A re-sort glides rows to their new slots, then stops.
+        snap.procs.reverse();
+        for p in &mut snap.procs {
+            p.cpu = 100.0 - p.cpu;
+        }
+        build(&mut state, &snap, &[], [0.0, 0.0]);
+        assert!(settles(&mut state, &snap), "reorder never settled");
+    }
+
+    #[test]
+    fn animations_off_never_request_frames() {
+        let mut snap = Snap::placeholder();
+        snap.procs = (1..10).map(|p| proc(p, 1.0)).collect();
+        let mut state = AppState::new(1240.0, 780.0);
+        state.settings.animations = false;
+        for page in [Page::Processes, Page::Startup, Page::Settings] {
+            state.page = page;
+            build(&mut state, &snap, &[], [0.0, 0.0]);
+            assert!(!animating(&state), "{page:?}");
+        }
+    }
 
     #[test]
     fn curve_stays_inside_its_samples() {

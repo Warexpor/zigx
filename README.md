@@ -39,7 +39,7 @@ Keys, when the search box is not focused:
 
 The Settings page, at the foot of the nav, applies every change at once and saves it to `~/.config/zigx/settings.txt`, which is also safe to edit by hand.
 
-- **Appearance:** interface scale, glass (clear, glass, solid), motion (smooth or reduced), row density, status color, title bar readout.
+- **Appearance:** interface scale, glass (clear, glass, solid), animations (on or off: fades, glides and transitions across the interface), graph motion (smooth or reduced), row density, status color, title bar readout.
 - **Graphs:** history (30 s, 1 min, 2 min), curves (smooth or linear), fill under traces, grid.
 - **Data:** update speed (0.5, 1 or 2 s, or Pause), process CPU as a share of one core or of the whole machine, byte units (1024 or 1000), temperature (°C or °F).
 - **Processes:** which optional columns show (GPU, Disk, PID, User, Threads), and whether ending a task asks for a second click.

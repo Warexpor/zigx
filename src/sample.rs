@@ -77,6 +77,7 @@ pub struct Engine {
     last_gpu: Instant,
     cached_procs: Vec<Proc>,
     cached_gpus: Vec<GpuRaw>,
+    cached_proc_gpu: HashMap<i32, f32>,
     sample_avg: f32,
     nvml: Option<Nvml>,
     text: String,
@@ -113,6 +114,7 @@ impl Engine {
             last_gpu: Instant::now(),
             cached_procs: Vec::new(),
             cached_gpus: Vec::new(),
+            cached_proc_gpu: HashMap::new(),
             sample_avg: 0.0,
             nvml: Nvml::open(),
             text: String::new(),
@@ -133,9 +135,14 @@ impl Engine {
         // is enough for the graph and keeps the monitor off the CPU budget.
         if self.cached_gpus.is_empty() || self.last_gpu.elapsed() >= Duration::from_secs(1) {
             self.cached_gpus = self.read_gpus();
+            self.cached_proc_gpu = self.read_proc_gpus();
+            for p in &mut self.cached_procs {
+                p.gpu = self.cached_proc_gpu.get(&p.pid).copied().unwrap_or(0.0);
+            }
             self.last_gpu = Instant::now();
         }
-        if self.cached_procs.is_empty() || self.last_proc.elapsed() >= Duration::from_millis(500) {
+        // Process list refreshes once a second so rows do not thrash every sample.
+        if self.cached_procs.is_empty() || self.last_proc.elapsed() >= Duration::from_secs(1) {
             let proc_dt = self.last_proc.elapsed().as_secs_f64();
             self.cached_procs = self.read_procs(proc_dt);
             self.last_proc = Instant::now();
@@ -301,6 +308,16 @@ impl Engine {
         sample_sysfs_gpus()
     }
 
+    fn read_proc_gpus(&self) -> HashMap<i32, f32> {
+        if let Some(nv) = self.nvml.as_ref() {
+            let map = nv.process_util();
+            if !map.is_empty() {
+                return map;
+            }
+        }
+        HashMap::new()
+    }
+
     fn read_procs(&mut self, dt: f64) -> Vec<Proc> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
@@ -371,6 +388,7 @@ impl Engine {
                 user: self.user_name(uid),
                 name,
                 cpu,
+                gpu: self.cached_proc_gpu.get(&pid).copied().unwrap_or(0.0),
                 rss: stat.rss_pages * self.page_size,
                 read_bps,
                 write_bps,
@@ -941,6 +959,14 @@ struct Nvml {
     clock: unsafe extern "C" fn(*mut std::ffi::c_void, i32, *mut u32) -> i32,
     enc: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32>,
     dec: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32>,
+    proc_util: Option<
+        unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *mut NvmlProcSample,
+            *mut u32,
+            u64,
+        ) -> i32,
+    >,
     names: Vec<String>,
 }
 
@@ -955,6 +981,17 @@ struct NvmlMem {
     total: u64,
     free: u64,
     used: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvmlProcSample {
+    pid: u32,
+    time_stamp: u64,
+    sm_util: u32,
+    mem_util: u32,
+    enc_util: u32,
+    dec_util: u32,
 }
 
 unsafe impl Send for Nvml {}
@@ -1017,11 +1054,56 @@ impl Nvml {
                     .get(b"nvmlDeviceGetDecoderUtilization\0")
                     .ok()
                     .map(|s| *s),
+                proc_util: lib
+                    .get(b"nvmlDeviceGetProcessUtilization\0")
+                    .ok()
+                    .map(|s| *s),
                 _lib: lib,
                 devices,
                 names,
             })
         }
+    }
+
+    fn process_util(&self) -> HashMap<i32, f32> {
+        let Some(proc_util) = self.proc_util else {
+            return HashMap::new();
+        };
+        let mut map = HashMap::new();
+        for &dev in &self.devices {
+            unsafe {
+                let mut count = 0u32;
+                // Size probe: INSUFFICIENT_SIZE (7) fills `count`.
+                let _ = proc_util(dev, std::ptr::null_mut(), &mut count, 0);
+                if count == 0 {
+                    continue;
+                }
+                // Over-allocate; NVML sometimes under-reports the needed size.
+                let mut n = count.max(8).saturating_mul(2);
+                let mut buf = vec![
+                    NvmlProcSample {
+                        pid: 0,
+                        time_stamp: 0,
+                        sm_util: 0,
+                        mem_util: 0,
+                        enc_util: 0,
+                        dec_util: 0,
+                    };
+                    n as usize
+                ];
+                if proc_util(dev, buf.as_mut_ptr(), &mut n, 0) != 0 {
+                    continue;
+                }
+                for sample in buf.iter().take(n as usize) {
+                    if sample.pid == 0 {
+                        continue;
+                    }
+                    let entry = map.entry(sample.pid as i32).or_insert(0.0);
+                    *entry += sample.sm_util as f32;
+                }
+            }
+        }
+        map
     }
 
     fn sample(&self) -> Vec<GpuRaw> {

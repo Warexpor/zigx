@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::model::{AppState, Col, Density, Drag, Page};
+use crate::model::{AppState, Col, Density, Drag, Page, ScrollBar};
 
 use super::frame::HitKind;
 
@@ -35,7 +35,13 @@ pub fn expire(state: &mut AppState) {
     }
 }
 
-pub fn on_press(state: &mut AppState, kind: HitKind, ctrl: bool, shift: bool) -> Vec<Effect> {
+pub fn on_press(
+    state: &mut AppState,
+    kind: HitKind,
+    ctrl: bool,
+    shift: bool,
+    mouse: [f32; 2],
+) -> Vec<Effect> {
     if !matches!(kind, HitKind::Search) {
         state.search_focused = false;
     }
@@ -56,6 +62,7 @@ pub fn on_press(state: &mut AppState, kind: HitKind, ctrl: bool, shift: bool) ->
         HitKind::View(view) => {
             state.view = view;
             state.scroll = 0.0;
+            state.pinned.clear();
             vec![Effect::Persist]
         }
         HitKind::Density => {
@@ -86,10 +93,20 @@ pub fn on_press(state: &mut AppState, kind: HitKind, ctrl: bool, shift: bool) ->
             } else {
                 state.system_open = !state.system_open;
             }
+            // Visible indices shift; drop pins and re-capture after the next layout.
+            state.pinned.clear();
             vec![]
         }
         HitKind::Proc { pid } => {
             select_proc(state, pid, ctrl, shift);
+            vec![]
+        }
+        HitKind::Deselect => {
+            clear_selection(state);
+            vec![]
+        }
+        HitKind::Scroll(which) => {
+            begin_scroll_drag(state, which, mouse[1]);
             vec![]
         }
         HitKind::Startup(index) => vec![Effect::FlipStartup(index)],
@@ -111,23 +128,23 @@ pub fn on_press(state: &mut AppState, kind: HitKind, ctrl: bool, shift: bool) ->
 }
 
 /// Press positions are applied by [`note_drag_origin`] so splitters track the cursor.
-pub fn note_drag_origin(state: &mut AppState, x: f32) {
+pub fn note_drag_origin(state: &mut AppState, x: f32, y: f32) {
     if let Some(drag) = state.drag.as_mut() {
         match drag {
             Drag::Nav { x0, .. } | Drag::Sub { x0, .. } => *x0 = x,
+            Drag::Scroll { y0, .. } => *y0 = y,
         }
     }
 }
 
 pub fn on_release(state: &mut AppState) -> Vec<Effect> {
-    if state.drag.take().is_some() {
-        vec![Effect::Persist]
-    } else {
-        vec![]
+    match state.drag.take() {
+        Some(Drag::Nav { .. } | Drag::Sub { .. }) => vec![Effect::Persist],
+        Some(Drag::Scroll { .. }) | None => vec![],
     }
 }
 
-pub fn on_move(state: &mut AppState, x: f32) -> bool {
+pub fn on_move(state: &mut AppState, x: f32, y: f32) -> bool {
     match state.drag {
         Some(Drag::Nav { x0, w0 }) => {
             state.nav_w = (w0 + (x - x0)).clamp(160.0, 300.0);
@@ -135,6 +152,21 @@ pub fn on_move(state: &mut AppState, x: f32) -> bool {
         }
         Some(Drag::Sub { x0, w0 }) => {
             state.sub_w = (w0 + (x - x0)).clamp(140.0, 260.0);
+            true
+        }
+        Some(Drag::Scroll {
+            which,
+            y0,
+            scroll0,
+            track,
+            max_scroll,
+        }) => {
+            let t = if track > 0.0 {
+                (scroll0 + (y - y0) / track * max_scroll).clamp(0.0, max_scroll)
+            } else {
+                scroll0
+            };
+            set_scroll(state, which, t);
             true
         }
         None => false,
@@ -309,6 +341,7 @@ fn select_proc(state: &mut AppState, pid: i32, ctrl: bool, shift: bool) {
                 for p in &state.visible_pids[lo..=hi] {
                     state.selected.insert(*p);
                 }
+                sync_pins(state);
                 return;
             }
         }
@@ -318,11 +351,72 @@ fn select_proc(state: &mut AppState, pid: i32, ctrl: bool, shift: bool) {
             state.selected.insert(pid);
         }
         state.anchor = Some(pid);
+        sync_pins(state);
         return;
     }
     state.selected.clear();
     state.selected.insert(pid);
     state.anchor = Some(pid);
+    sync_pins(state);
+}
+
+pub fn clear_selection(state: &mut AppState) {
+    state.selected.clear();
+    state.pinned.clear();
+    state.anchor = None;
+    state.armed = None;
+}
+
+fn begin_scroll_drag(state: &mut AppState, which: ScrollBar, y: f32) {
+    let Some(g) = state.scroll_bar.filter(|g| g.which == which) else {
+        return;
+    };
+    let track = (g.track_h - g.thumb_h).max(1.0);
+    let scroll0 = if y < g.thumb_y || y > g.thumb_y + g.thumb_h {
+        // Click in the track: jump so the thumb centers on the pointer.
+        let t = ((y - g.track_y - g.thumb_h * 0.5) / track).clamp(0.0, 1.0);
+        let s = t * g.max_scroll;
+        set_scroll(state, which, s);
+        s
+    } else {
+        get_scroll(state, which)
+    };
+    state.drag = Some(Drag::Scroll {
+        which,
+        y0: y,
+        scroll0,
+        track,
+        max_scroll: g.max_scroll,
+    });
+}
+
+fn get_scroll(state: &AppState, which: ScrollBar) -> f32 {
+    match which {
+        ScrollBar::Processes => state.scroll,
+        ScrollBar::Performance => state.perf_scroll,
+        ScrollBar::Startup => state.startup_scroll,
+    }
+}
+
+fn set_scroll(state: &mut AppState, which: ScrollBar, v: f32) {
+    match which {
+        ScrollBar::Processes => state.scroll = v.max(0.0),
+        ScrollBar::Performance => state.perf_scroll = v.max(0.0),
+        ScrollBar::Startup => state.startup_scroll = v.max(0.0),
+    }
+}
+
+/// Freeze each selected process at its current list index.
+fn sync_pins(state: &mut AppState) {
+    state.pinned.clear();
+    if state.selected.is_empty() {
+        return;
+    }
+    for &pid in &state.selected {
+        if let Some(i) = state.visible_pids.iter().position(|p| *p == pid) {
+            state.pinned.insert(pid, i);
+        }
+    }
 }
 
 fn end_task(state: &mut AppState) -> Vec<Effect> {

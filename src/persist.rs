@@ -151,6 +151,7 @@ fn col_name(c: Col) -> &'static str {
     match c {
         Col::Name => "name",
         Col::Cpu => "cpu",
+        Col::Gpu => "gpu",
         Col::Memory => "memory",
         Col::Disk => "disk",
         Col::Pid => "pid",
@@ -162,6 +163,7 @@ fn col_name(c: Col) -> &'static str {
 fn parse_col(s: &str) -> Col {
     match s {
         "name" => Col::Name,
+        "gpu" => Col::Gpu,
         "memory" => Col::Memory,
         "disk" => Col::Disk,
         "pid" => Col::Pid,

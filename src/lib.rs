@@ -14,8 +14,8 @@ mod startup;
 
 pub use frame::{build, hit_at, DrawList, Hit, HitKind, Rect};
 pub use interact::{
-    expire, note_drag_origin, on_key, on_move, on_press, on_release, on_wheel, terminate, Effect,
-    KeyIn,
+    clear_selection, expire, note_drag_origin, on_key, on_move, on_press, on_release, on_wheel,
+    terminate, Effect, KeyIn,
 };
 pub use model::*;
 pub use persist::{load_ui, save_ui};

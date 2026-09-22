@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -41,6 +41,7 @@ pub enum Density {
 pub enum Col {
     Name,
     Cpu,
+    Gpu,
     Memory,
     Disk,
     Pid,
@@ -61,6 +62,7 @@ pub struct Proc {
     pub user: String,
     pub name: String,
     pub cpu: f32,
+    pub gpu: f32,
     pub rss: u64,
     pub read_bps: Option<f64>,
     pub write_bps: Option<f64>,
@@ -182,10 +184,34 @@ pub struct Revert {
     pub previous: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollBar {
+    Processes,
+    Performance,
+    Startup,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollGeom {
+    pub which: ScrollBar,
+    pub track_y: f32,
+    pub track_h: f32,
+    pub thumb_y: f32,
+    pub thumb_h: f32,
+    pub max_scroll: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Drag {
     Nav { x0: f32, w0: f32 },
     Sub { x0: f32, w0: f32 },
+    Scroll {
+        which: ScrollBar,
+        y0: f32,
+        scroll0: f32,
+        track: f32,
+        max_scroll: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -210,6 +236,8 @@ pub struct AppState {
     pub query: String,
     pub search_focused: bool,
     pub selected: BTreeSet<i32>,
+    /// Selected PIDs stay at these `visible_pids` indices until deselected.
+    pub pinned: BTreeMap<i32, usize>,
     pub anchor: Option<i32>,
     pub scroll: f32,
     pub perf_scroll: f32,
@@ -217,6 +245,8 @@ pub struct AppState {
     pub nav_w: f32,
     pub sub_w: f32,
     pub drag: Option<Drag>,
+    /// Geometry of the active page scrollbar (set while building the frame).
+    pub scroll_bar: Option<ScrollGeom>,
     pub armed: Option<Armed>,
     pub undo: Option<Undo>,
     pub user_open: bool,
@@ -242,6 +272,7 @@ impl AppState {
             query: String::new(),
             search_focused: false,
             selected: BTreeSet::new(),
+            pinned: BTreeMap::new(),
             anchor: None,
             scroll: 0.0,
             perf_scroll: 0.0,
@@ -249,6 +280,7 @@ impl AppState {
             nav_w: 200.0,
             sub_w: 196.0,
             drag: None,
+            scroll_bar: None,
             armed: None,
             undo: None,
             user_open: true,

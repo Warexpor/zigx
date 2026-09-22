@@ -76,6 +76,8 @@ pub struct Label {
     pub weight: u16,
     /// Letter spacing in em.
     pub tracking: f32,
+    /// Optional scissor in design pixels (e.g. process list viewport).
+    pub clip: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +95,9 @@ pub enum HitKind {
     Undo,
     Group(bool),
     Proc { pid: i32 },
+    /// Empty process-list chrome: clears the selection (unfreezes pinned rows).
+    Deselect,
+    Scroll(crate::model::ScrollBar),
     Startup(usize),
     DragNav,
     DragSub,
@@ -204,7 +209,10 @@ impl DrawList {
         border: theme::Rgba,
         border_w: f32,
     ) {
-        if r.w < 1.0 || r.h < 1.0 || !self.visible(r) {
+        let Some(r) = self.clip_rect(r) else {
+            return;
+        };
+        if r.w < 1.0 || r.h < 1.0 {
             return;
         }
         self.slabs.push(Slab {
@@ -221,6 +229,21 @@ impl DrawList {
         });
     }
 
+    /// Intersect with the active clip, if any. `None` means fully outside.
+    fn clip_rect(&self, r: Rect) -> Option<Rect> {
+        let Some(c) = self.clip else {
+            return Some(r);
+        };
+        let x0 = r.x.max(c.x);
+        let y0 = r.y.max(c.y);
+        let x1 = r.right().min(c.right());
+        let y1 = r.bottom().min(c.bottom());
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+    }
+
     /// 1px hairline, the only hard edge in the system.
     fn hairline(&mut self, r: Rect) {
         self.fill(r, 0.0, theme::HAIRLINE);
@@ -234,6 +257,17 @@ impl DrawList {
 
     /// Glyph stroke: joined polyline with round ends.
     fn line(&mut self, pts: &[[f32; 2]], width: f32, color: theme::Rgba) {
+        if let Some(c) = self.clip {
+            let mut min_y = f32::INFINITY;
+            let mut max_y = f32::NEG_INFINITY;
+            for p in pts {
+                min_y = min_y.min(p[1]);
+                max_y = max_y.max(p[1]);
+            }
+            if max_y < c.y || min_y > c.bottom() {
+                return;
+            }
+        }
         self.strokes.push(Stroke {
             pts: pts.to_vec(),
             width,
@@ -293,6 +327,7 @@ impl DrawList {
             mono: t.mono,
             weight: t.weight,
             tracking: t.tracking,
+            clip: self.clip,
         });
     }
 
@@ -645,6 +680,7 @@ pub fn build(
     mouse: [f32; 2],
 ) -> DrawList {
     let mut d = DrawList::new();
+    state.scroll_bar = None;
     let w = state.width.max(420.0);
     let h = state.height.max(320.0);
 
@@ -677,7 +713,7 @@ pub fn build(
     }
 
     title_bar(&mut d, snap, bar, mouse);
-    nav_items(&mut d, state, nav, mouse, snap.sample_ms);
+    nav_items(&mut d, state, nav, mouse);
 
     d.hit(
         Rect::new(nav.right() - 2.0, body.y, 5.0, body.h),
@@ -744,7 +780,18 @@ fn title_bar(d: &mut DrawList, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
     }
 
     // Live readout, instrument style, ahead of the controls.
-    let readout = format!("cpu {}   mem {}", cpu_pct(snap.cpu_total), mem_short(snap));
+    let gpu = snap
+        .gpus
+        .first()
+        .and_then(|g| g.util)
+        .map(cpu_pct)
+        .unwrap_or_else(|| "—".into());
+    let readout = format!(
+        "cpu {}   mem {}   gpu {}",
+        cpu_pct(snap.cpu_total),
+        mem_short(snap),
+        gpu
+    );
     let rw = measure(&readout.to_uppercase(), MICRO_NUM);
     d.text_r(
         &readout,
@@ -783,7 +830,7 @@ fn side_item(
     }
 }
 
-fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2], sample_ms: f32) {
+fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2]) {
     eyebrow(d, nav.x + 20.0, nav.y + 18.0, nav.w - 40.0, "Monitor", None);
     let items = [
         (Icon::List, "Processes", Page::Processes),
@@ -798,7 +845,7 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2], sam
         y += 38.0;
     }
     d.text(
-        &format!("v{}  ·  {sample_ms:.1} ms", env!("CARGO_PKG_VERSION")),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
         Rect::new(nav.x + 20.0, nav.bottom() - 30.0, nav.w - 40.0, 14.0),
         MICRO_NUM,
         theme::INK_4,
@@ -945,12 +992,12 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     ghost_pill(d, dr, Some(dense_icon), dense, mouse, true, false);
     d.hit(dr, HitKind::Density);
 
-    // Column header.
+    // Column header metrics — painted after the list so scrolled row ink
+    // cannot cover the labels / hairline.
     let y = y + ctl_h + 20.0;
     let cols = columns(state.density, inner.w);
     let header = Rect::new(inner.x, y, inner.w, 16.0);
-    draw_header(d, &cols, header, state.sort);
-    d.hairline(Rect::new(inner.x, y + 24.0, inner.w, 1.0));
+    let hair_y = y + 24.0;
     let y = y + 25.0;
     let list = Rect::new(inner.x, y, inner.w, (inner.bottom() - y).max(20.0));
     d.list_rect = Some(list);
@@ -960,6 +1007,11 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         state
             .selected
             .retain(|pid| snap.procs.iter().any(|p| p.pid == *pid));
+        state.pinned.retain(|pid, _| state.selected.contains(pid));
+        if state.selected.is_empty() {
+            state.pinned.clear();
+            state.anchor = None;
+        }
     }
     let rows = visible_rows(state, snap);
     state.visible_pids = rows
@@ -969,6 +1021,14 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
             Row::Header { .. } => None,
         })
         .collect();
+    // After a view/group change cleared pins, freeze selected rows at their new spots.
+    if !state.selected.is_empty() && state.pinned.is_empty() {
+        for &pid in &state.selected {
+            if let Some(i) = state.visible_pids.iter().position(|p| *p == pid) {
+                state.pinned.insert(pid, i);
+            }
+        }
+    }
     let row_h = if state.density == Density::Compact {
         26.0
     } else {
@@ -981,6 +1041,8 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     }
     let first = (state.scroll / row_h).floor() as usize;
     let nvis = ((list.h / row_h).ceil() as usize) + 2;
+    // Under the rows: empty list space clears selection / unfreezes pins.
+    d.hit(list, HitKind::Deselect);
     d.clip = Some(list);
     for (i, row) in rows.iter().enumerate().skip(first).take(nvis) {
         let ry = list.y + i as f32 * row_h - state.scroll;
@@ -1030,7 +1092,17 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         }
     }
     d.clip = None;
-    scrollbar(d, list, content_h, state.scroll);
+    draw_header(d, &cols, header, state.sort);
+    d.hairline(Rect::new(inner.x, hair_y, inner.w, 1.0));
+    scrollbar(
+        d,
+        state,
+        list,
+        content_h,
+        state.scroll,
+        crate::model::ScrollBar::Processes,
+        mouse,
+    );
     if rows.is_empty() {
         d.text(
             "No matching processes",
@@ -1072,6 +1144,7 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
         .collect();
     sort_procs(&mut procs, state.sort.col, state.sort.desc);
     if state.view != ProcView::Grouped {
+        let procs = pin_procs(procs, &state.pinned, 0);
         return procs.into_iter().map(Row::Proc).collect();
     }
     let mut user: Vec<&Proc> = Vec::new();
@@ -1090,7 +1163,11 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
         open: state.user_open,
         user: true,
     });
+    let mut pin_base = 0usize;
     if state.user_open {
+        let n = user.len();
+        let user = pin_procs(user, &state.pinned, pin_base);
+        pin_base += n;
         rows.extend(user.into_iter().map(Row::Proc));
     }
     rows.push(Row::Header {
@@ -1100,9 +1177,51 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
         user: false,
     });
     if state.system_open {
+        let system = pin_procs(system, &state.pinned, pin_base);
         rows.extend(system.into_iter().map(Row::Proc));
     }
     rows
+}
+
+/// Keep pinned processes at the indices captured when they were selected.
+/// `index_base` is this slice's start inside `visible_pids`.
+fn pin_procs<'a>(
+    procs: Vec<&'a Proc>,
+    pinned: &std::collections::BTreeMap<i32, usize>,
+    index_base: usize,
+) -> Vec<&'a Proc> {
+    if pinned.is_empty() || procs.is_empty() {
+        return procs;
+    }
+    let n = procs.len();
+    let mut slots: Vec<Option<&'a Proc>> = vec![None; n];
+    let mut rest = Vec::with_capacity(n);
+    for p in procs {
+        if let Some(&idx) = pinned.get(&p.pid) {
+            if idx >= index_base && idx < index_base + n {
+                let local = idx - index_base;
+                if slots[local].is_none() {
+                    slots[local] = Some(p);
+                    continue;
+                }
+            }
+        }
+        rest.push(p);
+    }
+    let mut ri = 0usize;
+    for slot in &mut slots {
+        if slot.is_none() {
+            if let Some(p) = rest.get(ri) {
+                *slot = Some(*p);
+                ri += 1;
+            }
+        }
+    }
+    let mut out: Vec<&'a Proc> = slots.into_iter().flatten().collect();
+    if ri < rest.len() {
+        out.extend(rest.into_iter().skip(ri));
+    }
+    out
 }
 
 fn sort_procs(procs: &mut [&Proc], col: Col, desc: bool) {
@@ -1112,6 +1231,10 @@ fn sort_procs(procs: &mut [&Proc], col: Col, desc: bool) {
             Col::Cpu => a
                 .cpu
                 .partial_cmp(&b.cpu)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            Col::Gpu => a
+                .gpu
+                .partial_cmp(&b.gpu)
                 .unwrap_or(std::cmp::Ordering::Equal),
             Col::Memory => a.rss.cmp(&b.rss),
             Col::Disk => disk_sum(a)
@@ -1146,6 +1269,7 @@ fn columns(density: Density, width: f32) -> Vec<ColSpec> {
         &[
             (Col::Pid, 68.0, true, true),
             (Col::Memory, 88.0, true, true),
+            (Col::Gpu, 64.0, true, true),
             (Col::Cpu, 68.0, true, true),
         ]
     } else {
@@ -1155,6 +1279,7 @@ fn columns(density: Density, width: f32) -> Vec<ColSpec> {
             (Col::Pid, 72.0, true, true),
             (Col::Disk, 96.0, true, true),
             (Col::Memory, 88.0, true, true),
+            (Col::Gpu, 68.0, true, true),
             (Col::Cpu, 72.0, true, true),
         ]
     };
@@ -1185,6 +1310,7 @@ fn col_title(col: Col) -> &'static str {
     match col {
         Col::Name => "Name",
         Col::Cpu => "CPU",
+        Col::Gpu => "GPU",
         Col::Memory => "Memory",
         Col::Disk => "Disk",
         Col::Pid => "PID",
@@ -1239,6 +1365,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
         let text = match c.col {
             Col::Name => p.name.clone(),
             Col::Cpu => cpu_pct(p.cpu),
+            Col::Gpu => cpu_pct(p.gpu),
             Col::Memory => bytes(p.rss),
             Col::Disk => disk_cell(p.read_bps, p.write_bps),
             Col::Pid => p.pid.to_string(),
@@ -1248,6 +1375,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
         // Idle cells step back so the rows doing something read first.
         let idle = match c.col {
             Col::Cpu => p.cpu < 0.05,
+            Col::Gpu => p.gpu < 0.05,
             Col::Disk => disk_sum(p) < 1.0,
             _ => false,
         };
@@ -1255,6 +1383,8 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
             Col::Name => theme::INK,
             Col::Cpu if idle => theme::INK_4,
             Col::Cpu => heat(p.cpu),
+            Col::Gpu if idle => theme::INK_4,
+            Col::Gpu => heat(p.gpu),
             _ if idle => theme::INK_4,
             _ => theme::INK_2,
         };
@@ -1267,19 +1397,41 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
     }
 }
 
-fn scrollbar(d: &mut DrawList, viewport: Rect, content_h: f32, scroll: f32) {
+fn scrollbar(
+    d: &mut DrawList,
+    state: &mut AppState,
+    viewport: Rect,
+    content_h: f32,
+    scroll: f32,
+    which: crate::model::ScrollBar,
+    mouse: [f32; 2],
+) {
     if content_h <= viewport.h + 1.0 {
         return;
     }
     let thumb_h = (viewport.h * viewport.h / content_h).clamp(24.0, viewport.h);
     let max_scroll = content_h - viewport.h;
+    let track = (viewport.h - thumb_h).max(1.0);
     let t = (scroll / max_scroll).clamp(0.0, 1.0);
-    let y = viewport.y + (viewport.h - thumb_h) * t;
+    let thumb_y = viewport.y + track * t;
+    let hit = Rect::new(viewport.right() - 10.0, viewport.y, 12.0, viewport.h);
+    let hot = hit.contains(mouse[0], mouse[1])
+        || matches!(state.drag, Some(crate::model::Drag::Scroll { which: w, .. }) if w == which);
+    // Visual thumb stays slim; hit strip is wider so it is easy to grab.
     d.fill(
-        Rect::new(viewport.right() - 3.0, y, 2.0, thumb_h),
+        Rect::new(viewport.right() - 3.0, thumb_y, 2.0, thumb_h),
         1.0,
-        theme::INK_4,
+        if hot { theme::INK_2 } else { theme::INK_4 },
     );
+    state.scroll_bar = Some(crate::model::ScrollGeom {
+        which,
+        track_y: viewport.y,
+        track_h: viewport.h,
+        thumb_y,
+        thumb_h,
+        max_scroll,
+    });
+    d.hit(hit, HitKind::Scroll(which));
 }
 
 // --- Performance ------------------------------------------------------------
@@ -1355,7 +1507,15 @@ fn performance(
     if state.perf_scroll > max_scroll {
         state.perf_scroll = max_scroll;
     }
-    scrollbar(d, view, content_h, state.perf_scroll);
+    scrollbar(
+        d,
+        state,
+        view,
+        content_h,
+        state.perf_scroll,
+        crate::model::ScrollBar::Performance,
+        mouse,
+    );
 }
 
 fn window_label() -> String {
@@ -1910,7 +2070,15 @@ fn startup_page(
         d.hit(rr, HitKind::Startup(i));
     }
     d.clip = None;
-    scrollbar(d, list, content_h, state.startup_scroll);
+    scrollbar(
+        d,
+        state,
+        list,
+        content_h,
+        state.startup_scroll,
+        crate::model::ScrollBar::Startup,
+        mouse,
+    );
 }
 
 fn switch(d: &mut DrawList, r: Rect, on: bool) {

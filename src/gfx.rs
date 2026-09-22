@@ -606,16 +606,30 @@ impl Gfx {
             }
             let x = (label.x * scale).round();
             let y = (label.y * scale).round();
+            let mut bounds = TextBounds {
+                left: (x as i32) - 1,
+                top: (y as i32) - 1,
+                right: (x + label.w * scale).ceil() as i32 + 2,
+                bottom: (y + label.h * scale).ceil() as i32 + 4,
+            };
+            if let Some(clip) = label.clip {
+                let left = (clip.x * scale).floor() as i32;
+                let top = (clip.y * scale).floor() as i32;
+                let right = (clip.right() * scale).ceil() as i32;
+                let bottom = (clip.bottom() * scale).ceil() as i32;
+                bounds.left = bounds.left.max(left);
+                bounds.top = bounds.top.max(top);
+                bounds.right = bounds.right.min(right);
+                bounds.bottom = bounds.bottom.min(bottom);
+                if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+                    continue;
+                }
+            }
             self.prepared.push(Prepared {
                 index: i,
                 left: x,
                 top: y,
-                bounds: TextBounds {
-                    left: (x as i32) - 1,
-                    top: (y as i32) - 1,
-                    right: (x + label.w * scale).ceil() as i32 + 2,
-                    bottom: (y + label.h * scale).ceil() as i32 + 4,
-                },
+                bounds,
                 color: glyphon::Color::rgba(
                     label.color[0],
                     label.color[1],

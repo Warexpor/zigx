@@ -115,6 +115,7 @@ impl App {
                     };
                     // Dead PIDs can be recycled; do not leave them armed.
                     self.state.selected.clear();
+                    self.state.pinned.clear();
                     self.state.anchor = None;
                     self.state.undo = Some(Undo {
                         until: Instant::now() + Duration::from_secs(4),
@@ -193,9 +194,22 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
+        // ~70% of the primary monitor, keeping its aspect ratio (fallback 16:9).
+        let (w, h) = event_loop
+            .primary_monitor()
+            .or_else(|| event_loop.available_monitors().next())
+            .map(|m| {
+                let px = m.size();
+                let scale = m.scale_factor().max(0.1);
+                (
+                    (px.width as f64 / scale) * 0.70,
+                    (px.height as f64 / scale) * 0.70,
+                )
+            })
+            .unwrap_or((1344.0, 756.0));
         let mut attrs = WindowAttributes::default()
             .with_title("ZIGX")
-            .with_inner_size(LogicalSize::new(1240.0, 780.0))
+            .with_inner_size(LogicalSize::new(w, h))
             .with_min_inner_size(LogicalSize::new(420.0, 320.0))
             .with_transparent(true)
             .with_decorations(false);
@@ -223,14 +237,17 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = self.pointer(&window, position.x, position.y);
-                let dragging = on_move(&mut self.state, self.mouse[0]);
+                let dragging = on_move(&mut self.state, self.mouse[0], self.mouse[1]);
                 let kind = hit_at(&self.hits, self.mouse[0], self.mouse[1]);
-                let cursor = match kind {
-                    Some(HitKind::DragNav | HitKind::DragSub) => CursorIcon::EwResize,
-                    Some(HitKind::Search) => CursorIcon::Text,
-                    Some(HitKind::DragWindow) => CursorIcon::Default,
-                    Some(_) => CursorIcon::Pointer,
-                    None => CursorIcon::Default,
+                let cursor = match (&self.state.drag, kind) {
+                    (Some(Drag::Scroll { .. }), _) | (_, Some(HitKind::Scroll(_))) => {
+                        CursorIcon::NsResize
+                    }
+                    (_, Some(HitKind::DragNav | HitKind::DragSub)) => CursorIcon::EwResize,
+                    (_, Some(HitKind::Search)) => CursorIcon::Text,
+                    (_, Some(HitKind::DragWindow)) => CursorIcon::Default,
+                    (_, Some(_)) => CursorIcon::Pointer,
+                    (_, None) => CursorIcon::Default,
                 };
                 if cursor != self.cursor {
                     window.set_cursor(cursor);
@@ -252,11 +269,16 @@ impl ApplicationHandler<UserEvent> for App {
                             kind,
                             self.mods.control_key(),
                             self.mods.shift_key(),
+                            self.mouse,
                         );
-                        note_drag_origin(&mut self.state, self.mouse[0]);
+                        note_drag_origin(&mut self.state, self.mouse[0], self.mouse[1]);
                         self.apply(effects, event_loop);
                     } else {
                         self.state.search_focused = false;
+                        // Empty chrome (no hit target) clears a process selection.
+                        if self.state.page == Page::Processes && !self.state.selected.is_empty() {
+                            clear_selection(&mut self.state);
+                        }
                     }
                 } else {
                     let effects = on_release(&mut self.state);

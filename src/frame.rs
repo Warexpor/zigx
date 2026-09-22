@@ -1,12 +1,12 @@
 use std::time::Instant;
 
 use crate::format::{
-    self, bytes, cpu_pct, disk_cell, duration, fit_t, freq_ghz, percent, rate, text_width_t,
+    bytes, cpu_pct, disk_cell, duration, fit_t, freq_ghz, percent, rate, text_width_t,
 };
 use crate::interact::selection_label;
 use crate::model::{
-    theme, AppState, Col, Density, Page, Proc, ProcView, Section, Snap, Sort, StartupEntry,
-    HIST_CAP, SAMPLE_PERIOD_MS,
+    io_scale, theme, AppState, Col, Density, Page, Proc, ProcView, Section, Snap, Sort,
+    StartupEntry, HIST_WINDOW,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -95,7 +95,9 @@ pub enum HitKind {
     EndTask,
     Undo,
     Group(bool),
-    Proc { pid: i32 },
+    Proc {
+        pid: i32,
+    },
     /// Empty process-list chrome: clears the selection (unfreezes pinned rows).
     Deselect,
     Scroll(crate::model::ScrollBar),
@@ -334,16 +336,18 @@ impl DrawList {
 
     /// Telemetry graph: faint quarter grid, hairline baseline, thin traces.
     ///
-    /// X uses a fixed `HIST_CAP` time window (right-aligned) so the scale does
-    /// not stretch as the ring fills. `phase` scrolls by a fraction of one
-    /// sample between ticks. Densely smoothstep-sampled so motion stays calm
-    /// at any chart size without peak overshoot.
-    fn graph(&mut self, r: Rect, series: &[(&[f32], theme::Rgba)], max: f32, phase: f32) {
+    /// X spans a fixed `HIST_WINDOW` of samples so the scale does not stretch
+    /// as the ring fills. `head` places the right edge relative to the newest
+    /// sample (<= 0) and moves continuously, so the trace scrolls at a constant
+    /// speed and new data is drawn in rather than popped in. Curves are
+    /// uniform cubic B-splines: C2-smooth, and never outside the samples
+    /// around them.
+    fn graph(&mut self, r: Rect, series: &[(&[f32], theme::Rgba)], max: f32, head: f32) {
         if r.w < 4.0 || r.h < 4.0 || !self.visible(r) {
             return;
         }
         let max = max.max(0.001);
-        let phase = phase.clamp(0.0, 1.0);
+        let head = head.min(0.0);
         // Stroke width + miter + AA fringe need room above a 100% sample.
         let top_pad = 6.0;
         let usable = (r.h - top_pad).max(1.0);
@@ -354,33 +358,39 @@ impl DrawList {
             }
         }
         self.hairline(Rect::new(r.x, r.bottom(), r.w, 1.0));
-        let cap_span = (HIST_CAP.saturating_sub(1).max(1)) as f32;
-        let steps = ((r.w * 0.55) as usize).clamp(64, 480);
+        let span = HIST_WINDOW as f32;
+        let slot_w = r.w / span;
+        // Vertices sit at fixed fractions of each sample slot, so the polyline
+        // is rigid in data space and only translates as it scrolls. Resampling
+        // at fixed screen x instead makes sharp peaks shimmer frame to frame.
+        let sub = ((slot_w / 1.5).ceil() as usize).clamp(4, 24);
+        let y_of = |v: f32| r.bottom() - (v / max).clamp(0.0, 1.0) * usable;
         for (values, color) in series.iter() {
             if values.len() < 2 {
                 continue;
             }
             let n = values.len();
-            let oldest = values[0];
-            let mut raw = Vec::with_capacity(steps);
-            for s in 0..steps {
-                let t = s as f32 / (steps - 1) as f32;
-                // Age in sample-slots from the right edge of the fixed window.
-                let age = (1.0 - t) * cap_span;
-                let idx = (n - 1) as f32 - age + phase;
-                // Hold the oldest sample across empty lead-in so the left edge
-                // never pops in/out as phase scrolls.
-                let v = if idx < 0.0 {
-                    oldest
-                } else {
-                    sample_hist(values, idx.clamp(0.0, (n - 1) as f32))
-                };
-                let x = r.x + t * r.w;
-                let y = r.bottom() - (v / max).clamp(0.0, 1.0) * usable;
-                raw.push([x, y]);
-            }
-            // Round off needle tips so the stroke join does not flash.
-            soften_polyline_y(&mut raw, 2);
+            let right = (n - 1) as f32 + head;
+            let x_of = |idx: f32| r.right() - (right - idx) * slot_w;
+            let last = (n - 1) * sub;
+            let lo = (((right - span) * sub as f32).floor() as i64 - 1).clamp(0, last as i64);
+            let hi = ((right * sub as f32).ceil() as i64 + 1).clamp(0, last as i64);
+            // History starts at launch: before the first sample the plot stays
+            // empty, and the trace grows in from the right edge.
+            let vals: Vec<(f32, f32)> = (lo..=hi)
+                .map(|j| {
+                    let idx = j as f32 / sub as f32;
+                    (x_of(idx), sample_hist(values, idx))
+                })
+                .collect();
+            // Never clip a trace flat against the top while an eased scale
+            // is still catching up with it.
+            let peak = vals.iter().map(|v| v.1).fold(0.0_f32, f32::max);
+            let top = max.max(peak);
+            let raw: Vec<[f32; 2]> = vals
+                .iter()
+                .map(|&(x, v)| [x, y_of(v * max / top)])
+                .collect();
             let pts = clip_polyline_x(&raw, r.x, r.right());
             if pts.len() < 2 {
                 continue;
@@ -396,7 +406,11 @@ impl DrawList {
     }
 }
 
-/// Smoothstep-interpolated sample — no Catmull overshoot, so peaks do not flash.
+/// Uniform cubic B-spline sample. C2-smooth, so climbs bend over a whole
+/// sample instead of kinking, and always inside the range of the four samples
+/// around it, so it never overshoots. It does not pass through the samples:
+/// an isolated one-sample spike peaks at two thirds of its height. Segment
+/// `i` reads samples `i - 1 ..= i + 2`; the ends repeat their edge sample.
 fn sample_hist(values: &[f32], idx: f32) -> f32 {
     let n = values.len();
     if n == 0 {
@@ -405,30 +419,20 @@ fn sample_hist(values: &[f32], idx: f32) -> f32 {
     if n == 1 {
         return values[0];
     }
-    let max_i = (n - 1) as f32;
-    let idx = idx.clamp(0.0, max_i);
-    let i = idx.floor() as usize;
+    let idx = idx.clamp(0.0, (n - 1) as f32);
+    let i = (idx.floor() as usize).min(n - 2);
     let t = idx - i as f32;
-    if t < 1e-4 || i >= n - 1 {
-        return values[i.min(n - 1)];
-    }
-    let a = values[i];
-    let b = values[i + 1];
-    let t = t * t * (3.0 - 2.0 * t);
-    a + (b - a) * t
-}
-
-/// Binomial blur on Y only — keeps X on the time grid, softens acute tips.
-fn soften_polyline_y(pts: &mut [[f32; 2]], passes: usize) {
-    if pts.len() < 3 {
-        return;
-    }
-    for _ in 0..passes {
-        let ys: Vec<f32> = pts.iter().map(|p| p[1]).collect();
-        for i in 1..pts.len() - 1 {
-            pts[i][1] = (ys[i - 1] + ys[i] * 2.0 + ys[i + 1]) * 0.25;
-        }
-    }
+    let at = |k: isize| values[k.clamp(0, n as isize - 1) as usize];
+    let i = i as isize;
+    let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let u = 1.0 - t;
+    (u * u * u * p0
+        + (3.0 * t3 - 6.0 * t2 + 4.0) * p1
+        + (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) * p2
+        + t3 * p3)
+        / 6.0
 }
 
 /// Keep a scrolling series inside the chart: drop off-screen points and insert
@@ -807,8 +811,7 @@ pub fn build(
     let mut d = DrawList::new();
     state.scroll_bar = None;
     if state.page == Page::Performance {
-        // Numbers pick a target once a second; the ribbon samples every 200ms.
-        state.perf_smooth.tick(snap, 0.35, 0.18);
+        state.perf_smooth.tick(snap);
     }
     let w = state.width.max(420.0);
     let h = state.height.max(320.0);
@@ -913,11 +916,11 @@ fn title_bar(d: &mut DrawList, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
         .gpus
         .first()
         .and_then(|g| g.util)
-        .map(cpu_pct)
+        .map(percent)
         .unwrap_or_else(|| "—".into());
     let readout = format!(
         "cpu {}   mem {}   gpu {}",
-        cpu_pct(snap.cpu_total),
+        percent(snap.cpu_total),
         mem_short(snap),
         gpu
     );
@@ -1586,21 +1589,14 @@ fn performance(
             Icon::Chip,
             "CPU",
             Section::Cpu,
-            Some(percent(state.perf_smooth.cpu)),
+            Some(percent(snap.cpu_total)),
         ),
-        (
-            Icon::Mem,
-            "Memory",
-            Section::Memory,
-            Some(mem_short_n(state.perf_smooth.mem_used, snap.mem_total)),
-        ),
+        (Icon::Mem, "Memory", Section::Memory, Some(mem_short(snap))),
         (
             Icon::Gpu,
             "GPU",
             Section::Gpu,
-            snap.gpus
-                .first()
-                .and_then(|g| g.util.map(|_| percent(state.perf_smooth.gpu))),
+            snap.gpus.first().and_then(|g| g.util.map(percent)),
         ),
         (Icon::Disk, "Disk", Section::Disk, None),
         (Icon::Net, "Network", Section::Net, None),
@@ -1629,14 +1625,14 @@ fn performance(
     );
     d.detail_rect = Some(view);
     let y0 = view.y - state.perf_scroll;
-    let phase = hist_phase(snap);
+    let head = state.perf_smooth.head();
     d.clip = Some(view);
     let content_bottom = match state.section {
-        Section::Cpu => cpu_page(d, state, snap, view, y0, phase),
-        Section::Memory => memory_page(d, state, snap, view, y0, phase),
-        Section::Gpu => gpu_page(d, state, snap, view, y0, phase),
-        Section::Disk => io_page(d, state, view, y0, true, snap, phase),
-        Section::Net => io_page(d, state, view, y0, false, snap, phase),
+        Section::Cpu => cpu_page(d, snap, view, y0, head),
+        Section::Memory => memory_page(d, snap, view, y0, head),
+        Section::Gpu => gpu_page(d, state, snap, view, y0, head),
+        Section::Disk => io_page(d, state, view, y0, true, snap, head),
+        Section::Net => io_page(d, state, view, y0, false, snap, head),
     };
     d.clip = None;
     let content_h = (content_bottom - y0).max(0.0);
@@ -1653,11 +1649,6 @@ fn performance(
         crate::model::ScrollBar::Performance,
         mouse,
     );
-}
-
-fn hist_phase(snap: &Snap) -> f32 {
-    let period = SAMPLE_PERIOD_MS as f32 / 1000.0;
-    (snap.hist_at.elapsed().as_secs_f32() / period.max(0.001)).clamp(0.0, 1.0)
 }
 
 fn window_label() -> String {
@@ -1711,9 +1702,9 @@ fn scaled_graph(
     series: &[(&[f32], theme::Rgba)],
     max: f32,
     max_label: &str,
-    phase: f32,
+    head: f32,
 ) {
-    d.graph(r, series, max, phase);
+    d.graph(r, series, max, head);
     d.text_r(
         max_label,
         Rect::new(r.x, r.y - 16.0, r.w, 14.0),
@@ -1722,23 +1713,10 @@ fn scaled_graph(
     );
 }
 
-fn cpu_page(
-    d: &mut DrawList,
-    state: &AppState,
-    snap: &Snap,
-    view: Rect,
-    mut y: f32,
-    phase: f32,
-) -> f32 {
+fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) -> f32 {
     let top = y;
     y = page_title(d, "Processor", &snap.cpu_model, view, y);
-    y = readout(
-        d,
-        view,
-        y,
-        &percent(state.perf_smooth.cpu),
-        "Total utilization",
-    );
+    y = readout(d, view, y, &percent(snap.cpu_total), "Total utilization");
 
     let freq: f32 = if snap.cpu_freq_mhz.is_empty() {
         0.0
@@ -1759,7 +1737,7 @@ fn cpu_page(
     y += 64.0;
 
     // Telemetry grows with the sheet: graph takes the larger share, cores the rest.
-    let n = state.perf_smooth.cpu_per.len();
+    let n = snap.cpu_per.len();
     let spare = spare_height(
         view,
         y - top,
@@ -1773,36 +1751,41 @@ fn cpu_page(
     scaled_graph(
         d,
         Rect::new(view.x, y, view.w, graph_h),
-        &[(&state.perf_smooth.cpu_hist, theme::TRACE)],
+        &[(&snap.cpu_hist, theme::TRACE)],
         100.0,
         "100%",
-        phase,
+        head,
     );
     y += graph_h + 28.0;
 
     if n == 0 {
         return y;
     }
-    let peak = state
-        .perf_smooth
-        .cpu_per
-        .iter()
-        .copied()
-        .fold(0.0_f32, f32::max);
+    let peak = snap.cpu_per.iter().copied().fold(0.0_f32, f32::max);
     eyebrow(
         d,
         view.x,
         y,
         view.w,
         "Cores",
-        Some(&format!("{n} logical   peak {}", cpu_pct(peak))),
+        Some(&format!("{n} logical   peak {}", percent(peak))),
     );
     y += 24.0;
-    equalizer(
-        d,
-        Rect::new(view.x, y, view.w, cores_h),
-        &state.perf_smooth.cpu_per,
-    );
+    // Bars read the per-core rings at the graph's playback head, so they glide
+    // on the same clock and curve as the utilization trace above.
+    let cores: Vec<f32> = snap
+        .cpu_per_hist
+        .iter()
+        .map(|h| {
+            let idx = h.len() as f32 - 1.0 + head;
+            if idx < 0.0 {
+                0.0
+            } else {
+                sample_hist(h, idx)
+            }
+        })
+        .collect();
+    equalizer(d, Rect::new(view.x, y, view.w, cores_h), &cores);
     y + cores_h + 16.0
 }
 
@@ -1836,18 +1819,10 @@ fn equalizer(d: &mut DrawList, r: Rect, values: &[f32]) {
     d.hairline(Rect::new(r.x, r.bottom(), r.w, 1.0));
 }
 
-fn memory_page(
-    d: &mut DrawList,
-    state: &AppState,
-    snap: &Snap,
-    view: Rect,
-    mut y: f32,
-    phase: f32,
-) -> f32 {
+fn memory_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) -> f32 {
     let top = y;
     y = page_title(d, "Memory", "Physical RAM", view, y);
-    let used_n = state.perf_smooth.mem_used.round().max(0.0) as u64;
-    let used = bytes(used_n);
+    let used = bytes(snap.mem_used);
     d.text(
         &used,
         Rect::new(view.x, y, view.w, 52.0),
@@ -1873,7 +1848,7 @@ fn memory_page(
         (bytes(snap.mem_available), "Available"),
         (bytes(snap.mem_cached), "Cached"),
         (bytes(snap.mem_buffers), "Buffers"),
-        (mem_short_n(state.perf_smooth.mem_used, snap.mem_total), "Used"),
+        (mem_short(snap), "Used"),
     ];
     let slot = view.w / 4.0;
     for (i, (v, k)) in stats.iter().enumerate() {
@@ -1895,10 +1870,10 @@ fn memory_page(
     scaled_graph(
         d,
         Rect::new(view.x, y, view.w, graph_h),
-        &[(&state.perf_smooth.mem_hist, theme::TRACE)],
+        &[(&snap.mem_hist, theme::TRACE)],
         1.0,
         &bytes(snap.mem_total),
-        phase,
+        head,
     );
     y += graph_h + 28.0;
 
@@ -1918,9 +1893,9 @@ fn memory_page(
         y += 24.0;
         d.graph(
             Rect::new(view.x, y, view.w, swap_h),
-            &[(&state.perf_smooth.swap_hist, theme::TRACE_2)],
+            &[(&snap.swap_hist, theme::TRACE_2)],
             1.0,
-            phase,
+            head,
         );
         y += swap_h + 20.0;
     }
@@ -1933,7 +1908,7 @@ fn gpu_page(
     snap: &Snap,
     view: Rect,
     mut y: f32,
-    phase: f32,
+    head: f32,
 ) -> f32 {
     let top = y;
     if snap.gpus.is_empty() {
@@ -1942,16 +1917,7 @@ fn gpu_page(
     }
     for (gi, g) in snap.gpus.iter().enumerate() {
         y = page_title(d, "Graphics", &g.name, view, y);
-        let util = if g.util.is_some() {
-            // Primary GPU follows the shared smooth; extras use raw.
-            if gi == 0 {
-                percent(state.perf_smooth.gpu)
-            } else {
-                g.util.map(percent).unwrap_or_else(|| "—".into())
-            }
-        } else {
-            "—".into()
-        };
+        let util = g.util.map(percent).unwrap_or_else(|| "—".into());
         y = readout(d, view, y, &util, "Utilization");
 
         // Telemetry as a stat row.
@@ -2000,24 +1966,18 @@ fn gpu_page(
         };
         eyebrow(d, view.x, y, view.w, "Utilization", Some(&window_label()));
         y += 24.0;
-        let util_hist = state
-            .perf_smooth
-            .gpu_hist
-            .get(gi)
-            .map(|h| h.as_slice())
-            .unwrap_or(g.util_hist.as_slice());
         scaled_graph(
             d,
             Rect::new(view.x, y, view.w, graph_h),
-            &[(util_hist, theme::TRACE)],
+            &[(&g.util_hist, theme::TRACE)],
             100.0,
             "100%",
-            phase,
+            head,
         );
         y += graph_h + 28.0;
 
         if g.mem_total > 0 {
-            let frac = (g.mem_used as f32 / g.mem_total as f32).clamp(0.0, 1.0);
+            let frac = state.perf_smooth.vram.get(gi).copied().unwrap_or(0.0);
             eyebrow(
                 d,
                 view.x,
@@ -2046,7 +2006,7 @@ fn io_page(
     mut y: f32,
     disk: bool,
     snap: &Snap,
-    phase: f32,
+    head: f32,
 ) -> f32 {
     type Dev<'a> = (&'a str, f64, f64, &'a [f32], &'a [f32]);
     let top = y;
@@ -2059,22 +2019,26 @@ fn io_page(
         snap.disks
             .iter()
             .map(|d| {
-                let (a, b) = state
-                    .perf_smooth
-                    .disk_pair(&d.name)
-                    .unwrap_or((d.read_hist.as_slice(), d.write_hist.as_slice()));
-                (d.name.as_str(), d.read_bps, d.write_bps, a, b)
+                (
+                    d.name.as_str(),
+                    d.read_bps,
+                    d.write_bps,
+                    d.read_hist.as_slice(),
+                    d.write_hist.as_slice(),
+                )
             })
             .collect()
     } else {
         snap.nets
             .iter()
             .map(|n| {
-                let (a, b) = state
-                    .perf_smooth
-                    .net_pair(&n.name)
-                    .unwrap_or((n.rx_hist.as_slice(), n.tx_hist.as_slice()));
-                (n.name.as_str(), n.rx_bps, n.tx_bps, a, b)
+                (
+                    n.name.as_str(),
+                    n.rx_bps,
+                    n.tx_bps,
+                    n.rx_hist.as_slice(),
+                    n.tx_hist.as_slice(),
+                )
             })
             .collect()
     };
@@ -2125,13 +2089,15 @@ fn io_page(
             theme::INK_3,
         );
         y += 26.0;
-        let max = nice_pair(a_hist, b_hist);
+        let goal = io_scale(a_hist, b_hist, head);
+        let key = format!("{}:{name}", if disk { "disk" } else { "net" });
+        let max = state.perf_smooth.io_max(&key).unwrap_or(goal);
         let gr = Rect::new(view.x, y, view.w, graph_h);
         d.graph(
             gr,
             &[(a_hist, theme::TRACE), (b_hist, theme::TRACE_2)],
             max,
-            phase,
+            head,
         );
         // Legend, top left; scale, top right.
         let ly = gr.y + 6.0;
@@ -2148,7 +2114,7 @@ fn io_page(
         lx += 17.0;
         d.text(b_legend, Rect::new(lx, ly, 90.0, 12.0), MICRO, theme::INK_3);
         d.text_r(
-            &rate(max as f64),
+            &rate(goal as f64),
             Rect::new(gr.x, ly, gr.w, 12.0),
             MICRO_NUM,
             theme::INK_4,
@@ -2156,11 +2122,6 @@ fn io_page(
         y += graph_h + 24.0;
     }
     y
-}
-
-fn nice_pair(a: &[f32], b: &[f32]) -> f32 {
-    let m = a.iter().chain(b.iter()).copied().fold(0.0_f32, f32::max);
-    format::nice_ceil(m)
 }
 
 // --- Startup ----------------------------------------------------------------
@@ -2298,5 +2259,39 @@ fn switch(d: &mut DrawList, r: Rect, on: bool) {
             6.0,
             theme::INK_3,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample_hist;
+
+    #[test]
+    fn curve_stays_inside_its_samples() {
+        let v = [0.0, 100.0, 0.0, 40.0, 45.0, 90.0, 90.0, 90.0, 10.0];
+        for s in 0..=800 {
+            let idx = s as f32 / 100.0;
+            let i = (idx.floor() as usize).min(v.len() - 2);
+            let near = &v[i.saturating_sub(1)..(i + 3).min(v.len())];
+            let lo = near.iter().copied().fold(f32::MAX, f32::min) - 1e-3;
+            let hi = near.iter().copied().fold(f32::MIN, f32::max) + 1e-3;
+            let y = sample_hist(&v, idx);
+            assert!(y >= lo && y <= hi, "idx {idx}: {y} outside {lo}..{hi}");
+        }
+        // A held plateau reads exactly.
+        assert!((sample_hist(&v, 6.0) - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn drawn_segments_ignore_samples_that_have_not_played() {
+        // With the right edge two samples back, a new sample must not reshape
+        // anything left of it.
+        let old = [10.0, 80.0, 20.0, 60.0, 30.0];
+        let new = [10.0, 80.0, 20.0, 60.0, 30.0, 95.0];
+        let right = (old.len() - 1) as f32 - crate::model::GRAPH_DELAY as f32 + 1.0;
+        for s in 0..=((right * 100.0) as usize) {
+            let idx = s as f32 / 100.0;
+            assert!((sample_hist(&old, idx) - sample_hist(&new, idx)).abs() < 1e-4);
+        }
     }
 }

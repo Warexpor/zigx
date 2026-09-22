@@ -10,6 +10,8 @@ The visual system is monochrome and flat: one ink stepped by alpha, hairlines in
 cargo run --release
 ```
 
+Design system, layout, components, and motion are documented in [docs/design](docs/design/README.md).
+
 ## Install
 
 ```bash

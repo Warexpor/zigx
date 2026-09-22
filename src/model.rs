@@ -2,12 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub const HIST_CAP: usize = 150;
-/// Graph sampler period. History covers `HIST_CAP * SAMPLE_PERIOD_MS` ms.
-pub const SAMPLE_PERIOD_MS: u64 = 200;
-pub const HIST_SECS: u64 = HIST_CAP as u64 * SAMPLE_PERIOD_MS / 1000;
-/// How often Performance readouts pick up a new target value.
-pub const METRIC_PERIOD_MS: u64 = 1000;
+/// Sampler period. Every metric in the app updates once per tick.
+pub const SAMPLE_PERIOD_MS: u64 = 1000;
+/// Samples spanned by a graph, right edge to left edge.
+pub const HIST_WINDOW: usize = 30;
+/// Ring capacity: the window plus the playback delay and interpolation taps.
+pub const HIST_CAP: usize = HIST_WINDOW + 6;
+pub const HIST_SECS: u64 = HIST_WINDOW as u64 * SAMPLE_PERIOD_MS / 1000;
+/// Graphs play back this many samples behind the newest one. A curve segment
+/// depends on the sample after its end, so the right edge must stay two
+/// samples back for every drawn segment to be final: nothing already on screen
+/// reshapes when a new sample lands. The fraction over 2.0 absorbs jitter.
+pub const GRAPH_DELAY: f64 = 2.15;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -133,8 +139,10 @@ pub struct Snap {
     pub uptime_secs: u64,
     pub load: [f32; 3],
     pub sample_ms: f32,
-    /// Instant the ring buffers last advanced. Frame uses this for scroll phase.
+    /// Instant the ring buffers last advanced.
     pub hist_at: Instant,
+    /// Count of ring advances; the newest ring entry carries this sequence number.
+    pub hist_seq: u64,
 }
 
 impl Snap {
@@ -166,6 +174,7 @@ impl Snap {
             load: [0.0; 3],
             sample_ms: 0.0,
             hist_at: Instant::now(),
+            hist_seq: 0,
         }
     }
 }
@@ -208,8 +217,14 @@ pub struct ScrollGeom {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Drag {
-    Nav { x0: f32, w0: f32 },
-    Sub { x0: f32, w0: f32 },
+    Nav {
+        x0: f32,
+        w0: f32,
+    },
+    Sub {
+        x0: f32,
+        w0: f32,
+    },
     Scroll {
         which: ScrollBar,
         y0: f32,
@@ -261,34 +276,34 @@ pub struct AppState {
     /// Interface zoom. Layout stays in design pixels; this scales them onto the window.
     pub ui_scale: f32,
     pub visible_pids: Vec<i32>,
-    /// EMA-smoothed performance readouts; advanced on each paint of that page.
+    /// Graph playback clock and eased bars; advanced on each paint of that page.
     pub perf_smooth: PerfSmooth,
 }
 
-/// Display-side smoothing for the Performance page.
+/// Display-side motion for the Performance page.
 ///
-/// Readout targets refresh once a second. Graph rings follow every sampler
-/// tick; only the tip eases so new samples glide in without morphing history.
+/// Text reads the snapshot directly, so numbers change once per sample. Only
+/// graphics move between samples: graphs scroll on a steady playback clock and
+/// bars and graph scales ease toward each new sample.
 #[derive(Clone, Debug)]
 pub struct PerfSmooth {
-    pub primed: bool,
-    pub at: Instant,
-    pub hist_at: Option<Instant>,
-    pub cpu: f32,
-    pub mem_used: f32,
-    pub gpu: f32,
-    pub cpu_per: Vec<f32>,
-    pub cpu_hist: Vec<f32>,
-    pub mem_hist: Vec<f32>,
-    pub swap_hist: Vec<f32>,
-    pub gpu_hist: Vec<Vec<f32>>,
-    pub disk_hist: BTreeMap<String, (Vec<f32>, Vec<f32>)>,
-    pub net_hist: BTreeMap<String, (Vec<f32>, Vec<f32>)>,
-    metric_at: Instant,
-    tgt_cpu: f32,
-    tgt_mem: f32,
-    tgt_gpu: f32,
-    tgt_cpu_per: Vec<f32>,
+    primed: bool,
+    at: Instant,
+    /// Playback position in sample sequence units; the right edge of every graph.
+    pos: f64,
+    seq: u64,
+    /// VRAM fill fraction per GPU.
+    pub vram: Vec<f32>,
+    /// Graph scale per I/O device, keyed `disk:<name>` / `net:<name>`.
+    io_max: BTreeMap<String, Damp>,
+}
+
+/// Critically damped follower state. I/O scales follow in log space so a
+/// 100x rescale reads as an even zoom instead of an instant squash.
+#[derive(Clone, Copy, Debug)]
+struct Damp {
+    value: f32,
+    vel: f32,
 }
 
 impl Default for PerfSmooth {
@@ -296,124 +311,143 @@ impl Default for PerfSmooth {
         Self {
             primed: false,
             at: Instant::now(),
-            hist_at: None,
-            cpu: 0.0,
-            mem_used: 0.0,
-            gpu: 0.0,
-            cpu_per: Vec::new(),
-            cpu_hist: Vec::new(),
-            mem_hist: Vec::new(),
-            swap_hist: Vec::new(),
-            gpu_hist: Vec::new(),
-            disk_hist: BTreeMap::new(),
-            net_hist: BTreeMap::new(),
-            metric_at: Instant::now(),
-            tgt_cpu: 0.0,
-            tgt_mem: 0.0,
-            tgt_gpu: 0.0,
-            tgt_cpu_per: Vec::new(),
+            pos: 0.0,
+            seq: 0,
+            vram: Vec::new(),
+            io_max: BTreeMap::new(),
         }
     }
 }
 
+/// Time constants, seconds.
+const CLOCK_TAU: f32 = 0.6;
+const BAR_TAU: f32 = 0.14;
+/// I/O scale smooth times. Growing is quicker so the scale is ready before a
+/// burst is drawn; shrinking is slow so the graph relaxes after it leaves.
+const SCALE_GROW: f32 = 0.35;
+const SCALE_SHRINK: f32 = 0.9;
+
 impl PerfSmooth {
-    /// `metric_tau` / `tip_tau` are half-lives in seconds.
-    pub fn tick(&mut self, snap: &Snap, metric_tau: f32, tip_tau: f32) {
+    pub fn tick(&mut self, snap: &Snap) {
         let now = Instant::now();
-        let dt = if self.primed {
-            now.saturating_duration_since(self.at).as_secs_f32()
-        } else {
-            1.0
-        };
+        let dt = now.saturating_duration_since(self.at).as_secs_f32();
         self.at = now;
-        let am = 1.0 - (-dt / metric_tau.max(0.001)).exp();
-        let at = 1.0 - (-dt / tip_tau.max(0.001)).exp();
-        let gpu = snap.gpus.first().and_then(|g| g.util).unwrap_or(0.0);
-        let advanced = self.hist_at != Some(snap.hist_at);
-        self.hist_at = Some(snap.hist_at);
+        let period = SAMPLE_PERIOD_MS as f64 / 1000.0;
+        let lag = snap.hist_at.elapsed().as_secs_f64() / period;
+        let target = snap.hist_seq as f64 - GRAPH_DELAY + lag;
 
-        if !self.primed {
-            self.cpu = snap.cpu_total;
-            self.mem_used = snap.mem_used as f32;
-            self.gpu = gpu;
-            self.cpu_per = snap.cpu_per.clone();
-            self.tgt_cpu = self.cpu;
-            self.tgt_mem = self.mem_used;
-            self.tgt_gpu = self.gpu;
-            self.tgt_cpu_per = self.cpu_per.clone();
-            self.metric_at = now;
-            self.cpu_hist = snap.cpu_hist.clone();
-            self.mem_hist = snap.mem_hist.clone();
-            self.swap_hist = snap.swap_hist.clone();
-            self.gpu_hist = snap.gpus.iter().map(|g| g.util_hist.clone()).collect();
-            self.disk_hist = snap
-                .disks
-                .iter()
-                .map(|d| (d.name.clone(), (d.read_hist.clone(), d.write_hist.clone())))
-                .collect();
-            self.net_hist = snap
-                .nets
-                .iter()
-                .map(|n| (n.name.clone(), (n.rx_hist.clone(), n.tx_hist.clone())))
-                .collect();
-            self.primed = true;
-            return;
-        }
-
-        if self.metric_at.elapsed().as_millis() >= METRIC_PERIOD_MS as u128 {
-            self.tgt_cpu = snap.cpu_total;
-            self.tgt_mem = snap.mem_used as f32;
-            self.tgt_gpu = gpu;
-            self.tgt_cpu_per = snap.cpu_per.clone();
-            self.metric_at = now;
-        }
-
-        self.cpu += (self.tgt_cpu - self.cpu) * am;
-        self.mem_used += (self.tgt_mem - self.mem_used) * am;
-        self.gpu += (self.tgt_gpu - self.gpu) * am;
-        ease_vec(&mut self.cpu_per, &self.tgt_cpu_per, am);
-
-        track_ring(&mut self.cpu_hist, &snap.cpu_hist, advanced, at);
-        track_ring(&mut self.mem_hist, &snap.mem_hist, advanced, at);
-        track_ring(&mut self.swap_hist, &snap.swap_hist, advanced, at);
-
-        if self.gpu_hist.len() != snap.gpus.len() {
-            self.gpu_hist = snap.gpus.iter().map(|g| g.util_hist.clone()).collect();
+        // Advance at exactly one sample per period, then bleed off drift and
+        // jitter slowly so the scroll speed never visibly changes.
+        let fresh = !self.primed || (target - self.pos).abs() > 2.0;
+        if fresh {
+            self.pos = target;
         } else {
-            for (dst, g) in self.gpu_hist.iter_mut().zip(&snap.gpus) {
-                track_ring(dst, &g.util_hist, advanced, at);
-            }
+            self.pos += dt as f64 / period;
+            self.pos += (target - self.pos) * rate(dt, CLOCK_TAU) as f64;
         }
+        self.pos = self.pos.min(snap.hist_seq as f64);
+        self.seq = snap.hist_seq;
 
-        sync_pair_map(
-            &mut self.disk_hist,
-            snap.disks
-                .iter()
-                .map(|d| (d.name.as_str(), d.read_hist.as_slice(), d.write_hist.as_slice())),
-            advanced,
-            at,
-        );
-        sync_pair_map(
-            &mut self.net_hist,
-            snap.nets
-                .iter()
-                .map(|n| (n.name.as_str(), n.rx_hist.as_slice(), n.tx_hist.as_slice())),
-            advanced,
-            at,
-        );
+        let bar = if fresh { 1.0 } else { rate(dt, BAR_TAU) };
+        let vram: Vec<f32> = snap
+            .gpus
+            .iter()
+            .map(|g| {
+                if g.mem_total == 0 {
+                    0.0
+                } else {
+                    (g.mem_used as f32 / g.mem_total as f32).clamp(0.0, 1.0)
+                }
+            })
+            .collect();
+        ease_vec(&mut self.vram, &vram, bar);
+
+        let head = self.head();
+        let mut keep = BTreeSet::new();
+        let devs = snap
+            .disks
+            .iter()
+            .map(|d| (format!("disk:{}", d.name), &d.read_hist, &d.write_hist))
+            .chain(
+                snap.nets
+                    .iter()
+                    .map(|n| (format!("net:{}", n.name), &n.rx_hist, &n.tx_hist)),
+            );
+        for (key, a, b) in devs {
+            let goal = io_scale(a, b, head).ln();
+            let m = self.io_max.entry(key.clone()).or_insert(Damp {
+                value: goal,
+                vel: 0.0,
+            });
+            if fresh {
+                *m = Damp {
+                    value: goal,
+                    vel: 0.0,
+                };
+            } else {
+                let t = if goal > m.value {
+                    SCALE_GROW
+                } else {
+                    SCALE_SHRINK
+                };
+                smooth_damp(m, goal, t, dt);
+            }
+            keep.insert(key);
+        }
+        self.io_max.retain(|k, _| keep.contains(k));
+        self.primed = true;
     }
 
-    pub fn disk_pair(&self, name: &str) -> Option<(&[f32], &[f32])> {
-        self.disk_hist
-            .get(name)
-            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+    /// Right edge of the graphs, in samples relative to the newest one (<= 0).
+    pub fn head(&self) -> f32 {
+        (self.pos - self.seq as f64) as f32
     }
 
-    pub fn net_pair(&self, name: &str) -> Option<(&[f32], &[f32])> {
-        self.net_hist
-            .get(name)
-            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+    pub fn io_max(&self, key: &str) -> Option<f32> {
+        self.io_max.get(key).map(|d| d.value.exp())
     }
+}
+
+/// Target scale for a pair of rate histories: the nice ceiling of what the
+/// graph shows at `head`, plus the samples the curve is heading into, so the
+/// scale grows before a burst is drawn and relaxes once it scrolls out.
+pub fn io_scale(a: &[f32], b: &[f32], head: f32) -> f32 {
+    crate::format::nice_ceil(window_peak(a, head).max(window_peak(b, head)))
+}
+
+fn window_peak(h: &[f32], head: f32) -> f32 {
+    if h.is_empty() {
+        return 0.0;
+    }
+    let right = (h.len() - 1) as f32 + head;
+    let lo = ((right - HIST_WINDOW as f32).floor() - 1.0).max(0.0) as usize;
+    let hi = ((right.floor() + 2.0).max(0.0) as usize).min(h.len() - 1);
+    if lo > hi {
+        return 0.0;
+    }
+    h[lo..=hi].iter().copied().fold(0.0_f32, f32::max)
+}
+
+/// Critically damped approach (no overshoot), frame-rate independent.
+fn smooth_damp(d: &mut Damp, target: f32, smooth_time: f32, dt: f32) {
+    let omega = 2.0 / smooth_time.max(1e-4);
+    let x = omega * dt;
+    let decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x);
+    let change = d.value - target;
+    let temp = (d.vel + omega * change) * dt;
+    d.vel = (d.vel - omega * temp) * decay;
+    let out = target + (change + temp) * decay;
+    if (target > d.value) == (out > target) {
+        d.value = target;
+        d.vel = 0.0;
+    } else {
+        d.value = out;
+    }
+}
+
+/// Frame-rate independent exponential approach factor.
+fn rate(dt: f32, tau: f32) -> f32 {
+    1.0 - (-dt / tau.max(0.001)).exp()
 }
 
 fn ease_vec(dst: &mut Vec<f32>, src: &[f32], a: f32) {
@@ -424,44 +458,6 @@ fn ease_vec(dst: &mut Vec<f32>, src: &[f32], a: f32) {
     for (d, s) in dst.iter_mut().zip(src) {
         *d += (*s - *d) * a;
     }
-}
-
-/// Keep the ribbon shape locked to the sampler ring; only the tip eases.
-fn track_ring(dst: &mut Vec<f32>, src: &[f32], advanced: bool, tip_a: f32) {
-    if src.len() < 2 {
-        *dst = src.to_vec();
-        return;
-    }
-    if dst.len() != src.len() {
-        *dst = src.to_vec();
-        return;
-    }
-    if advanced {
-        let tip = dst.last().copied().unwrap_or(0.0);
-        dst.remove(0);
-        dst.push(tip);
-    }
-    let last = dst.len() - 1;
-    dst[..last].copy_from_slice(&src[..last]);
-    dst[last] += (src[last] - dst[last]) * tip_a;
-}
-
-fn sync_pair_map<'a, I>(
-    dst: &mut BTreeMap<String, (Vec<f32>, Vec<f32>)>,
-    src: I,
-    advanced: bool,
-    tip_a: f32,
-) where
-    I: IntoIterator<Item = (&'a str, &'a [f32], &'a [f32])>,
-{
-    let mut keep = BTreeSet::new();
-    for (name, a_hist, b_hist) in src {
-        keep.insert(name.to_string());
-        let entry = dst.entry(name.to_string()).or_default();
-        track_ring(&mut entry.0, a_hist, advanced, tip_a);
-        track_ring(&mut entry.1, b_hist, advanced, tip_a);
-    }
-    dst.retain(|k, _| keep.contains(k));
 }
 
 impl AppState {
@@ -530,7 +526,7 @@ pub mod theme {
     pub type Rgba = [u8; 4];
 
     // Mission-control monochrome. One ink, spectral white, stepped by alpha
-    // (100 / 62 / 38 / 22). Surfaces are hairlines and ghost fills on black
+    // (100 / 67 / 46 / 31). Surfaces are hairlines and ghost fills on black
     // glass; nothing is lifted, shaded, or tinted.
     const SPECTRAL: [u8; 3] = [240, 240, 250];
     const fn ink(a: u8) -> Rgba {

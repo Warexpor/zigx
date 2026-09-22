@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 use crate::model::{Disk, Gpu, Net, Proc, Snap, HIST_CAP, SAMPLE_PERIOD_MS};
 
 const PF_KTHREAD: u64 = 0x00200000;
+/// Gap between the priming read and the first real sample.
+const PRIME_MS: u64 = 250;
+/// Shortest delta a rate is computed over; guards against divide-by-tiny.
+const MIN_DT_SECS: f64 = 0.2;
 
 pub struct Hub {
     snap: Arc<Mutex<Arc<Snap>>>,
@@ -29,16 +33,25 @@ pub fn spawn(wake: impl Fn() + Send + 'static) -> Hub {
         .name("zigx-sample".into())
         .spawn(move || {
             let mut engine = Engine::new();
+            let period = Duration::from_millis(SAMPLE_PERIOD_MS);
+            // Deadline clock: ticks stay on a fixed 1 s grid instead of drifting
+            // by the sample cost. The first deadline is short so real numbers
+            // replace the priming zeros quickly.
+            let mut next = Instant::now() + Duration::from_millis(PRIME_MS);
             loop {
-                let started = Instant::now();
                 let snap = engine.tick();
-                let spent = started.elapsed();
                 {
                     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
                     *guard = Arc::new(snap);
                 }
                 wake();
-                thread::sleep(Duration::from_millis(SAMPLE_PERIOD_MS).saturating_sub(spent));
+                let now = Instant::now();
+                if next <= now {
+                    // Fell behind (suspend, stall): re-anchor instead of bursting.
+                    next = now + period;
+                }
+                thread::sleep(next - now);
+                next += period;
             }
         })
         .expect("sampler thread");
@@ -74,14 +87,12 @@ pub struct Engine {
     names: HashMap<i32, String>,
     kthreads: u32,
     last_proc: Instant,
-    last_gpu: Instant,
     last_cpu_total: f32,
     last_cpu_per: Vec<f32>,
-    cached_procs: Vec<Proc>,
-    cached_gpus: Vec<GpuRaw>,
     cached_proc_gpu: HashMap<i32, f32>,
     sample_avg: f32,
     hist_at: Instant,
+    hist_seq: u64,
     nvml: Option<Nvml>,
     text: String,
     bytes: Vec<u8>,
@@ -114,14 +125,12 @@ impl Engine {
             names: HashMap::new(),
             kthreads: 0,
             last_proc: Instant::now(),
-            last_gpu: Instant::now(),
             last_cpu_total: 0.0,
             last_cpu_per: Vec::new(),
-            cached_procs: Vec::new(),
-            cached_gpus: Vec::new(),
             cached_proc_gpu: HashMap::new(),
             sample_avg: 0.0,
             hist_at: Instant::now(),
+            hist_seq: 0,
             nvml: Nvml::open(),
             text: String::new(),
             bytes: Vec::new(),
@@ -137,29 +146,17 @@ impl Engine {
         let mem = self.read_mem();
         let disks_raw = self.read_disks();
         let nets_raw = self.read_nets();
-        // NVML utilization calls block for tens of milliseconds. Once a second
-        // is enough for the graph and keeps the monitor off the CPU budget.
-        if self.cached_gpus.is_empty() || self.last_gpu.elapsed() >= Duration::from_secs(1) {
-            self.cached_gpus = self.read_gpus();
-            self.cached_proc_gpu = self.read_proc_gpus();
-            for p in &mut self.cached_procs {
-                p.gpu = self.cached_proc_gpu.get(&p.pid).copied().unwrap_or(0.0);
-            }
-            self.last_gpu = Instant::now();
-        }
-        // Process list refreshes once a second so rows do not thrash every sample.
-        if self.cached_procs.is_empty() || self.last_proc.elapsed() >= Duration::from_secs(1) {
-            let proc_dt = self.last_proc.elapsed().as_secs_f64();
-            self.cached_procs = self.read_procs(proc_dt);
-            self.last_proc = Instant::now();
-        }
-        let gpu_raw = self.cached_gpus.clone();
-        let procs = self.cached_procs.clone();
+        // Every reading, GPUs and the process table included, refreshes on the
+        // same 1 s tick so the whole app changes in lockstep.
+        let gpu_raw = self.read_gpus();
+        self.cached_proc_gpu = self.read_proc_gpus();
+        let proc_dt = self.last_proc.elapsed().as_secs_f64();
+        let procs = self.read_procs(proc_dt);
+        self.last_proc = Instant::now();
 
         let mut cpu_total = 0.0;
         let mut cpu_per = Vec::new();
-        // Floor matches a slightly late sample tick (~half of SAMPLE_PERIOD).
-        let min_dt = (SAMPLE_PERIOD_MS as f64 / 1000.0) * 0.4;
+        let min_dt = MIN_DT_SECS;
         let advance = self.primed && dt > min_dt;
         if advance {
             if let Some((idle0, total0)) = cpu_lines.first() {
@@ -202,6 +199,7 @@ impl Engine {
         let gpus = self.finish_gpus(gpu_raw, advance);
         if advance {
             self.hist_at = now;
+            self.hist_seq += 1;
         }
 
         self.prev_cpu = cpu_lines.iter().map(|(i, t)| (*i, *t)).collect();
@@ -246,6 +244,7 @@ impl Engine {
             load,
             sample_ms: self.sample_avg,
             hist_at: self.hist_at,
+            hist_seq: self.hist_seq,
         }
     }
 
@@ -979,12 +978,7 @@ struct Nvml {
     enc: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32>,
     dec: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32>,
     proc_util: Option<
-        unsafe extern "C" fn(
-            *mut std::ffi::c_void,
-            *mut NvmlProcSample,
-            *mut u32,
-            u64,
-        ) -> i32,
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlProcSample, *mut u32, u64) -> i32,
     >,
     names: Vec<String>,
 }
@@ -1240,7 +1234,7 @@ mod tests {
     fn live_sample_sees_this_machine() {
         let mut eng = Engine::new();
         let _ = eng.tick();
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(PRIME_MS));
         let snap = eng.tick();
         assert!(snap.mem_total > 0, "meminfo");
         assert!(!snap.cpu_per.is_empty(), "cores");

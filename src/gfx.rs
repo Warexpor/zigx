@@ -114,11 +114,12 @@ struct Globals {
 
 struct Vin {
     // xy = pixel position. z = signed distance from the centerline in px.
-    // w = solid half-width in px (huge → filled triangle, no fade).
+    // w = solid half-width in px; negative marks a wash vertex.
     @location(0) pos: vec4<f32>,
     @location(1) color: vec4<f32>,
-    // Overshoot past the start (x) and end (y) of the segment, in px.
+    // Stroke: overshoot past the start (x) and end (y) of the segment, in px.
     // Negative inside. Huge negative means that end has no cap.
+    // Wash: (trace y, baseline y) in px.
     @location(2) axis: vec2<f32>,
 };
 
@@ -143,6 +144,16 @@ fn vs_main(v: Vin) -> Vout {
 
 @fragment
 fn fs_main(v: Vout) -> @location(0) vec4<f32> {
+    if v.edge.y < 0.0 {
+        // Wash under a trace. axis = (trace y at this column, baseline y); both
+        // are linear across each slice, so the fade is exact per pixel and has
+        // no seam along the triangle split, however steep the slice.
+        let span = max(v.axis.y - v.axis.x, 1.0);
+        let t = clamp((v.axis.y - v.clip.y) / span, 0.0, 1.0);
+        // Static screen-space dither: a gradient this faint bands in 8 bits.
+        let n = fract(sin(dot(floor(v.clip.xy), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
+        return max(v.color * t + vec4<f32>(n / 255.0), vec4<f32>(0.0));
+    }
     // Capsule distance: perpendicular inside the run, radial past a capped end.
     let over = max(max(v.axis.x, v.axis.y), 0.0);
     let dist = length(vec2<f32>(over, abs(v.edge.x)));
@@ -501,15 +512,7 @@ impl Gfx {
                 // Faint wash under the line: tinted at the trace, gone at the baseline.
                 let mut top = stroke.color;
                 top[3] = ((stroke.color[3] as f32 * 0.07).min(18.0)) as u8;
-                let mut bottom = top;
-                bottom[3] = 0;
-                fill_under(
-                    &pts,
-                    base * scale,
-                    premul(top),
-                    premul(bottom),
-                    &mut self.vertex_cpu,
-                );
+                fill_under(&pts, base * scale, premul(top), &mut self.vertex_cpu);
             }
             stroke_line(
                 &pts,
@@ -899,35 +902,28 @@ fn premul(c: [u8; 4]) -> [f32; 4] {
     ]
 }
 
-fn fill_under(
-    pts: &[[f32; 2]],
-    baseline: f32,
-    top: [f32; 4],
-    bottom: [f32; 4],
-    out: &mut Vec<Vert>,
-) {
+/// Wash from the trace down to `baseline`, faded per pixel in the shader.
+fn fill_under(pts: &[[f32; 2]], baseline: f32, color: [f32; 4], out: &mut Vec<Vert>) {
+    let wash = |out: &mut Vec<Vert>, p: [f32; 2], trace_y: f32| {
+        out.push(Vert {
+            pos: [p[0], p[1], 0.0, -1.0],
+            color,
+            axis: [trace_y, baseline],
+        });
+    };
     for w in pts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        vert(out, a, top);
-        vert(out, b, top);
-        vert(out, [a[0], baseline], bottom);
-        vert(out, b, top);
-        vert(out, [b[0], baseline], bottom);
-        vert(out, [a[0], baseline], bottom);
+        wash(out, a, a[1]);
+        wash(out, b, b[1]);
+        wash(out, [a[0], baseline], a[1]);
+        wash(out, b, b[1]);
+        wash(out, [b[0], baseline], b[1]);
+        wash(out, [a[0], baseline], a[1]);
     }
 }
 
 /// Sentinel for "this end has no cap": the fragment never sees it go positive.
 const NO_CAP: f32 = -1.0e6;
-
-fn vert(out: &mut Vec<Vert>, p: [f32; 2], color: [f32; 4]) {
-    // Filled triangle: distance 0, half-width huge → cover stays 1.
-    out.push(Vert {
-        pos: [p[0], p[1], 0.0, 1.0e6],
-        color,
-        axis: [NO_CAP, NO_CAP],
-    });
-}
 
 /// One ribbon vertex. `dist` is the signed perpendicular distance from the
 /// centerline; `sa`/`sb` are overshoots past the segment's start and end.

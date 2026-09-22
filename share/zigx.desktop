@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=ZIGX
+Comment=Glass system monitor
+Exec=zigx
+Terminal=false
+Type=Application
+Categories=System;Monitor;
+StartupWMClass=zigx

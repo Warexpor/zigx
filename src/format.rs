@@ -69,8 +69,26 @@ pub fn freq_ghz(mhz: f32) -> String {
     }
 }
 
-pub fn fit(s: &str, max_w: f32, size: f32, mono: bool) -> String {
-    let cw = if mono { size * 0.60 } else { size * 0.54 };
+/// Estimated advance of one glyph. `tracking` is letter spacing in em.
+/// Uppercase runs are wider than mixed case in every humanist sans.
+fn char_w(size: f32, mono: bool, caps: bool, tracking: f32) -> f32 {
+    let base = if mono {
+        size * 0.60
+    } else if caps {
+        size * 0.66
+    } else {
+        size * 0.51
+    };
+    base + tracking * size
+}
+
+fn is_caps(s: &str) -> bool {
+    let letters: Vec<char> = s.chars().filter(|c| c.is_alphabetic()).collect();
+    !letters.is_empty() && letters.iter().all(|c| c.is_uppercase())
+}
+
+pub fn fit_t(s: &str, max_w: f32, size: f32, mono: bool, tracking: f32) -> String {
+    let cw = char_w(size, mono, is_caps(s), tracking);
     if cw <= 0.0 || max_w <= 0.0 {
         return String::new();
     }
@@ -87,9 +105,10 @@ pub fn fit(s: &str, max_w: f32, size: f32, mono: bool) -> String {
     out
 }
 
-pub fn text_width(s: &str, size: f32, mono: bool) -> f32 {
-    let cw = if mono { size * 0.60 } else { size * 0.54 };
-    s.chars().count() as f32 * cw
+pub fn text_width_t(s: &str, size: f32, mono: bool, tracking: f32) -> f32 {
+    let n = s.chars().count() as f32;
+    // Tracking is added after every glyph but the last.
+    (n * char_w(size, mono, is_caps(s), 0.0) + (n - 1.0).max(0.0) * tracking * size).max(0.0)
 }
 
 /// Nice axis ceiling (1, 2, 5 × 10^n).
@@ -132,8 +151,16 @@ mod tests {
 
     #[test]
     fn fit_ellipsizes() {
-        let s = fit("systemd-journald", 40.0, 13.0, false);
+        let s = fit_t("systemd-journald", 40.0, 13.0, false, 0.0);
         assert!(s.ends_with('…'));
         assert!(s.chars().count() < "systemd-journald".chars().count());
+    }
+
+    #[test]
+    fn tracking_widens_text() {
+        let plain = text_width_t("MONITOR", 10.0, false, 0.0);
+        let tracked = text_width_t("MONITOR", 10.0, false, 0.10);
+        assert!(tracked > plain);
+        assert!((tracked - plain - 6.0 * 1.0).abs() < 1e-4);
     }
 }

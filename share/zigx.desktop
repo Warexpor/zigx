@@ -1,8 +1,11 @@
 [Desktop Entry]
 Name=ZIGX
+GenericName=System Monitor
 Comment=Glass system monitor
 Exec=zigx
+Icon=utilities-system-monitor
 Terminal=false
 Type=Application
 Categories=System;Monitor;
+Keywords=task;manager;processes;cpu;memory;gpu;
 StartupWMClass=zigx

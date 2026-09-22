@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::model::{Disk, Gpu, Net, Proc, Snap, HIST_CAP};
+use crate::model::{Disk, Gpu, Net, Proc, Snap, HIST_CAP, SAMPLE_PERIOD_MS};
 
 const PF_KTHREAD: u64 = 0x00200000;
 
@@ -38,7 +38,7 @@ pub fn spawn(wake: impl Fn() + Send + 'static) -> Hub {
                     *guard = Arc::new(snap);
                 }
                 wake();
-                thread::sleep(Duration::from_millis(250).saturating_sub(spent));
+                thread::sleep(Duration::from_millis(SAMPLE_PERIOD_MS).saturating_sub(spent));
             }
         })
         .expect("sampler thread");
@@ -591,6 +591,7 @@ impl Engine {
     }
 }
 
+#[derive(Default)]
 struct MemRaw {
     total: u64,
     available: u64,
@@ -600,21 +601,6 @@ struct MemRaw {
     swap_free: u64,
     used: u64,
     swap_used: u64,
-}
-
-impl Default for MemRaw {
-    fn default() -> Self {
-        Self {
-            total: 0,
-            available: 0,
-            cached: 0,
-            buffers: 0,
-            swap_total: 0,
-            swap_free: 0,
-            used: 0,
-            swap_used: 0,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -947,7 +933,6 @@ fn hwmon_stats(hwmon: Option<&Path>) -> (Option<u32>, Option<f32>, Option<u32>) 
 
 struct Nvml {
     _lib: libloading::Library,
-    count: u32,
     devices: Vec<*mut std::ffi::c_void>,
     util: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtil) -> i32,
     mem: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlMem) -> i32,
@@ -1033,7 +1018,6 @@ impl Nvml {
                     .ok()
                     .map(|s| *s),
                 _lib: lib,
-                count,
                 devices,
                 names,
             })
@@ -1117,7 +1101,6 @@ impl Nvml {
                 });
             }
         }
-        let _ = self.count;
         out
     }
 }

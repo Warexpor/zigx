@@ -74,25 +74,17 @@ fn fs_main(v: VertexOut) -> @location(0) vec4<f32> {
     let dist = sd_round_box(p, size * 0.5, radius);
     let cover = 1.0 - smoothstep(-0.75, 0.75, dist);
 
-    // Vertical light: gentle lift toward the top plus a soft sheen band.
-    let top = 1.0 - smoothstep(0.0, size.y * 0.85, v.local.y);
-    let fill_rgb = v.fill.rgb + vec3<f32>(top * 0.028 + top * top * 0.026);
+    // Flat fill. No sheen, no lift: the compositor blur is the only light.
     let fill_a = v.fill.a * cover;
 
-    // Hairline border, brighter toward the top edge.
+    // Hairline border straddling the edge, uniform all the way round.
     let band = 1.0 - smoothstep(max(bw - 0.5, 0.0), bw + 0.9, abs(dist));
-    let border_a = v.border.a * band * (0.55 + 0.45 * top);
-    let border_rgb = mix(v.border.rgb * 0.6, min(v.border.rgb + vec3<f32>(0.22), vec3<f32>(1.0)), top);
+    let border_a = v.border.a * band * step(0.001, bw);
 
-    // Compose fill, then a thin inner highlight just inside the top edge,
-    // then the border. Everything premultiplied.
+    // Compose fill then border, premultiplied.
     var col_a = fill_a;
-    var col_rgb = fill_rgb * fill_a;
-    let inl = (1.0 - smoothstep(0.5, 1.8, abs(dist + bw + 1.1))) * top * step(0.004, v.fill.a);
-    let inl_a = inl * 0.13 * cover;
-    col_rgb = vec3<f32>(1.0) * inl_a + col_rgb * (1.0 - inl_a);
-    col_a = inl_a + col_a * (1.0 - inl_a);
-    col_rgb = border_rgb * border_a + col_rgb * (1.0 - border_a);
+    var col_rgb = v.fill.rgb * fill_a;
+    col_rgb = v.border.rgb * border_a + col_rgb * (1.0 - border_a);
     col_a = border_a + col_a * (1.0 - border_a);
 
     // Soft drop shadow, only outside the box, shifted slightly downward.
@@ -191,8 +183,9 @@ pub struct Gfx {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     buffers: Vec<Buffer>,
-    buffer_keys: Vec<(String, u32, bool, u16)>,
+    buffer_keys: Vec<(String, u32, bool, u16, i32)>,
     prepared: Vec<Prepared>,
+    fonts: Fonts,
     logged_text_error: bool,
 }
 
@@ -216,13 +209,18 @@ impl Gfx {
                 .expect("gpu device");
 
         let caps = surface.get_capabilities(&adapter);
+        // Non-sRGB target on purpose: the theme's alpha tokens are authored
+        // with web semantics (8% white over black is #141414, not #4d4d4d).
+        // An sRGB format would re-encode the shader's linear output and lift
+        // every ghost fill and hairline several stops. glyphon picks its
+        // Web color mode for these formats, so text agrees.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .or_else(|| caps.formats.first().copied())
-            .unwrap_or(TextureFormat::Bgra8UnormSrgb);
+            .unwrap_or(TextureFormat::Bgra8Unorm);
         let alpha = if caps
             .alpha_modes
             .contains(&CompositeAlphaMode::PreMultiplied)
@@ -238,7 +236,6 @@ impl Gfx {
         } else {
             CompositeAlphaMode::Auto
         };
-        eprintln!("zigx surface {format:?} alpha {alpha:?}");
 
         let size = window.inner_size();
         let config = SurfaceConfiguration {
@@ -316,16 +313,13 @@ impl Gfx {
         });
 
         let mut font_system = FontSystem::new();
+        let fonts = choose_families(&mut font_system);
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-
-        // Keep the cache alive; glyphon stores what it needs inside the atlas.
-        drop(cache);
-        let _ = &mut font_system;
 
         Self {
             surface,
@@ -350,6 +344,7 @@ impl Gfx {
             buffers: Vec::new(),
             buffer_keys: Vec::new(),
             prepared: Vec::new(),
+            fonts,
             logged_text_error: false,
         }
     }
@@ -482,9 +477,9 @@ impl Gfx {
                 .collect();
             let color = premul(stroke.color);
             if let Some(base) = stroke.baseline {
-                // Gradient wash under the line: tinted at the trace, gone at the baseline.
+                // Faint wash under the line: tinted at the trace, gone at the baseline.
                 let mut top = stroke.color;
-                top[3] = ((stroke.color[3] as f32 * 0.26).min(64.0)) as u8;
+                top[3] = ((stroke.color[3] as f32 * 0.12).min(30.0)) as u8;
                 let mut bottom = top;
                 bottom[3] = 0;
                 fill_under(
@@ -541,7 +536,7 @@ impl Gfx {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
             buf.set_wrap(Wrap::None);
             self.buffers.push(buf);
-            self.buffer_keys.push((String::new(), 0, false, 400));
+            self.buffer_keys.push((String::new(), 0, false, 400, 0));
         }
         self.buffers.truncate(n);
         self.buffer_keys.truncate(n);
@@ -550,17 +545,27 @@ impl Gfx {
         for (i, label) in draw.labels.iter().enumerate() {
             let size_px = (label.size * scale).max(1.0);
             let size_key = (size_px * 10.0).round() as u32;
+            let track_key = (label.tracking * 1000.0).round() as i32;
             let changed = self.buffer_keys[i].0 != label.text
                 || self.buffer_keys[i].1 != size_key
                 || self.buffer_keys[i].2 != label.mono
-                || self.buffer_keys[i].3 != label.weight;
+                || self.buffer_keys[i].3 != label.weight
+                || self.buffer_keys[i].4 != track_key;
             if changed {
-                let attrs = if label.mono {
+                let weight = if label.mono {
+                    self.fonts.mono.snap(label.weight)
+                } else {
+                    self.fonts.sans.snap(label.weight)
+                };
+                let mut attrs = if label.mono {
                     Attrs::new().family(Family::Monospace)
                 } else {
                     Attrs::new().family(Family::SansSerif)
                 }
-                .weight(Weight(label.weight));
+                .weight(Weight(weight));
+                if label.tracking != 0.0 {
+                    attrs = attrs.letter_spacing(label.tracking);
+                }
                 let buf = &mut self.buffers[i];
                 buf.set_metrics(Metrics::new(size_px, (label.h * scale).max(size_px)));
                 buf.set_size(
@@ -568,7 +573,13 @@ impl Gfx {
                     Some((label.h * scale).max(1.0)),
                 );
                 buf.set_text(&label.text, &attrs, Shaping::Advanced, None);
-                self.buffer_keys[i] = (label.text.clone(), size_key, label.mono, label.weight);
+                self.buffer_keys[i] = (
+                    label.text.clone(),
+                    size_key,
+                    label.mono,
+                    label.weight,
+                    track_key,
+                );
                 dirty[i] = true;
             }
             let x = (label.x * scale).round();
@@ -652,6 +663,127 @@ impl Gfx {
         }
         self.prepared = prepared;
     }
+}
+
+/// Upright weights a family can actually produce. `None` means the family
+/// has a variable `wght` axis and any weight is fine.
+#[derive(Clone, Debug, Default)]
+struct WeightSet(Option<Vec<u16>>);
+
+impl WeightSet {
+    /// Nearest available weight. cosmic-text only treats exact (or variable)
+    /// matches as belonging to the requested family; anything else drops
+    /// into a machine-wide fallback list where an italic face can win a tie.
+    fn snap(&self, want: u16) -> u16 {
+        match &self.0 {
+            None => want,
+            Some(list) if list.is_empty() => want,
+            Some(list) => *list
+                .iter()
+                .min_by_key(|w| (w.abs_diff(want), **w))
+                .unwrap_or(&want),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Fonts {
+    sans: WeightSet,
+    mono: WeightSet,
+}
+
+/// cosmic-text's built-in generic families ("Open Sans", "Noto Sans Mono") are
+/// rarely installed. When the family is missing, every face on the machine is
+/// ranked by weight distance alone, so a 600-weight label can land in a serif.
+/// Bind the generic families to fonts that actually exist instead.
+fn choose_families(font_system: &mut FontSystem) -> Fonts {
+    const SANS: &[&str] = &[
+        "Inter",
+        "Inter Variable",
+        "Adwaita Sans",
+        "Cantarell",
+        "Noto Sans",
+        "Liberation Sans",
+        "DejaVu Sans",
+    ];
+    const MONO: &[&str] = &[
+        "JetBrainsMono Nerd Font",
+        "JetBrains Mono",
+        "Adwaita Mono",
+        "CaskaydiaMono Nerd Font",
+        "Cascadia Mono",
+        "Fira Code",
+        "Noto Sans Mono",
+        "Liberation Mono",
+        "DejaVu Sans Mono",
+    ];
+    let installed: std::collections::HashSet<String> = font_system
+        .db()
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+        .collect();
+    let pick = |env: &str, prefs: &[&str]| -> Option<String> {
+        if let Ok(name) = std::env::var(env) {
+            if installed.contains(&name) {
+                return Some(name);
+            }
+            eprintln!("zigx: {env}={name} is not an installed font family");
+        }
+        prefs
+            .iter()
+            .find(|name| installed.contains(**name))
+            .map(|name| name.to_string())
+    };
+    let sans = pick("ZIGX_SANS", SANS);
+    let mono = pick("ZIGX_MONO", MONO);
+    let fonts = Fonts {
+        sans: sans
+            .as_deref()
+            .map(|n| weights_of(font_system, n))
+            .unwrap_or_default(),
+        mono: mono
+            .as_deref()
+            .map(|n| weights_of(font_system, n))
+            .unwrap_or_default(),
+    };
+    let db = font_system.db_mut();
+    if let Some(name) = &sans {
+        db.set_sans_serif_family(name.clone());
+    }
+    if let Some(name) = &mono {
+        db.set_monospace_family(name.clone());
+    }
+    fonts
+}
+
+fn weights_of(font_system: &FontSystem, family: &str) -> WeightSet {
+    let db = font_system.db();
+    let mut weights: Vec<u16> = Vec::new();
+    for face in db.faces() {
+        if face.style != glyphon::Style::Normal
+            || !face.families.iter().any(|(name, _)| name == family)
+        {
+            continue;
+        }
+        let variable = db
+            .with_face_data(face.id, |data, index| {
+                ttf_parser::Face::parse(data, index)
+                    .map(|f| {
+                        f.variation_axes()
+                            .into_iter()
+                            .any(|a| a.tag == ttf_parser::Tag::from_bytes(b"wght"))
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if variable {
+            return WeightSet(None);
+        }
+        weights.push(face.weight.0);
+    }
+    weights.sort_unstable();
+    weights.dedup();
+    WeightSet(Some(weights))
 }
 
 fn pipeline(

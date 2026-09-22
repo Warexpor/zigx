@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,9 +16,28 @@ pub fn autostart_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("autostart")
 }
 
-pub fn load_startup() -> Vec<StartupEntry> {
-    let dir = autostart_dir();
-    let Ok(rd) = fs::read_dir(&dir) else {
+/// System autostart directories, lowest precedence first.
+fn system_autostart_dirs() -> Vec<PathBuf> {
+    let dirs = std::env::var("XDG_CONFIG_DIRS").unwrap_or_default();
+    let mut out: Vec<PathBuf> = dirs
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join("autostart"))
+        .collect();
+    if out.is_empty() {
+        out.push(PathBuf::from("/etc/xdg/autostart"));
+    }
+    out.reverse();
+    out
+}
+
+struct Loaded {
+    path: PathBuf,
+    fields: DesktopFields,
+}
+
+fn load_dir(dir: &Path) -> Vec<(String, Loaded)> {
+    let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -26,72 +46,129 @@ pub fn load_startup() -> Vec<StartupEntry> {
         if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
             continue;
         }
+        let Some(file) = path.file_name().and_then(|f| f.to_str()) else {
+            continue;
+        };
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
-        let fields = parse_desktop(&text);
-        if fields.kind.as_deref() == Some("Link") {
-            continue;
-        }
-        let name = fields.name.unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Autostart")
-                .to_string()
-        });
-        out.push(StartupEntry {
-            name,
-            exec: fields.exec.unwrap_or_default(),
-            path,
-            enabled: fields.enabled,
-        });
+        out.push((
+            file.to_string(),
+            Loaded {
+                path,
+                fields: parse_desktop(&text),
+            },
+        ));
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     out
 }
 
-pub fn write_enabled(path: &Path, enable: bool) -> io::Result<Revert> {
-    let dir = autostart_dir()
-        .canonicalize()
-        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "no autostart directory"))?;
-    let canon = path.canonicalize()?;
-    if canon.parent() != Some(dir.as_path()) {
+/// Every autostart entry the session would consider, following the XDG
+/// precedence rule: a file in `~/.config/autostart` overrides the system file
+/// with the same name, even when the override only says `Hidden=true`.
+pub fn load_startup() -> Vec<StartupEntry> {
+    let user_dir = autostart_dir();
+    let mut system: HashMap<String, Loaded> = HashMap::new();
+    for dir in system_autostart_dirs() {
+        for (file, loaded) in load_dir(&dir) {
+            system.insert(file, loaded);
+        }
+    }
+    let mut user: HashMap<String, Loaded> = load_dir(&user_dir).into_iter().collect();
+
+    let mut out = Vec::new();
+    let mut files: Vec<String> = system.keys().chain(user.keys()).cloned().collect();
+    files.sort();
+    files.dedup();
+    for file in files {
+        let sys = system.remove(&file);
+        let usr = user.remove(&file);
+        let effective = usr.as_ref().or(sys.as_ref()).map(|l| &l.fields);
+        if effective.is_some_and(|f| f.kind.as_deref() == Some("Link")) {
+            continue;
+        }
+        let pick = |get: fn(&DesktopFields) -> Option<&String>| {
+            usr.as_ref()
+                .and_then(|l| get(&l.fields))
+                .or_else(|| sys.as_ref().and_then(|l| get(&l.fields)))
+                .cloned()
+        };
+        let name = pick(|f| f.name.as_ref())
+            .unwrap_or_else(|| file.strip_suffix(".desktop").unwrap_or(&file).to_string());
+        let exec = pick(|f| f.exec.as_ref()).unwrap_or_default();
+        let enabled = effective.is_none_or(|f| f.enabled);
+        out.push(StartupEntry {
+            name,
+            exec,
+            path: user_dir.join(&file),
+            system_path: sys.map(|l| l.path),
+            enabled,
+        });
+    }
+    out.sort_by_key(|e| e.name.to_lowercase());
+    out
+}
+
+fn user_path_for(path: &Path) -> io::Result<PathBuf> {
+    let dir = autostart_dir();
+    let file = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
+    if path.parent() != Some(dir.as_path()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "refusing to edit a file outside autostart",
         ));
     }
-    let previous = fs::read_to_string(&canon)?;
-    let mut bak = canon.clone().into_os_string();
-    bak.push(".bak");
-    let bak = PathBuf::from(bak);
-    if !bak.exists() {
-        fs::copy(&canon, &bak)?;
+    Ok(dir.join(file))
+}
+
+/// Flip an entry. Existing user files are edited in place with a one-time
+/// `.bak`. Entries that only exist system-wide get a user override created,
+/// seeded from the system file so the override stays readable on its own.
+pub fn write_enabled(path: &Path, system_path: Option<&Path>, enable: bool) -> io::Result<Revert> {
+    let target = user_path_for(path)?;
+    let previous = match fs::read_to_string(&target) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
+    let base = match (&previous, system_path) {
+        (Some(text), _) => text.clone(),
+        (None, Some(sys)) => fs::read_to_string(sys)?,
+        (None, None) => "[Desktop Entry]\nType=Application\n".to_string(),
+    };
+    if previous.is_some() {
+        let mut bak = target.clone().into_os_string();
+        bak.push(".bak");
+        let bak = PathBuf::from(bak);
+        if !bak.exists() {
+            fs::copy(&target, &bak)?;
+        }
+    } else if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir)?;
     }
-    let mut next = set_key(&previous, "Hidden", if enable { "false" } else { "true" });
+    let mut next = set_key(&base, "Hidden", if enable { "false" } else { "true" });
     if enable {
         next = set_key(&next, "X-GNOME-Autostart-enabled", "true");
     }
-    atomic_write(&canon, &next)?;
+    atomic_write(&target, &next)?;
     Ok(Revert {
-        path: canon,
+        path: target,
         previous,
     })
 }
 
 pub fn restore_startup(revert: &Revert) -> io::Result<()> {
-    let dir = autostart_dir().canonicalize()?;
-    let canon = revert
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| revert.path.clone());
-    if canon.parent() != Some(dir.as_path()) && revert.path.parent() != Some(dir.as_path()) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "refusing to restore outside autostart",
-        ));
+    let target = user_path_for(&revert.path)?;
+    match &revert.previous {
+        Some(text) => atomic_write(&target, text),
+        None => match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        },
     }
-    atomic_write(&revert.path, &revert.previous)
 }
 
 struct DesktopFields {
@@ -215,5 +292,62 @@ mod tests {
     fn ignores_later_groups() {
         let src = "[Desktop Entry]\nName=Keep\n\n[Desktop Action]\nName=Ignore\n";
         assert_eq!(parse_desktop(src).name.as_deref(), Some("Keep"));
+    }
+
+    #[test]
+    fn set_key_adds_missing_key_inside_entry_group() {
+        let src = "[Desktop Entry]\nName=A\n\n[Desktop Action x]\nName=B\n";
+        let out = set_key(src, "Hidden", "true");
+        let entry_end = out.find("[Desktop Action").unwrap();
+        let hidden = out.find("Hidden=true").unwrap();
+        assert!(
+            hidden < entry_end,
+            "key must land in [Desktop Entry]: {out}"
+        );
+    }
+
+    #[test]
+    fn user_mask_overrides_system_entry_and_undo_removes_created_file() {
+        let root = std::env::temp_dir().join(format!("zigx-startup-{}", std::process::id()));
+        let sys = root.join("sys").join("autostart");
+        let usr = root.join("home").join("autostart");
+        fs::create_dir_all(&sys).unwrap();
+        fs::create_dir_all(&usr).unwrap();
+        fs::write(
+            sys.join("a.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Alpha\nExec=alpha\n",
+        )
+        .unwrap();
+        fs::write(
+            sys.join("b.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Beta\nExec=beta\n",
+        )
+        .unwrap();
+        fs::write(usr.join("b.desktop"), "[Desktop Entry]\nHidden=true\n").unwrap();
+
+        // Process-wide env; tests in this module run in one process, and no
+        // other test in the crate touches XDG_CONFIG_*.
+        std::env::set_var("XDG_CONFIG_DIRS", root.join("sys"));
+        std::env::set_var("XDG_CONFIG_HOME", root.join("home"));
+
+        let list = load_startup();
+        assert_eq!(list.len(), 2);
+        let a = list.iter().find(|e| e.name == "Alpha").unwrap();
+        let b = list.iter().find(|e| e.name == "Beta").unwrap();
+        assert!(a.enabled);
+        assert!(!b.enabled, "user mask must win");
+        assert_eq!(b.exec, "beta", "exec falls back to the system file");
+        assert!(a.system_path.is_some());
+        assert!(!a.path.exists());
+
+        let revert = write_enabled(&a.path, a.system_path.as_deref(), false).unwrap();
+        assert!(a.path.exists());
+        assert!(revert.previous.is_none());
+        let reloaded = load_startup();
+        assert!(!reloaded.iter().find(|e| e.name == "Alpha").unwrap().enabled);
+
+        restore_startup(&revert).unwrap();
+        assert!(!a.path.exists(), "undo removes the file we created");
+        let _ = fs::remove_dir_all(&root);
     }
 }

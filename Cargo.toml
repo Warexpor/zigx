@@ -1,9 +1,14 @@
 [package]
 name = "zigx"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Fast glass system monitor for Linux"
 license = "Apache-2.0"
+repository = "https://github.com/Warexpor/zigx"
+readme = "README.md"
+keywords = ["system-monitor", "task-manager", "wayland", "hyprland", "wgpu"]
+categories = ["gui", "os::linux-apis"]
+rust-version = "1.82"
 
 [dependencies]
 bytemuck = { version = "1", features = ["derive"] }
@@ -11,6 +16,7 @@ glyphon = "0.12"
 libc = "0.2"
 libloading = "0.8"
 pollster = "0.4"
+ttf-parser = { version = "0.25", default-features = false, features = ["std", "variable-fonts"] }
 wgpu = "30"
 winit = "0.30"
 

@@ -113,10 +113,20 @@ impl App {
                     }
                 }
                 Effect::Kill(pids) => {
+                    let asked = pids.len();
                     let n = terminate(&pids);
+                    let label = match (n, asked) {
+                        (0, _) => "Could not signal the selected process".to_string(),
+                        (1, 1) => "SIGTERM sent".to_string(),
+                        (n, asked) if n == asked => format!("SIGTERM sent to {n} processes"),
+                        (n, asked) => format!("SIGTERM sent to {n} of {asked} processes"),
+                    };
+                    // Dead PIDs can be recycled; do not leave them armed.
+                    self.state.selected.clear();
+                    self.state.anchor = None;
                     self.state.undo = Some(Undo {
                         until: Instant::now() + Duration::from_secs(4),
-                        label: format!("SIGTERM sent to {n}"),
+                        label,
                         revert: None,
                     });
                 }
@@ -136,7 +146,8 @@ impl App {
         let enable = !entry.enabled;
         let name = entry.name.clone();
         let path = entry.path.clone();
-        match write_enabled(&path, enable) {
+        let system_path = entry.system_path.clone();
+        match write_enabled(&path, system_path.as_deref(), enable) {
             Ok(revert) => {
                 self.state.undo = Some(Undo {
                     until: Instant::now() + Duration::from_secs(10),

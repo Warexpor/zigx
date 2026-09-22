@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use crate::format::{
-    self, bytes, cpu_pct, disk_cell, duration, fit, freq_ghz, percent, rate, text_width,
+    self, bytes, cpu_pct, disk_cell, duration, fit_t, freq_ghz, percent, rate, text_width_t,
 };
 use crate::interact::selection_label;
 use crate::model::{
@@ -72,6 +72,8 @@ pub struct Label {
     pub color: theme::Rgba,
     pub mono: bool,
     pub weight: u16,
+    /// Letter spacing in em.
+    pub tracking: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +103,56 @@ pub struct Hit {
     pub kind: HitKind,
 }
 
+// --- Type roles --------------------------------------------------------------
+//
+// Two families, one weight. Hierarchy comes from size, alpha, and case, not
+// from bold. Micro labels are uppercase and tracked like panel engraving.
+
+#[derive(Clone, Copy, Debug)]
+struct Type {
+    size: f32,
+    mono: bool,
+    weight: u16,
+    tracking: f32,
+    upper: bool,
+}
+
+const fn ty(size: f32, mono: bool, weight: u16, tracking: f32, upper: bool) -> Type {
+    Type {
+        size,
+        mono,
+        weight,
+        tracking,
+        upper,
+    }
+}
+
+const WORDMARK: Type = ty(11.5, false, 500, 0.18, true);
+const MICRO: Type = ty(10.0, false, 400, 0.10, true);
+const MICRO_NUM: Type = ty(10.0, true, 400, 0.06, true);
+const NAV: Type = ty(13.0, false, 400, 0.0, false);
+const BODY: Type = ty(12.5, false, 400, 0.0, false);
+const PILL: Type = ty(12.0, false, 400, 0.0, false);
+const PILL_ON: Type = ty(12.0, false, 500, 0.0, false);
+const NUM: Type = ty(12.0, true, 400, 0.0, false);
+const NUM_SMALL: Type = ty(10.5, true, 400, 0.0, false);
+const TITLE: Type = ty(22.0, false, 400, -0.012, false);
+const SUB: Type = ty(12.0, false, 400, 0.0, false);
+const READOUT: Type = ty(44.0, true, 400, -0.02, false);
+const READOUT_SUB: Type = ty(16.0, true, 400, 0.0, false);
+const STAT: Type = ty(15.0, true, 400, 0.0, false);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Align {
+    Left,
+    Right,
+    Center,
+}
+
+fn measure(s: &str, t: Type) -> f32 {
+    text_width_t(s, t.size, t.mono, t.tracking)
+}
+
 pub struct DrawList {
     pub slabs: Vec<Slab>,
     pub strokes: Vec<Stroke>,
@@ -111,6 +163,8 @@ pub struct DrawList {
     pub startup_rect: Option<Rect>,
     clip: Option<Rect>,
 }
+
+const NONE: theme::Rgba = [0, 0, 0, 0];
 
 impl DrawList {
     fn new() -> Self {
@@ -133,6 +187,14 @@ impl DrawList {
         }
     }
 
+    fn fill(&mut self, r: Rect, radius: f32, fill: theme::Rgba) {
+        self.slab(r, radius, fill, NONE, 0.0);
+    }
+
+    fn outline(&mut self, r: Rect, radius: f32, line: theme::Rgba) {
+        self.slab(r, radius, NONE, line, 1.0);
+    }
+
     fn slab(
         &mut self,
         r: Rect,
@@ -140,20 +202,6 @@ impl DrawList {
         fill: theme::Rgba,
         border: theme::Rgba,
         border_w: f32,
-    ) {
-        self.slab_ex(r, radius, fill, border, border_w, 0.0, 0.0);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn slab_ex(
-        &mut self,
-        r: Rect,
-        radius: f32,
-        fill: theme::Rgba,
-        border: theme::Rgba,
-        border_w: f32,
-        shadow: f32,
-        shadow_a: f32,
     ) {
         if r.w < 1.0 || r.h < 1.0 || !self.visible(r) {
             return;
@@ -167,14 +215,14 @@ impl DrawList {
             fill,
             border,
             border_w,
-            shadow,
-            shadow_a,
+            shadow: 0.0,
+            shadow_a: 0.0,
         });
     }
 
     /// 1px hairline, the only hard edge in the system.
     fn hairline(&mut self, r: Rect) {
-        self.slab(r, 0.0, theme::DIVIDER, [0, 0, 0, 0], 0.0);
+        self.fill(r, 0.0, theme::HAIRLINE);
     }
 
     fn hit(&mut self, rect: Rect, kind: HitKind) {
@@ -192,31 +240,40 @@ impl DrawList {
         });
     }
 
-    fn text(&mut self, text: &str, r: Rect, size: f32, color: theme::Rgba, mono: bool, right: bool) {
-        self.textw(text, r, size, color, mono, right, 400);
+    fn text(&mut self, s: &str, r: Rect, t: Type, color: theme::Rgba) {
+        self.place(s, r, t, color, Align::Left);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn textw(
-        &mut self,
-        text: &str,
-        r: Rect,
-        size: f32,
-        color: theme::Rgba,
-        mono: bool,
-        right: bool,
-        weight: u16,
-    ) {
-        if !self.visible(r) {
+    fn text_r(&mut self, s: &str, r: Rect, t: Type, color: theme::Rgba) {
+        self.place(s, r, t, color, Align::Right);
+    }
+
+    fn text_c(&mut self, s: &str, r: Rect, t: Type, color: theme::Rgba) {
+        self.place(s, r, t, color, Align::Center);
+    }
+
+    fn place(&mut self, s: &str, r: Rect, t: Type, color: theme::Rgba, align: Align) {
+        if !self.visible(r) || color[3] == 0 {
             return;
         }
-        let fitted = fit(text, r.w, size, mono);
+        let owned;
+        let s = if t.upper {
+            owned = s.to_uppercase();
+            owned.as_str()
+        } else {
+            s
+        };
+        let fitted = fit_t(s, r.w, t.size, t.mono, t.tracking);
         if fitted.is_empty() {
             return;
         }
-        let tw = text_width(&fitted, size, mono);
-        let lh = size * 1.35;
-        let x = if right { r.right() - tw } else { r.x };
+        let tw = measure(&fitted, t);
+        let lh = t.size * 1.3;
+        let x = match align {
+            Align::Left => r.x,
+            Align::Right => r.right() - tw,
+            Align::Center => r.x + (r.w - tw) * 0.5,
+        };
         let y = r.y + (r.h - lh) * 0.5;
         self.labels.push(Label {
             text: fitted,
@@ -224,33 +281,27 @@ impl DrawList {
             y,
             w: r.w,
             h: lh,
-            size,
+            size: t.size,
             color,
-            mono,
-            weight,
+            mono: t.mono,
+            weight: t.weight,
+            tracking: t.tracking,
         });
     }
 
-    /// Center the most recent label inside `r`.
-    fn center_last(&mut self, r: Rect, size: f32, mono: bool) {
-        if let Some(last) = self.labels.last_mut() {
-            let tw = text_width(&last.text, size, mono);
-            last.x = r.x + (r.w - tw) * 0.5;
-        }
-    }
-
+    /// Telemetry graph: faint quarter grid, hairline baseline, thin traces.
     fn graph(&mut self, r: Rect, series: &[(&[f32], theme::Rgba)], max: f32, dot: bool) {
         if r.w < 4.0 || r.h < 4.0 || !self.visible(r) {
             return;
         }
         let max = max.max(0.001);
-        self.slab(
-            Rect::new(r.x, r.bottom(), r.w, 1.0),
-            0.0,
-            theme::DIVIDER,
-            [0, 0, 0, 0],
-            0.0,
-        );
+        if r.h >= 80.0 {
+            for k in 1..4 {
+                let gy = r.y + r.h * (k as f32) / 4.0;
+                self.fill(Rect::new(r.x, gy, r.w, 1.0), 0.0, theme::GRID);
+            }
+        }
+        self.hairline(Rect::new(r.x, r.bottom(), r.w, 1.0));
         for (si, (values, color)) in series.iter().enumerate() {
             if values.len() < 2 {
                 continue;
@@ -267,19 +318,13 @@ impl DrawList {
                 .collect();
             self.strokes.push(Stroke {
                 pts: pts.clone(),
-                width: 1.5,
+                width: 1.25,
                 color: *color,
                 baseline: Some(r.bottom()),
             });
             if dot && si == 0 {
                 if let Some(p) = pts.last() {
-                    self.slab(
-                        Rect::new(p[0] - 2.0, p[1] - 2.0, 4.0, 4.0),
-                        2.0,
-                        *color,
-                        [0, 0, 0, 0],
-                        0.0,
-                    );
+                    self.fill(Rect::new(p[0] - 2.0, p[1] - 2.0, 4.0, 4.0), 2.0, *color);
                 }
             }
         }
@@ -313,14 +358,17 @@ enum Icon {
     ChevronRight,
 }
 
+const ICON_W: f32 = 1.25;
+
 /// Draw a 14x14 line icon at (x, y).
 fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
+    let w = ICON_W;
     match kind {
         Icon::List => {
             for i in 0..3 {
                 let yy = y + 2.5 + i as f32 * 4.0;
-                d.line(&[[x + 1.0, yy], [x + 3.0, yy]], 1.4, c);
-                d.line(&[[x + 5.5, yy], [x + 13.0, yy]], 1.4, c);
+                d.line(&[[x + 1.0, yy], [x + 3.0, yy]], w, c);
+                d.line(&[[x + 5.5, yy], [x + 13.0, yy]], w, c);
             }
         }
         Icon::Pulse => d.line(
@@ -332,75 +380,69 @@ fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
                 [x + 10.5, y + 8.5],
                 [x + 13.0, y + 8.5],
             ],
-            1.4,
+            w,
             c,
         ),
         Icon::Launch => {
-            d.line(&[[x + 3.0, y + 11.0], [x + 11.0, y + 3.0]], 1.4, c);
+            d.line(&[[x + 3.0, y + 11.0], [x + 11.0, y + 3.0]], w, c);
             d.line(
                 &[[x + 5.5, y + 3.0], [x + 11.0, y + 3.0], [x + 11.0, y + 8.5]],
-                1.4,
+                w,
                 c,
             );
         }
         Icon::Chip => {
-            d.slab(Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 2.5, [0, 0, 0, 0], c, 1.2);
-            d.slab(
-                Rect::new(x + 5.75, y + 5.75, 2.5, 2.5),
-                0.8,
-                c,
-                [0, 0, 0, 0],
-                0.0,
-            );
+            d.slab(Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 2.0, NONE, c, w);
+            d.fill(Rect::new(x + 5.75, y + 5.75, 2.5, 2.5), 0.5, c);
         }
         Icon::Mem => {
-            d.slab(Rect::new(x + 2.0, y + 7.0, 2.2, 5.0), 1.1, c, [0, 0, 0, 0], 0.0);
-            d.slab(Rect::new(x + 5.9, y + 4.5, 2.2, 7.5), 1.1, c, [0, 0, 0, 0], 0.0);
-            d.slab(Rect::new(x + 9.8, y + 2.0, 2.2, 10.0), 1.1, c, [0, 0, 0, 0], 0.0);
+            d.fill(Rect::new(x + 2.0, y + 7.0, 2.2, 5.0), 0.6, c);
+            d.fill(Rect::new(x + 5.9, y + 4.5, 2.2, 7.5), 0.6, c);
+            d.fill(Rect::new(x + 9.8, y + 2.0, 2.2, 10.0), 0.6, c);
         }
         Icon::Gpu => {
-            d.slab(Rect::new(x + 1.0, y + 3.5, 12.0, 8.0), 2.5, [0, 0, 0, 0], c, 1.2);
-            d.slab(Rect::new(x + 6.0, y + 6.5, 2.0, 2.0), 1.0, c, [0, 0, 0, 0], 0.0);
+            d.slab(Rect::new(x + 1.0, y + 3.5, 12.0, 8.0), 2.0, NONE, c, w);
+            d.fill(Rect::new(x + 6.0, y + 6.5, 2.0, 2.0), 0.5, c);
         }
         Icon::Disk => {
-            d.slab(Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 5.0, [0, 0, 0, 0], c, 1.2);
-            d.slab(Rect::new(x + 6.0, y + 6.0, 2.0, 2.0), 1.0, c, [0, 0, 0, 0], 0.0);
+            d.slab(Rect::new(x + 2.0, y + 2.0, 10.0, 10.0), 5.0, NONE, c, w);
+            d.fill(Rect::new(x + 6.0, y + 6.0, 2.0, 2.0), 1.0, c);
         }
         Icon::Net => {
-            d.line(&[[x + 4.0, y + 2.5], [x + 4.0, y + 9.5]], 1.3, c);
+            d.line(&[[x + 4.0, y + 2.5], [x + 4.0, y + 9.5]], w, c);
             d.line(
                 &[[x + 1.8, y + 7.0], [x + 4.0, y + 9.5], [x + 6.2, y + 7.0]],
-                1.3,
+                w,
                 c,
             );
-            d.line(&[[x + 10.0, y + 4.5], [x + 10.0, y + 11.5]], 1.3, c);
+            d.line(&[[x + 10.0, y + 4.5], [x + 10.0, y + 11.5]], w, c);
             d.line(
                 &[[x + 7.8, y + 7.0], [x + 10.0, y + 4.5], [x + 12.2, y + 7.0]],
-                1.3,
+                w,
                 c,
             );
         }
         Icon::Search => {
-            d.slab(Rect::new(x + 2.0, y + 2.0, 8.0, 8.0), 4.0, [0, 0, 0, 0], c, 1.3);
-            d.line(&[[x + 8.8, y + 8.8], [x + 12.5, y + 12.5]], 1.4, c);
+            d.slab(Rect::new(x + 2.0, y + 2.0, 8.0, 8.0), 4.0, NONE, c, w);
+            d.line(&[[x + 8.8, y + 8.8], [x + 12.5, y + 12.5]], w, c);
         }
         Icon::Pin => {
-            d.slab(Rect::new(x + 4.5, y + 1.5, 5.0, 5.0), 2.5, [0, 0, 0, 0], c, 1.3);
-            d.line(&[[x + 7.0, y + 6.5], [x + 7.0, y + 12.5]], 1.3, c);
+            d.slab(Rect::new(x + 4.5, y + 1.5, 5.0, 5.0), 2.5, NONE, c, w);
+            d.line(&[[x + 7.0, y + 6.5], [x + 7.0, y + 12.5]], w, c);
         }
-        Icon::Min => d.line(&[[x + 3.0, y + 7.0], [x + 11.0, y + 7.0]], 1.4, c),
+        Icon::Min => d.line(&[[x + 3.0, y + 7.0], [x + 11.0, y + 7.0]], w, c),
         Icon::Close => {
-            d.line(&[[x + 3.5, y + 3.5], [x + 10.5, y + 10.5]], 1.4, c);
-            d.line(&[[x + 10.5, y + 3.5], [x + 3.5, y + 10.5]], 1.4, c);
+            d.line(&[[x + 3.5, y + 3.5], [x + 10.5, y + 10.5]], w, c);
+            d.line(&[[x + 10.5, y + 3.5], [x + 3.5, y + 10.5]], w, c);
         }
         Icon::ChevronDown => d.line(
             &[[x + 3.0, y + 5.0], [x + 7.0, y + 9.0], [x + 11.0, y + 5.0]],
-            1.4,
+            w,
             c,
         ),
         Icon::ChevronRight => d.line(
             &[[x + 5.0, y + 3.0], [x + 9.0, y + 7.0], [x + 5.0, y + 11.0]],
-            1.4,
+            w,
             c,
         ),
     }
@@ -416,8 +458,8 @@ fn heat(v: f32) -> theme::Rgba {
     }
 }
 
-/// Soft pill button: rounded-full, whisper fill, 12px label.
-fn pill_button(
+/// Ghost pill: transparent, 1px outline, label centered. The only button.
+fn ghost_pill(
     d: &mut DrawList,
     r: Rect,
     label: &str,
@@ -425,33 +467,49 @@ fn pill_button(
     enabled: bool,
     danger: bool,
 ) {
-    let hot = r.contains(mouse[0], mouse[1]) && enabled;
-    let (fill, ink) = if danger {
-        (theme::DANGER_SOFT, theme::DANGER_INK)
+    let hot = enabled && r.contains(mouse[0], mouse[1]);
+    let (line, ink) = if danger {
+        (theme::DANGER_LINE, theme::DANGER_INK)
+    } else if !enabled {
+        (theme::HAIRLINE, theme::INK_4)
+    } else if hot {
+        (theme::ACCENT_LINE, theme::INK)
     } else {
-        (
-            if hot { theme::HOVER } else { theme::SOFT },
-            if !enabled {
-                theme::FAINT
-            } else if hot {
-                theme::INK
-            } else {
-                theme::DIM
-            },
-        )
+        (theme::GHOST_LINE, theme::INK_2)
     };
-    d.slab(r, r.h * 0.5, fill, [0, 0, 0, 0], 0.0);
-    d.textw(label, r, 12.0, ink, false, false, 500);
-    d.center_last(r, 12.0, false);
+    d.slab(
+        r,
+        r.h * 0.5,
+        if hot { theme::HOVER } else { NONE },
+        line,
+        1.0,
+    );
+    d.text_c(label, r, PILL, ink);
 }
 
-/// x.ai stat pattern: mono value on top, quiet label beneath. No box.
+/// Stat: mono value over a tracked micro label. No box.
 fn stat(d: &mut DrawList, x: f32, y: f32, w: f32, value: &str, label: &str) {
-    d.textw(value, Rect::new(x, y, w, 20.0), 14.0, theme::INK, true, false, 500);
-    d.text(label, Rect::new(x, y + 22.0, w, 14.0), 10.5, theme::FAINT, false, false);
+    d.text(value, Rect::new(x, y, w, 20.0), STAT, theme::INK);
+    d.text(label, Rect::new(x, y + 23.0, w, 14.0), MICRO, theme::INK_3);
+}
+
+/// Section eyebrow: micro label, optional mono detail to its right.
+fn eyebrow(d: &mut DrawList, x: f32, y: f32, w: f32, label: &str, detail: Option<&str>) {
+    d.text(label, Rect::new(x, y, w, 14.0), MICRO, theme::INK_3);
+    if let Some(detail) = detail {
+        let lw = measure(&label.to_uppercase(), MICRO);
+        d.text(
+            detail,
+            Rect::new(x + lw + 14.0, y, (w - lw - 14.0).max(0.0), 14.0),
+            MICRO_NUM,
+            theme::INK_4,
+        );
+    }
 }
 
 // --- Frame -----------------------------------------------------------------
+
+const BAR_H: f32 = 48.0;
 
 pub fn build(
     state: &mut AppState,
@@ -463,11 +521,11 @@ pub fn build(
     let w = state.width.max(420.0);
     let h = state.height.max(320.0);
 
-    // One window, one jet-glass surface.
+    // One window, one sheet of black glass.
     let root = Rect::new(0.0, 0.0, w, h);
-    d.slab(root, 12.0, theme::WELL, theme::WELL_BORDER, 1.0);
+    d.slab(root, 10.0, theme::CANVAS, theme::CANVAS_LINE, 1.0);
 
-    let bar = Rect::new(0.0, 0.0, w, 54.0);
+    let bar = Rect::new(0.0, 0.0, w, BAR_H);
     let body = Rect::new(0.0, bar.bottom(), w, (h - bar.bottom()).max(80.0));
     let nav = Rect::new(0.0, body.y, state.nav_w, body.h);
     let main = Rect::new(nav.right(), body.y, (w - nav.right()).max(80.0), body.h);
@@ -494,7 +552,10 @@ pub fn build(
     title_bar(&mut d, state, snap, bar, mouse);
     nav_items(&mut d, state, nav, mouse, snap.sample_ms);
 
-    d.hit(Rect::new(nav.right() - 2.0, body.y, 5.0, body.h), HitKind::DragNav);
+    d.hit(
+        Rect::new(nav.right() - 2.0, body.y, 5.0, body.h),
+        HitKind::DragNav,
+    );
 
     match (state.page, perf) {
         (Page::Performance, Some((sub, detail))) => {
@@ -516,90 +577,90 @@ pub fn build(
 fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
     d.hit(bar, HitKind::DragWindow);
 
-    d.textw(
-        "zigx",
-        Rect::new(bar.x + 20.0, bar.y, 60.0, bar.h),
-        14.0,
-        theme::INK,
-        false,
-        false,
-        600,
-    );
-
-    // Live readout ahead of the window controls.
-    let stat_text = format!("cpu {} · mem {}", cpu_pct(snap.cpu_total), mem_short(snap));
-    let sw = text_width(&stat_text, 10.5, true);
     d.text(
-        &stat_text,
-        Rect::new(
-            bar.right() - 14.0 - 3.0 * 34.0 - 20.0 - sw,
-            bar.y,
-            sw + 4.0,
-            bar.h,
-        ),
-        10.5,
-        theme::MUTED,
-        true,
-        false,
+        "zigx",
+        Rect::new(bar.x + 20.0, bar.y, 80.0, bar.h),
+        WORDMARK,
+        theme::INK,
     );
 
+    // Window controls: bare glyphs, ghost disc only on hover.
     let specs = [
         (Icon::Pin, HitKind::ToggleTop),
         (Icon::Min, HitKind::Minimize),
         (Icon::Close, HitKind::Close),
     ];
     let cy = bar.y + bar.h * 0.5;
+    let mut left_edge = bar.right();
     for (i, (ic, kind)) in specs.iter().enumerate() {
         let r = Rect::new(
-            bar.right() - 14.0 - (3 - i) as f32 * 34.0,
+            bar.right() - 12.0 - (3 - i) as f32 * 32.0,
             cy - 14.0,
             28.0,
             28.0,
         );
+        left_edge = left_edge.min(r.x);
         let hot = r.contains(mouse[0], mouse[1]);
         let on = matches!(kind, HitKind::ToggleTop) && state.always_on_top;
         let is_close = matches!(kind, HitKind::Close);
         if on {
-            d.slab(r, 14.0, theme::SELECTED, [0, 0, 0, 0], 0.0);
+            d.fill(r, 14.0, theme::SELECTED);
         } else if hot {
-            d.slab(
-                r,
-                14.0,
-                if is_close {
-                    theme::DANGER_SOFT
-                } else {
-                    theme::HOVER
-                },
-                [0, 0, 0, 0],
-                0.0,
-            );
+            d.fill(r, 14.0, theme::HOVER);
         }
-        let color = if on {
+        let color = if hot && is_close {
+            theme::DANGER_INK
+        } else if on || hot {
             theme::INK
-        } else if hot {
-            if is_close {
-                theme::DANGER_INK
-            } else {
-                theme::INK
-            }
         } else {
-            theme::MUTED
+            theme::INK_3
         };
         icon(d, *ic, r.x + 7.0, r.y + 7.0, color);
         d.hit(r, *kind);
     }
+
+    // Live readout, instrument style, ahead of the controls.
+    let readout = format!("cpu {}   mem {}", cpu_pct(snap.cpu_total), mem_short(snap));
+    let rw = measure(&readout.to_uppercase(), MICRO_NUM);
+    d.text_r(
+        &readout,
+        Rect::new(left_edge - 24.0 - rw, bar.y, rw + 2.0, bar.h),
+        MICRO_NUM,
+        theme::INK_3,
+    );
+}
+
+fn side_item(
+    d: &mut DrawList,
+    r: Rect,
+    ic: Icon,
+    label: &str,
+    detail: Option<&str>,
+    on: bool,
+    mouse: [f32; 2],
+) {
+    let hot = r.contains(mouse[0], mouse[1]);
+    if on {
+        d.fill(r, 6.0, theme::GHOST);
+    } else if hot {
+        d.fill(r, 6.0, theme::HOVER);
+    }
+    let ink = if on || hot { theme::INK } else { theme::INK_2 };
+    let glyph = if on { theme::INK } else { theme::INK_3 };
+    icon(d, ic, r.x + 12.0, r.y + (r.h - 14.0) * 0.5, glyph);
+    d.text(label, Rect::new(r.x + 36.0, r.y, r.w * 0.55, r.h), NAV, ink);
+    if let Some(detail) = detail {
+        d.text_r(
+            detail,
+            Rect::new(r.x + r.w * 0.5, r.y, r.w * 0.5 - 12.0, r.h),
+            MICRO_NUM,
+            if on { theme::INK_2 } else { theme::INK_4 },
+        );
+    }
 }
 
 fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2], sample_ms: f32) {
-    d.textw(
-        "Monitor",
-        Rect::new(nav.x + 20.0, nav.y + 16.0, nav.w - 40.0, 16.0),
-        11.0,
-        theme::FAINT,
-        false,
-        false,
-        500,
-    );
+    eyebrow(d, nav.x + 20.0, nav.y + 18.0, nav.w - 40.0, "Monitor", None);
     let items = [
         (Icon::List, "Processes", Page::Processes),
         (Icon::Pulse, "Performance", Page::Performance),
@@ -607,41 +668,16 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2], sam
     ];
     let mut y = nav.y + 44.0;
     for (ic, label, page) in items {
-        let r = Rect::new(nav.x + 8.0, y, nav.w - 16.0, 36.0);
-        let on = state.page == page;
-        let hot = r.contains(mouse[0], mouse[1]);
-        if on {
-            d.slab(r, 9.0, theme::SELECTED, [0, 0, 0, 0], 0.0);
-        } else if hot {
-            d.slab(r, 9.0, theme::HOVER, [0, 0, 0, 0], 0.0);
-        }
-        let color = if on {
-            theme::INK
-        } else if hot {
-            theme::DIM
-        } else {
-            theme::MUTED
-        };
-        icon(d, ic, r.x + 12.0, r.y + 11.0, color);
-        d.textw(
-            label,
-            Rect::new(r.x + 38.0, r.y, r.w - 48.0, r.h),
-            13.0,
-            color,
-            false,
-            false,
-            if on { 500 } else { 400 },
-        );
+        let r = Rect::new(nav.x + 10.0, y, nav.w - 20.0, 34.0);
+        side_item(d, r, ic, label, None, state.page == page, mouse);
         d.hit(r, HitKind::Page(page));
-        y += 40.0;
+        y += 38.0;
     }
     d.text(
-        &format!("v0.2 · {sample_ms:.1} ms"),
-        Rect::new(nav.x + 20.0, nav.bottom() - 26.0, nav.w - 40.0, 14.0),
-        10.0,
-        theme::FAINT,
-        true,
-        false,
+        &format!("v{}  ·  {sample_ms:.1} ms", env!("CARGO_PKG_VERSION")),
+        Rect::new(nav.x + 20.0, nav.bottom() - 30.0, nav.w - 40.0, 14.0),
+        MICRO_NUM,
+        theme::INK_4,
     );
 }
 
@@ -651,29 +687,20 @@ fn toast(d: &mut DrawList, state: &AppState, main: Rect) {
         return;
     }
     let has_revert = undo.revert.is_some();
-    let label_w = text_width(&undo.label, 12.5, false);
-    let w = label_w + 32.0 + if has_revert { 88.0 } else { 0.0 };
-    let r = Rect::new(
-        main.x + (main.w - w) * 0.5,
-        main.bottom() - 56.0,
-        w.max(120.0),
-        40.0,
-    );
-    d.slab_ex(r, 20.0, theme::TOAST, theme::SOFT_BORDER, 1.0, 14.0, 0.45);
+    let label_w = measure(&undo.label, BODY);
+    let w = (label_w + 36.0 + if has_revert { 86.0 } else { 0.0 }).max(120.0);
+    let r = Rect::new(main.x + (main.w - w) * 0.5, main.bottom() - 60.0, w, 38.0);
+    d.slab(r, 19.0, theme::TOAST, theme::GHOST_LINE, 1.0);
     d.text(
         &undo.label,
-        Rect::new(r.x + 16.0, r.y, label_w + 4.0, r.h),
-        12.5,
+        Rect::new(r.x + 18.0, r.y, label_w + 4.0, r.h),
+        BODY,
         theme::INK,
-        false,
-        false,
     );
     if has_revert {
-        // Inverted primary: solid white pill, near-black text.
-        let u = Rect::new(r.right() - 72.0, r.y + 7.0, 60.0, 26.0);
-        d.slab(u, 13.0, theme::ACCENT, [0, 0, 0, 0], 0.0);
-        d.textw("Undo", u, 11.5, theme::ON_ACCENT, false, false, 600);
-        d.center_last(u, 11.5, false);
+        let u = Rect::new(r.right() - 74.0, r.y + 7.0, 62.0, 24.0);
+        d.fill(u, 12.0, theme::ACCENT);
+        d.text_c("Undo", u, PILL_ON, theme::ON_ACCENT);
         d.hit(u, HitKind::Undo);
     }
 }
@@ -681,86 +708,76 @@ fn toast(d: &mut DrawList, state: &AppState, main: Rect) {
 // --- Processes --------------------------------------------------------------
 
 fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mouse: [f32; 2]) {
-    let inner = main.inset(24.0);
-    let mut y = inner.y + 4.0;
+    let inner = Rect::new(main.x + 24.0, main.y + 20.0, main.w - 48.0, main.h - 44.0);
+    let y = inner.y;
+    let ctl_h = 30.0;
 
-    // Segmented control: charcoal pill, active segment inverted to solid white.
+    // Segmented control: one ghost outline, the active segment is the white pill.
     let views = [
         ("Grouped", ProcView::Grouped),
         ("Flat", ProcView::Flat),
         ("User", ProcView::User),
         ("System", ProcView::System),
     ];
-    let seg_h = 32.0;
-    let mut seg_w = 8.0;
-    for (label, _) in views {
-        seg_w += text_width(label, 12.0, false) + 24.0 + 2.0;
-    }
-    let seg = Rect::new(inner.x, y, seg_w, seg_h);
-    d.slab(seg, seg_h * 0.5, theme::CARD, [0, 0, 0, 0], 0.0);
-    let mut x = seg.x + 4.0;
+    let pad = 3.0;
+    let seg_w: f32 = views
+        .iter()
+        .map(|(l, _)| measure(l, PILL) + 26.0)
+        .sum::<f32>()
+        + pad * 2.0;
+    let seg = Rect::new(inner.x, y, seg_w, ctl_h);
+    d.outline(seg, ctl_h * 0.5, theme::GHOST_LINE);
+    let mut x = seg.x + pad;
     for (label, view) in views {
-        let w = text_width(label, 12.0, false) + 24.0;
-        let r = Rect::new(x, y + 4.0, w, seg_h - 8.0);
+        let w = measure(label, PILL) + 26.0;
+        let r = Rect::new(x, y + pad, w, ctl_h - pad * 2.0);
         let on = state.view == view;
         let hot = r.contains(mouse[0], mouse[1]);
         if on {
-            d.slab(r, r.h * 0.5, theme::ACCENT, [0, 0, 0, 0], 0.0);
+            d.fill(r, r.h * 0.5, theme::ACCENT);
+            d.text_c(label, r, PILL_ON, theme::ON_ACCENT);
+        } else {
+            d.text_c(label, r, PILL, if hot { theme::INK } else { theme::INK_2 });
         }
-        d.textw(
-            label,
-            r,
-            12.0,
-            if on {
-                theme::ON_ACCENT
-            } else if hot {
-                theme::INK
-            } else {
-                theme::MUTED
-            },
-            false,
-            false,
-            500,
-        );
-        d.center_last(r, 12.0, false);
         d.hit(r, HitKind::View(view));
-        x += w + 2.0;
+        x += w;
     }
 
-    // End task, soft pill on the right.
+    // Right cluster: End task, density, search.
     let end = selection_label(state);
-    let ew = text_width(&end, 12.0, false) + 30.0;
-    let er = Rect::new(inner.right() - ew, y, ew, 32.0);
+    let ew = measure(&end, PILL) + 32.0;
+    let er = Rect::new(inner.right() - ew, y, ew, ctl_h);
     let armed = state
         .armed
         .as_ref()
         .is_some_and(|a| a.until > Instant::now() && a.pids == state.selected);
-    pill_button(d, er, &end, mouse, !state.selected.is_empty(), armed);
+    ghost_pill(d, er, &end, mouse, !state.selected.is_empty(), armed);
     d.hit(er, HitKind::EndTask);
 
-    // Density toggle.
     let dense = if state.density == Density::Compact {
         "Compact"
     } else {
         "Comfortable"
     };
-    let dw = text_width(dense, 12.0, false) + 30.0;
-    let dr = Rect::new(er.x - 8.0 - dw, y, dw, 32.0);
-    pill_button(d, dr, dense, mouse, true, false);
+    let dw = measure(dense, PILL) + 32.0;
+    let dr = Rect::new(er.x - 8.0 - dw, y, dw, ctl_h);
+    ghost_pill(d, dr, dense, mouse, true, false);
     d.hit(dr, HitKind::Density);
 
-    // Search: charcoal pill, border brightens on focus.
     let search_w = 200.0_f32.min((dr.x - seg.right() - 16.0).max(90.0));
-    let sr = Rect::new(dr.x - 8.0 - search_w, y, search_w, 32.0);
+    let sr = Rect::new(dr.x - 8.0 - search_w, y, search_w, ctl_h);
     let focus = state.search_focused;
+    let hot = sr.contains(mouse[0], mouse[1]);
     d.slab(
         sr,
-        16.0,
-        theme::CARD,
+        ctl_h * 0.5,
+        if focus { theme::GHOST } else { NONE },
         if focus {
             theme::ACCENT_LINE
+        } else if hot {
+            theme::GHOST_LINE
         } else {
-            [0, 0, 0, 0]
+            theme::HAIRLINE
         },
         1.0,
     );
@@ -768,8 +785,8 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         d,
         Icon::Search,
         sr.x + 11.0,
-        sr.y + 9.0,
-        if focus { theme::INK } else { theme::FAINT },
+        sr.y + 8.0,
+        if focus { theme::INK } else { theme::INK_4 },
     );
     let q = if state.query.is_empty() && !focus {
         "Search".to_string()
@@ -778,29 +795,31 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     } else {
         state.query.clone()
     };
+    let typing = focus || !state.query.is_empty();
     d.text(
         &q,
-        Rect::new(sr.x + 33.0, sr.y, sr.w - 41.0, sr.h),
-        12.0,
-        if state.query.is_empty() && !focus {
-            theme::FAINT
-        } else {
-            theme::INK
-        },
-        state.search_focused || !state.query.is_empty(),
-        false,
+        Rect::new(sr.x + 32.0, sr.y, sr.w - 42.0, sr.h),
+        if typing { NUM } else { PILL },
+        if typing { theme::INK } else { theme::INK_4 },
     );
     d.hit(sr, HitKind::Search);
 
-    y += 46.0;
+    // Column header.
+    let y = y + ctl_h + 20.0;
     let cols = columns(state.density, inner.w);
-    let header = Rect::new(inner.x, y, inner.w, 18.0);
+    let header = Rect::new(inner.x, y, inner.w, 16.0);
     draw_header(d, &cols, header, state.sort);
     d.hairline(Rect::new(inner.x, y + 24.0, inner.w, 1.0));
-    y += 29.0;
+    let y = y + 25.0;
     let list = Rect::new(inner.x, y, inner.w, (inner.bottom() - y).max(20.0));
     d.list_rect = Some(list);
 
+    // Drop selections whose process has exited so End task cannot hit a recycled PID.
+    if !state.selected.is_empty() {
+        state
+            .selected
+            .retain(|pid| snap.procs.iter().any(|p| p.pid == *pid));
+    }
     let rows = visible_rows(state, snap);
     state.visible_pids = rows
         .iter()
@@ -810,9 +829,9 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         })
         .collect();
     let row_h = if state.density == Density::Compact {
-        28.0
+        26.0
     } else {
-        34.0
+        32.0
     };
     let content_h = rows.len() as f32 * row_h;
     let max_scroll = (content_h - list.h).max(0.0);
@@ -827,6 +846,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         if ry + row_h < list.y || ry > list.bottom() {
             continue;
         }
+        let rr = Rect::new(list.x, ry, list.w, row_h);
         match row {
             Row::Header {
                 title,
@@ -841,47 +861,30 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                     } else {
                         Icon::ChevronRight
                     },
-                    list.x + 4.0,
+                    list.x + 2.0,
                     ry + row_h * 0.5 - 7.0,
-                    theme::MUTED,
+                    theme::INK_4,
                 );
-                d.textw(
+                eyebrow(
+                    d,
+                    list.x + 24.0,
+                    ry + (row_h - 14.0) * 0.5,
+                    200.0,
                     title,
-                    Rect::new(list.x + 26.0, ry, 120.0, row_h),
-                    11.5,
-                    theme::DIM,
-                    false,
-                    false,
-                    600,
+                    Some(&count.to_string()),
                 );
-                let tw = text_width(title, 11.5, false);
-                d.text(
-                    &format!("{count}"),
-                    Rect::new(list.x + 32.0 + tw, ry, 60.0, row_h),
-                    10.0,
-                    theme::FAINT,
-                    true,
-                    false,
-                );
-                d.hit(Rect::new(list.x, ry, list.w, row_h), HitKind::Group(*user));
+                d.hit(rr, HitKind::Group(*user));
             }
             Row::Proc(p) => {
                 let on = state.selected.contains(&p.pid);
-                let hot = Rect::new(list.x, ry, list.w, row_h).contains(mouse[0], mouse[1]);
-                if on || hot {
-                    d.slab(
-                        Rect::new(list.x, ry, list.w, row_h),
-                        8.0,
-                        if on { theme::SELECTED } else { theme::HOVER },
-                        [0, 0, 0, 0],
-                        0.0,
-                    );
+                let hot = rr.contains(mouse[0], mouse[1]);
+                if on {
+                    d.fill(rr, 6.0, theme::SELECTED);
+                } else if hot {
+                    d.fill(rr, 6.0, theme::HOVER);
                 }
-                draw_proc(d, &cols, Rect::new(list.x, ry, list.w, row_h), p);
-                d.hit(
-                    Rect::new(list.x, ry, list.w, row_h),
-                    HitKind::Proc { pid: p.pid },
-                );
+                draw_proc(d, &cols, rr, p);
+                d.hit(rr, HitKind::Proc { pid: p.pid });
             }
         }
     }
@@ -891,10 +894,8 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         d.text(
             "No matching processes",
             Rect::new(list.x, list.y + 12.0, list.w, 24.0),
-            13.0,
-            theme::MUTED,
-            false,
-            false,
+            BODY,
+            theme::INK_3,
         );
     }
 }
@@ -1002,33 +1003,32 @@ struct ColSpec {
 fn columns(density: Density, width: f32) -> Vec<ColSpec> {
     let spec: &[(Col, f32, bool, bool)] = if density == Density::Compact {
         &[
-            (Col::Pid, 64.0, true, true),
-            (Col::Memory, 84.0, true, true),
-            (Col::Cpu, 64.0, true, true),
+            (Col::Pid, 68.0, true, true),
+            (Col::Memory, 88.0, true, true),
+            (Col::Cpu, 68.0, true, true),
         ]
     } else {
         &[
-            (Col::Threads, 72.0, true, true),
-            (Col::User, 88.0, false, false),
-            (Col::Pid, 64.0, true, true),
-            (Col::Disk, 88.0, true, true),
-            (Col::Memory, 84.0, true, true),
-            (Col::Cpu, 68.0, true, true),
+            (Col::Threads, 76.0, true, true),
+            (Col::User, 96.0, false, false),
+            (Col::Pid, 72.0, true, true),
+            (Col::Disk, 96.0, true, true),
+            (Col::Memory, 88.0, true, true),
+            (Col::Cpu, 72.0, true, true),
         ]
     };
     let fixed: f32 = spec.iter().map(|(_, w, _, _)| *w).sum();
     let x = width - fixed;
     let mut cols = vec![ColSpec {
         col: Col::Name,
-        x: 8.0,
-        w: (x - 12.0).max(40.0),
+        x: 10.0,
+        w: (x - 14.0).max(40.0),
         right: false,
         mono: false,
     }];
     let mut cursor = x;
-    let mut placed = Vec::new();
     for (col, w, right, mono) in spec.iter().rev() {
-        placed.push(ColSpec {
+        cols.push(ColSpec {
             col: *col,
             x: cursor,
             w: *w,
@@ -1037,8 +1037,6 @@ fn columns(density: Density, width: f32) -> Vec<ColSpec> {
         });
         cursor += *w;
     }
-    cols.extend(placed);
-    let _ = cursor;
     cols
 }
 
@@ -1056,26 +1054,39 @@ fn col_title(col: Col) -> &'static str {
 
 fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
     for c in cols {
-        let r = Rect::new(row.x + c.x, row.y, c.w - 8.0, row.h);
+        let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
         let active = c.col == sort.col;
-        let color = if active { theme::DIM } else { theme::FAINT };
-        d.textw(col_title(c.col), r, 11.0, color, false, c.right, 500);
+        let color = if active { theme::INK } else { theme::INK_3 };
+        let title = col_title(c.col);
+        if c.right {
+            d.text_r(title, r, MICRO, color);
+        } else {
+            d.text(title, r, MICRO, color);
+        }
         if active {
-            let tw = text_width(col_title(c.col), 11.0, false);
+            let tw = measure(&title.to_uppercase(), MICRO);
             let cx = if c.right {
-                r.right() - tw - 11.0
+                r.right() - tw - 12.0
             } else {
-                r.x + tw + 5.0
+                r.x + tw + 6.0
             };
             let cy = row.y + row.h * 0.5 - 2.0;
             if sort.desc {
-                d.line(&[[cx, cy], [cx + 3.5, cy + 4.0], [cx + 7.0, cy]], 1.2, theme::DIM);
+                d.line(
+                    &[[cx, cy], [cx + 3.0, cy + 3.5], [cx + 6.0, cy]],
+                    1.1,
+                    theme::INK_2,
+                );
             } else {
-                d.line(&[[cx, cy + 4.0], [cx + 3.5, cy], [cx + 7.0, cy + 4.0]], 1.2, theme::DIM);
+                d.line(
+                    &[[cx, cy + 3.5], [cx + 3.0, cy], [cx + 6.0, cy + 3.5]],
+                    1.1,
+                    theme::INK_2,
+                );
             }
         }
         d.hit(
-            Rect::new(row.x + c.x, row.y, c.w, row.h),
+            Rect::new(row.x + c.x, row.y - 4.0, c.w, row.h + 8.0),
             HitKind::Sort(c.col),
         );
     }
@@ -1083,7 +1094,7 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
 
 fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
     for c in cols {
-        let r = Rect::new(row.x + c.x, row.y, c.w - 8.0, row.h);
+        let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
         let text = match c.col {
             Col::Name => p.name.clone(),
             Col::Cpu => cpu_pct(p.cpu),
@@ -1093,19 +1104,25 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
             Col::User => p.user.clone(),
             Col::Threads => p.threads.to_string(),
         };
+        // Idle cells step back so the rows doing something read first.
+        let idle = match c.col {
+            Col::Cpu => p.cpu < 0.05,
+            Col::Disk => disk_sum(p) < 1.0,
+            _ => false,
+        };
         let color = match c.col {
             Col::Name => theme::INK,
+            Col::Cpu if idle => theme::INK_4,
             Col::Cpu => heat(p.cpu),
-            _ => theme::DIM,
+            _ if idle => theme::INK_4,
+            _ => theme::INK_2,
         };
-        d.text(
-            &text,
-            r,
-            12.5,
-            color,
-            c.mono || c.col != Col::Name && c.col != Col::User,
-            c.right,
-        );
+        let t = if c.mono { NUM } else { BODY };
+        if c.right {
+            d.text_r(&text, r, t, color);
+        } else {
+            d.text(&text, r, t, color);
+        }
     }
 }
 
@@ -1117,12 +1134,10 @@ fn scrollbar(d: &mut DrawList, viewport: Rect, content_h: f32, scroll: f32) {
     let max_scroll = content_h - viewport.h;
     let t = (scroll / max_scroll).clamp(0.0, 1.0);
     let y = viewport.y + (viewport.h - thumb_h) * t;
-    d.slab(
-        Rect::new(viewport.right() - 4.0, y, 2.0, thumb_h),
+    d.fill(
+        Rect::new(viewport.right() - 3.0, y, 2.0, thumb_h),
         1.0,
-        [238, 240, 246, 46],
-        [0, 0, 0, 0],
-        0.0,
+        theme::INK_4,
     );
 }
 
@@ -1136,17 +1151,21 @@ fn performance(
     detail: Rect,
     mouse: [f32; 2],
 ) {
-    d.textw(
+    eyebrow(
+        d,
+        sub.x + 20.0,
+        sub.y + 18.0,
+        sub.w - 40.0,
         "Resources",
-        Rect::new(sub.x + 20.0, sub.y + 16.0, sub.w - 40.0, 16.0),
-        11.0,
-        theme::FAINT,
-        false,
-        false,
-        500,
+        None,
     );
     let items = [
-        (Icon::Chip, "CPU", Section::Cpu, Some(percent(snap.cpu_total))),
+        (
+            Icon::Chip,
+            "CPU",
+            Section::Cpu,
+            Some(percent(snap.cpu_total)),
+        ),
         (Icon::Mem, "Memory", Section::Memory, Some(mem_short(snap))),
         (
             Icon::Gpu,
@@ -1159,46 +1178,26 @@ fn performance(
     ];
     let mut y = sub.y + 44.0;
     for (ic, label, section, extra) in items {
-        let r = Rect::new(sub.x + 8.0, y, sub.w - 16.0, 36.0);
-        let on = state.section == section;
-        let hot = r.contains(mouse[0], mouse[1]);
-        if on {
-            d.slab(r, 9.0, theme::SELECTED, [0, 0, 0, 0], 0.0);
-        } else if hot {
-            d.slab(r, 9.0, theme::HOVER, [0, 0, 0, 0], 0.0);
-        }
-        let color = if on {
-            theme::INK
-        } else if hot {
-            theme::DIM
-        } else {
-            theme::MUTED
-        };
-        icon(d, ic, r.x + 12.0, r.y + 11.0, color);
-        d.textw(
+        let r = Rect::new(sub.x + 10.0, y, sub.w - 20.0, 34.0);
+        side_item(
+            d,
+            r,
+            ic,
             label,
-            Rect::new(r.x + 37.0, r.y, r.w * 0.5, r.h),
-            13.0,
-            color,
-            false,
-            false,
-            if on { 500 } else { 400 },
+            extra.as_deref(),
+            state.section == section,
+            mouse,
         );
-        if let Some(extra) = extra {
-            d.text(
-                &extra,
-                Rect::new(r.x + r.w * 0.55, r.y, r.w * 0.45 - 12.0, r.h),
-                10.5,
-                if on { theme::DIM } else { theme::FAINT },
-                true,
-                true,
-            );
-        }
         d.hit(r, HitKind::Section(section));
-        y += 40.0;
+        y += 38.0;
     }
 
-    let view = detail.inset(28.0);
+    let view = Rect::new(
+        detail.x + 28.0,
+        detail.y + 22.0,
+        detail.w - 56.0,
+        detail.h - 46.0,
+    );
     d.detail_rect = Some(view);
     let y0 = view.y - state.perf_scroll;
     d.clip = Some(view);
@@ -1218,6 +1217,10 @@ fn performance(
     scrollbar(d, view, content_h, state.perf_scroll);
 }
 
+fn window_label() -> String {
+    format!("{} s window", crate::model::HIST_SECS)
+}
+
 fn mem_short(snap: &Snap) -> String {
     if snap.mem_total == 0 {
         "—".into()
@@ -1227,45 +1230,55 @@ fn mem_short(snap: &Snap) -> String {
 }
 
 fn page_title(d: &mut DrawList, title: &str, sub: &str, view: Rect, y: f32) -> f32 {
-    d.textw(
-        title,
-        Rect::new(view.x, y, view.w, 26.0),
-        20.0,
-        theme::INK,
-        false,
-        false,
-        500,
-    );
+    d.text(title, Rect::new(view.x, y, view.w, 28.0), TITLE, theme::INK);
     d.text(
         sub,
-        Rect::new(view.x, y + 27.0, view.w, 16.0),
-        12.0,
-        theme::MUTED,
-        false,
-        false,
+        Rect::new(view.x, y + 30.0, view.w, 16.0),
+        SUB,
+        theme::INK_3,
     );
-    y + 52.0
+    y + 62.0
+}
+
+/// Big mono readout with a micro caption. Returns the y after it.
+fn readout(d: &mut DrawList, view: Rect, y: f32, value: &str, caption: &str) -> f32 {
+    d.text(
+        value,
+        Rect::new(view.x, y, view.w, 52.0),
+        READOUT,
+        theme::INK,
+    );
+    d.text(
+        caption,
+        Rect::new(view.x, y + 56.0, view.w, 14.0),
+        MICRO,
+        theme::INK_3,
+    );
+    y + 88.0
+}
+
+/// Graph with a scale note in the top-right corner.
+fn scaled_graph(
+    d: &mut DrawList,
+    r: Rect,
+    series: &[(&[f32], theme::Rgba)],
+    max: f32,
+    max_label: &str,
+    dot: bool,
+) {
+    d.graph(r, series, max, dot);
+    d.text_r(
+        max_label,
+        Rect::new(r.x, r.y - 16.0, r.w, 14.0),
+        MICRO_NUM,
+        theme::INK_4,
+    );
 }
 
 fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32) -> f32 {
+    let top = y;
     y = page_title(d, "Processor", &snap.cpu_model, view, y);
-    d.text(
-        &percent(snap.cpu_total),
-        Rect::new(view.x, y, 260.0, 56.0),
-        48.0,
-        theme::INK,
-        true,
-        false,
-    );
-    d.text(
-        "total utilization",
-        Rect::new(view.x, y + 58.0, 200.0, 14.0),
-        10.5,
-        theme::FAINT,
-        false,
-        false,
-    );
-    y += 84.0;
+    y = readout(d, view, y, &percent(snap.cpu_total), "Total utilization");
 
     let freq: f32 = if snap.cpu_freq_mhz.is_empty() {
         0.0
@@ -1277,275 +1290,265 @@ fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32) -> f32 {
         (format!("{}", snap.proc_count), "Processes"),
         (format!("{}", snap.thread_count), "Threads"),
         (duration(snap.uptime_secs), "Uptime"),
-        (format!("{:.2}", snap.load[0]), "Load avg"),
+        (format!("{:.2}", snap.load[0]), "Load"),
     ];
     let slot = view.w / 5.0;
     for (i, (v, k)) in stats.iter().enumerate() {
         stat(d, view.x + i as f32 * slot, y, slot - 16.0, v, k);
     }
-    y += 56.0;
+    y += 64.0;
 
-    d.graph(
-        Rect::new(view.x, y, view.w, 140.0),
+    // Telemetry grows with the sheet: graph takes the larger share, cores the rest.
+    let n = snap.cpu_per.len();
+    let spare = spare_height(
+        view,
+        y - top,
+        24.0 + 28.0 + if n > 0 { 24.0 + 16.0 } else { 0.0 },
+    );
+    let graph_h = (spare * if n > 0 { 0.62 } else { 1.0 }).clamp(110.0, 320.0);
+    let cores_h = (spare * 0.38).clamp(60.0, 150.0);
+
+    eyebrow(d, view.x, y, view.w, "Utilization", Some(&window_label()));
+    y += 24.0;
+    scaled_graph(
+        d,
+        Rect::new(view.x, y, view.w, graph_h),
         &[(&snap.cpu_hist, theme::TRACE)],
         100.0,
+        "100%",
         true,
     );
-    y += 162.0;
+    y += graph_h + 28.0;
 
-    let n = snap.cpu_per.len();
     if n == 0 {
         return y;
     }
     let peak = snap.cpu_per.iter().copied().fold(0.0_f32, f32::max);
-    d.textw(
+    eyebrow(
+        d,
+        view.x,
+        y,
+        view.w,
         "Cores",
-        Rect::new(view.x, y, 100.0, 18.0),
-        13.0,
-        theme::DIM,
-        false,
-        false,
-        500,
+        Some(&format!("{n} logical   peak {}", cpu_pct(peak))),
     );
-    d.text(
-        &format!("{n} logical · peak {}", cpu_pct(peak)),
-        Rect::new(view.x + 100.0, y + 1.0, view.w - 100.0, 16.0),
-        10.5,
-        theme::FAINT,
-        true,
-        false,
-    );
-    y += 26.0;
-    equalizer(d, Rect::new(view.x, y, view.w, 92.0), &snap.cpu_per);
-    y + 108.0
+    y += 24.0;
+    equalizer(d, Rect::new(view.x, y, view.w, cores_h), &snap.cpu_per);
+    y + cores_h + 16.0
 }
 
-/// Per-core usage as an equalizer: slim round-topped bars on a baseline.
+/// Vertical room left in the viewport once `used` content height and
+/// `reserved` fixed chrome are laid out. Uses content height, not the
+/// scrolled y, so graph sizes stay stable while the user scrolls.
+fn spare_height(view: Rect, used: f32, reserved: f32) -> f32 {
+    (view.h - used - reserved).max(0.0)
+}
+
+/// Per-core usage as thin bars on a hairline.
 fn equalizer(d: &mut DrawList, r: Rect, values: &[f32]) {
     let n = values.len();
     if n == 0 {
         return;
     }
     let slot = r.w / n as f32;
-    let bw = (slot * 0.5).clamp(2.0, 12.0);
+    let bw = (slot * 0.42).clamp(2.0, 10.0);
     for (i, v) in values.iter().enumerate() {
-        let h = (v / 100.0).clamp(0.0, 1.0) * r.h;
-        let h = h.max(2.0);
+        let h = ((v / 100.0).clamp(0.0, 1.0) * r.h).max(2.0);
         let x = r.x + i as f32 * slot + (slot - bw) * 0.5;
         let color = if *v >= 90.0 {
             theme::HOT
         } else if *v >= 70.0 {
             theme::WARN
         } else {
-            [238, 240, 246, 170]
+            theme::INK_2
         };
-        d.slab(
-            Rect::new(x, r.bottom() - h, bw, h),
-            bw * 0.5,
-            color,
-            [0, 0, 0, 0],
-            0.0,
-        );
+        d.fill(Rect::new(x, r.bottom() - h, bw, h), 1.0, color);
     }
-    d.slab(
-        Rect::new(r.x, r.bottom(), r.w, 1.0),
-        0.0,
-        theme::DIVIDER,
-        [0, 0, 0, 0],
-        0.0,
-    );
+    d.hairline(Rect::new(r.x, r.bottom(), r.w, 1.0));
 }
 
 fn memory_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32) -> f32 {
+    let top = y;
     y = page_title(d, "Memory", "Physical RAM", view, y);
     let used = bytes(snap.mem_used);
     d.text(
         &used,
-        Rect::new(view.x, y, view.w, 56.0),
-        48.0,
+        Rect::new(view.x, y, view.w, 52.0),
+        READOUT,
         theme::INK,
-        true,
-        false,
     );
-    let uw = text_width(&used, 48.0, true);
+    let uw = measure(&used, READOUT);
     d.text(
         &format!("/ {}", bytes(snap.mem_total)),
-        Rect::new(view.x + uw + 10.0, y + 26.0, view.w - uw - 10.0, 26.0),
-        16.0,
-        theme::MUTED,
-        true,
-        false,
+        Rect::new(view.x + uw + 12.0, y + 24.0, view.w - uw - 12.0, 24.0),
+        READOUT_SUB,
+        theme::INK_3,
     );
-    y += 76.0;
-    d.graph(
-        Rect::new(view.x, y, view.w, 140.0),
-        &[(&snap.mem_hist, theme::TRACE)],
-        1.0,
-        true,
+    d.text(
+        "In use",
+        Rect::new(view.x, y + 56.0, view.w, 14.0),
+        MICRO,
+        theme::INK_3,
     );
-    y += 158.0;
+    y += 88.0;
 
     let stats = [
         (bytes(snap.mem_available), "Available"),
         (bytes(snap.mem_cached), "Cached"),
         (bytes(snap.mem_buffers), "Buffers"),
+        (mem_short(snap), "Used"),
     ];
-    let slot = view.w / 3.0;
+    let slot = view.w / 4.0;
     for (i, (v, k)) in stats.iter().enumerate() {
         stat(d, view.x + i as f32 * slot, y, slot - 16.0, v, k);
     }
-    y += 58.0;
+    y += 64.0;
 
-    if snap.swap_total > 0 {
-        d.textw(
+    let has_swap = snap.swap_total > 0;
+    let spare = spare_height(
+        view,
+        y - top,
+        24.0 + 28.0 + if has_swap { 24.0 + 20.0 } else { 0.0 },
+    );
+    let graph_h = (spare * if has_swap { 0.68 } else { 1.0 }).clamp(110.0, 320.0);
+    let swap_h = (spare * 0.32).clamp(56.0, 120.0);
+
+    eyebrow(d, view.x, y, view.w, "Usage", Some(&window_label()));
+    y += 24.0;
+    scaled_graph(
+        d,
+        Rect::new(view.x, y, view.w, graph_h),
+        &[(&snap.mem_hist, theme::TRACE)],
+        1.0,
+        &bytes(snap.mem_total),
+        true,
+    );
+    y += graph_h + 28.0;
+
+    if has_swap {
+        eyebrow(
+            d,
+            view.x,
+            y,
+            view.w,
             "Swap",
-            Rect::new(view.x, y, 100.0, 18.0),
-            13.0,
-            theme::DIM,
-            false,
-            false,
-            500,
-        );
-        d.text(
-            &format!("{} / {}", bytes(snap.swap_used), bytes(snap.swap_total)),
-            Rect::new(view.x + 100.0, y + 1.0, view.w - 100.0, 16.0),
-            10.5,
-            theme::FAINT,
-            true,
-            false,
+            Some(&format!(
+                "{} / {}",
+                bytes(snap.swap_used),
+                bytes(snap.swap_total)
+            )),
         );
         y += 24.0;
         d.graph(
-            Rect::new(view.x, y, view.w, 80.0),
-            &[(&snap.swap_hist, theme::TRACE_DIM)],
+            Rect::new(view.x, y, view.w, swap_h),
+            &[(&snap.swap_hist, theme::TRACE_2)],
             1.0,
             false,
         );
-        y += 92.0;
+        y += swap_h + 20.0;
     }
     y
 }
 
 fn gpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32) -> f32 {
+    let top = y;
     if snap.gpus.is_empty() {
-        d.text(
-            "No GPU reported",
-            Rect::new(view.x, y, view.w, 24.0),
-            14.0,
-            theme::MUTED,
-            false,
-            false,
-        );
-        return y + 30.0;
+        y = page_title(d, "Graphics", "No GPU reported", view, y);
+        return y;
     }
     for g in &snap.gpus {
         y = page_title(d, "Graphics", &g.name, view, y);
         let util = g.util.map(percent).unwrap_or_else(|| "—".into());
-        d.text(
-            &util,
-            Rect::new(view.x, y, 220.0, 56.0),
-            48.0,
-            theme::INK,
-            true,
-            false,
-        );
-        d.text(
-            "utilization",
-            Rect::new(view.x, y + 58.0, 200.0, 14.0),
-            10.5,
-            theme::FAINT,
-            false,
-            false,
-        );
-        y += 82.0;
-        let gh = 110.0;
-        let hist = g.util_hist.as_slice();
-        d.graph(
-            Rect::new(view.x, y, view.w, gh),
-            &[(hist, theme::TRACE)],
-            100.0,
-            true,
-        );
-        y += gh + 20.0;
-        if g.mem_total > 0 {
-            let frac = (g.mem_used as f32 / g.mem_total as f32).clamp(0.0, 1.0);
-            d.textw(
-                "VRAM",
-                Rect::new(view.x, y, 80.0, 16.0),
-                11.0,
-                theme::DIM,
-                false,
-                false,
-                500,
-            );
-            d.text(
-                &format!("{} / {}", bytes(g.mem_used), bytes(g.mem_total)),
-                Rect::new(view.x + 80.0, y, view.w - 80.0, 16.0),
-                11.0,
-                theme::MUTED,
-                true,
-                true,
-            );
-            y += 20.0;
-            d.slab(
-                Rect::new(view.x, y, view.w, 3.0),
-                1.5,
-                [238, 240, 246, 14],
-                [0, 0, 0, 0],
-                0.0,
-            );
-            d.slab(
-                Rect::new(view.x, y, (view.w * frac).max(3.0), 3.0),
-                1.5,
-                theme::ACCENT_DIM,
-                [0, 0, 0, 0],
-                0.0,
-            );
-            y += 22.0;
-        }
-        // Telemetry as one quiet readout line.
-        let mut bits = Vec::new();
+        y = readout(d, view, y, &util, "Utilization");
+
+        // Telemetry as a stat row.
+        let mut stats: Vec<(String, &str)> = Vec::new();
         if let Some(t) = g.temp_c {
-            bits.push(format!("{t} °C"));
+            stats.push((format!("{t} °C"), "Temp"));
         }
         if let Some(p) = g.power_w {
-            bits.push(format!("{p:.0} W"));
+            stats.push((format!("{p:.0} W"), "Power"));
         }
         if let Some(c) = g.clk_core {
-            bits.push(format!("{c} MHz"));
+            stats.push((format!("{c} MHz"), "Core"));
         }
         if let Some(c) = g.clk_mem {
-            bits.push(format!("mem {c} MHz"));
+            stats.push((format!("{c} MHz"), "Mem clock"));
         }
         if let Some(e) = g.enc {
-            bits.push(format!("enc {e}%"));
+            stats.push((format!("{e}%"), "Encode"));
         }
         if let Some(e) = g.dec {
-            bits.push(format!("dec {e}%"));
+            stats.push((format!("{e}%"), "Decode"));
         }
         if g.integrated {
-            bits.push("integrated".into());
+            stats.push(("Integrated".into(), "Type"));
         }
-        d.text(
-            &bits.join("   ·   "),
-            Rect::new(view.x, y, view.w, 16.0),
-            10.5,
-            theme::MUTED,
+        if !stats.is_empty() {
+            let cols = stats.len().min(5);
+            let slot = view.w / cols as f32;
+            for (i, (v, k)) in stats.iter().take(cols).enumerate() {
+                stat(d, view.x + i as f32 * slot, y, slot - 16.0, v, k);
+            }
+            y += 64.0;
+        }
+
+        // A single GPU gets the whole sheet; several share fixed panels.
+        let has_vram = g.mem_total > 0;
+        let graph_h = if snap.gpus.len() == 1 {
+            spare_height(
+                view,
+                y - top,
+                24.0 + 28.0 + if has_vram { 52.0 } else { 0.0 },
+            )
+            .clamp(100.0, 320.0)
+        } else {
+            120.0
+        };
+        eyebrow(d, view.x, y, view.w, "Utilization", Some(&window_label()));
+        y += 24.0;
+        scaled_graph(
+            d,
+            Rect::new(view.x, y, view.w, graph_h),
+            &[(g.util_hist.as_slice(), theme::TRACE)],
+            100.0,
+            "100%",
             true,
-            false,
         );
-        y += 40.0;
+        y += graph_h + 28.0;
+
+        if g.mem_total > 0 {
+            let frac = (g.mem_used as f32 / g.mem_total as f32).clamp(0.0, 1.0);
+            eyebrow(
+                d,
+                view.x,
+                y,
+                view.w,
+                "VRAM",
+                Some(&format!("{} / {}", bytes(g.mem_used), bytes(g.mem_total))),
+            );
+            y += 22.0;
+            d.fill(Rect::new(view.x, y, view.w, 2.0), 1.0, theme::GRID);
+            d.fill(
+                Rect::new(view.x, y, (view.w * frac).max(2.0), 2.0),
+                1.0,
+                theme::INK,
+            );
+            y += 30.0;
+        }
     }
     y
 }
 
 fn io_page(d: &mut DrawList, view: Rect, mut y: f32, disk: bool, snap: &Snap) -> f32 {
-    let (names_empty, a_legend, b_legend) = if disk {
-        ("No disks", "read", "write")
+    type Dev<'a> = (&'a str, f64, f64, &'a [f32], &'a [f32]);
+    let top = y;
+    let (title, sub, a_legend, b_legend, la, lb) = if disk {
+        ("Disk", "Block devices", "read", "write", "R", "W")
     } else {
-        ("No interfaces", "rx", "tx")
+        ("Network", "Interfaces", "receive", "transmit", "RX", "TX")
     };
-    let devs: Vec<(&str, f64, f64, &[f32], &[f32])> = if disk {
+    let devs: Vec<Dev> = if disk {
         snap.disks
             .iter()
             .map(|d| {
@@ -1573,68 +1576,81 @@ fn io_page(d: &mut DrawList, view: Rect, mut y: f32, disk: bool, snap: &Snap) ->
             .collect()
     };
     if devs.is_empty() {
-        d.text(
-            names_empty,
-            Rect::new(view.x, y, view.w, 24.0),
-            14.0,
-            theme::MUTED,
-            false,
-            false,
+        return page_title(
+            d,
+            title,
+            if disk { "No disks" } else { "No interfaces" },
+            view,
+            y,
         );
-        return y + 28.0;
     }
+
+    // Headline readout: totals across devices.
+    let (sum_a, sum_b) = devs
+        .iter()
+        .fold((0.0, 0.0), |acc, dv| (acc.0 + dv.1, acc.1 + dv.2));
+    y = page_title(d, title, sub, view, y);
+    let slot = view.w / 4.0;
+    stat(d, view.x, y, slot - 16.0, &rate(sum_a), a_legend);
+    stat(d, view.x + slot, y, slot - 16.0, &rate(sum_b), b_legend);
+    stat(
+        d,
+        view.x + slot * 2.0,
+        y,
+        slot - 16.0,
+        &devs.len().to_string(),
+        if disk { "Devices" } else { "Interfaces" },
+    );
+    y += 64.0;
+
+    // Split the remaining sheet evenly between devices.
+    let n = devs.len() as f32;
+    let per_dev = spare_height(view, y - top, 0.0) / n;
+    let graph_h = (per_dev - 26.0 - 24.0).clamp(80.0, 320.0);
+
     for (name, a_bps, b_bps, a_hist, b_hist) in devs {
-        d.textw(
-            name,
-            Rect::new(view.x, y, view.w * 0.4, 20.0),
-            13.0,
-            theme::INK,
-            true,
-            false,
-            500,
-        );
-        let (la, lb) = if disk { ("R", "W") } else { ("RX", "TX") };
         d.text(
-            &format!("{la} {}    {lb} {}", rate(a_bps), rate(b_bps)),
-            Rect::new(view.x + view.w * 0.35, y, view.w * 0.65, 20.0),
-            11.0,
-            theme::MUTED,
-            true,
-            true,
+            name,
+            Rect::new(view.x, y, view.w * 0.5, 18.0),
+            NUM,
+            theme::INK,
+        );
+        d.text_r(
+            &format!("{la} {}     {lb} {}", rate(a_bps), rate(b_bps)),
+            Rect::new(view.x + view.w * 0.4, y, view.w * 0.6, 18.0),
+            NUM_SMALL,
+            theme::INK_3,
         );
         y += 26.0;
         let max = nice_pair(a_hist, b_hist);
-        let gr = Rect::new(view.x, y, view.w, 100.0);
+        let gr = Rect::new(view.x, y, view.w, graph_h);
         d.graph(
             gr,
-            &[(a_hist, theme::TRACE), (b_hist, theme::TRACE_DIM)],
+            &[(a_hist, theme::TRACE), (b_hist, theme::TRACE_2)],
             max,
             false,
         );
-        // Legend: short line swatches, top right.
-        let lw = text_width(a_legend, 10.0, true) + text_width(b_legend, 10.0, true) + 52.0;
-        let lx = gr.right() - lw - 2.0;
-        let ly = gr.y + 4.0;
-        d.line(&[[lx, ly + 5.0], [lx + 12.0, ly + 5.0]], 1.5, theme::TRACE);
-        d.text(
-            a_legend,
-            Rect::new(lx + 17.0, ly, 34.0, 12.0),
-            10.0,
-            theme::MUTED,
-            true,
-            false,
+        // Legend, top left; scale, top right.
+        let ly = gr.y + 6.0;
+        let mut lx = gr.x;
+        d.line(&[[lx, ly + 6.0], [lx + 12.0, ly + 6.0]], 1.25, theme::TRACE);
+        lx += 17.0;
+        d.text(a_legend, Rect::new(lx, ly, 90.0, 12.0), MICRO, theme::INK_3);
+        lx += measure(&a_legend.to_uppercase(), MICRO) + 16.0;
+        d.line(
+            &[[lx, ly + 6.0], [lx + 12.0, ly + 6.0]],
+            1.25,
+            theme::TRACE_2,
         );
-        let lx2 = lx + 17.0 + text_width(a_legend, 10.0, true) + 14.0;
-        d.line(&[[lx2, ly + 5.0], [lx2 + 12.0, ly + 5.0]], 1.5, theme::TRACE_DIM);
-        d.text(
-            b_legend,
-            Rect::new(lx2 + 17.0, ly, 34.0, 12.0),
-            10.0,
-            theme::MUTED,
-            true,
-            false,
+        lx += 17.0;
+        d.text(b_legend, Rect::new(lx, ly, 90.0, 12.0), MICRO, theme::INK_3);
+        d.text_r(
+            &rate(max as f64),
+            Rect::new(gr.x, ly, gr.w, 12.0),
+            MICRO_NUM,
+            theme::INK_4,
         );
-        y += 118.0;
+        y += graph_h + 24.0;
     }
     y
 }
@@ -1653,43 +1669,42 @@ fn startup_page(
     main: Rect,
     mouse: [f32; 2],
 ) {
-    let inner = main.inset(28.0);
-    d.textw(
-        "Startup apps",
-        Rect::new(inner.x, inner.y + 4.0, inner.w, 28.0),
-        20.0,
-        theme::INK,
-        false,
-        false,
-        500,
+    let inner = Rect::new(main.x + 28.0, main.y + 22.0, main.w - 56.0, main.h - 46.0);
+    let enabled = startup.iter().filter(|e| e.enabled).count();
+    let y = page_title(
+        d,
+        "Startup",
+        "Session autostart. Off writes Hidden=true to ~/.config/autostart and keeps a .bak.",
+        inner,
+        inner.y,
     );
-    d.text(
-        "User autostart entries. Turning one off writes Hidden=true and keeps a .bak.",
-        Rect::new(inner.x, inner.y + 34.0, inner.w, 16.0),
-        12.0,
-        theme::MUTED,
-        false,
-        false,
+    eyebrow(
+        d,
+        inner.x,
+        y,
+        inner.w,
+        "Entries",
+        Some(&format!("{enabled} of {} on", startup.len())),
     );
+    let y = y + 22.0;
+    d.hairline(Rect::new(inner.x, y, inner.w, 1.0));
     let list = Rect::new(
         inner.x,
-        inner.y + 66.0,
+        y + 1.0,
         inner.w,
-        (inner.h - 66.0).max(20.0),
+        (inner.bottom() - y - 1.0).max(20.0),
     );
     d.startup_rect = Some(list);
     if startup.is_empty() {
         d.text(
-            "Nothing in ~/.config/autostart",
-            Rect::new(list.x, list.y, list.w, 24.0),
-            13.0,
-            theme::MUTED,
-            false,
-            false,
+            "No autostart entries found",
+            Rect::new(list.x, list.y + 12.0, list.w, 24.0),
+            BODY,
+            theme::INK_3,
         );
         return;
     }
-    let row_h = 54.0;
+    let row_h = 52.0;
     let content_h = startup.len() as f32 * row_h;
     let max_scroll = (content_h - list.h).max(0.0);
     if state.startup_scroll > max_scroll {
@@ -1697,71 +1712,80 @@ fn startup_page(
     }
     let first = (state.startup_scroll / row_h).floor() as usize;
     let nvis = ((list.h / row_h).ceil() as usize) + 2;
+    d.clip = Some(list);
     for (i, entry) in startup.iter().enumerate().skip(first).take(nvis) {
         let ry = list.y + i as f32 * row_h - state.startup_scroll;
         if ry + row_h < list.y || ry > list.bottom() {
             continue;
         }
-        let hot = Rect::new(list.x, ry, list.w, row_h).contains(mouse[0], mouse[1]);
-        if hot {
-            d.slab(
-                Rect::new(list.x - 8.0, ry, list.w + 16.0, row_h),
-                8.0,
+        let rr = Rect::new(list.x, ry, list.w, row_h);
+        if rr.contains(mouse[0], mouse[1]) {
+            d.fill(
+                Rect::new(list.x - 10.0, ry, list.w + 20.0, row_h),
+                6.0,
                 theme::HOVER,
-                [0, 0, 0, 0],
-                0.0,
             );
         }
-        d.textw(
-            &entry.name,
-            Rect::new(list.x, ry + 8.0, list.w - 110.0, 20.0),
-            13.5,
-            theme::INK,
-            false,
-            false,
-            500,
-        );
+        let name_ink = if entry.enabled {
+            theme::INK
+        } else {
+            theme::INK_2
+        };
+        let name_w = measure(&entry.name, BODY).min(list.w - 120.0);
         d.text(
-            &entry.exec,
-            Rect::new(list.x, ry + 29.0, list.w - 110.0, 16.0),
-            10.5,
-            theme::MUTED,
-            true,
-            false,
+            &entry.name,
+            Rect::new(list.x, ry + 9.0, list.w - 120.0, 18.0),
+            BODY,
+            name_ink,
+        );
+        if entry.system_path.is_some() {
+            d.text(
+                "system",
+                Rect::new(list.x + name_w + 10.0, ry + 10.0, 60.0, 16.0),
+                MICRO,
+                theme::INK_4,
+            );
+        }
+        d.text(
+            if entry.exec.is_empty() {
+                "no Exec line"
+            } else {
+                &entry.exec
+            },
+            Rect::new(list.x, ry + 28.0, list.w - 120.0, 16.0),
+            NUM_SMALL,
+            if entry.enabled {
+                theme::INK_3
+            } else {
+                theme::INK_4
+            },
         );
         d.hairline(Rect::new(list.x, ry + row_h - 1.0, list.w, 1.0));
         switch(
             d,
-            Rect::new(list.right() - 40.0, ry + 17.0, 34.0, 20.0),
+            Rect::new(list.right() - 36.0, ry + 17.0, 32.0, 18.0),
             entry.enabled,
         );
-        d.hit(Rect::new(list.x, ry, list.w, row_h), HitKind::Startup(i));
+        d.hit(rr, HitKind::Startup(i));
     }
+    d.clip = None;
     scrollbar(d, list, content_h, state.startup_scroll);
 }
 
 fn switch(d: &mut DrawList, r: Rect, on: bool) {
-    d.slab(
-        r,
-        r.h * 0.5,
-        if on {
-            theme::ACCENT
-        } else {
-            [238, 240, 246, 14]
-        },
-        [0, 0, 0, 0],
-        0.0,
-    );
-    let kx = if on { r.right() - 16.5 } else { r.x + 2.5 };
-    d.slab(
-        Rect::new(kx, r.y + 2.5, 15.0, 15.0),
-        7.5,
-        if on {
-            theme::ON_ACCENT
-        } else {
-            [140, 142, 150, 255]
-        },
-        [0, 0, 0, 0],
-        0.0,
-    );
+    if on {
+        d.fill(r, r.h * 0.5, theme::ACCENT);
+        d.fill(
+            Rect::new(r.right() - 15.0, r.y + 3.0, 12.0, 12.0),
+            6.0,
+            theme::ON_ACCENT,
+        );
+    } else {
+        d.outline(r, r.h * 0.5, theme::GHOST_LINE);
+        d.fill(
+            Rect::new(r.x + 3.0, r.y + 3.0, 12.0, 12.0),
+            6.0,
+            theme::INK_3,
+        );
+    }
 }

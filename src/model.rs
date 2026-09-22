@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 pub const HIST_CAP: usize = 120;
+/// Sampler period. History covers `HIST_CAP * SAMPLE_PERIOD_MS` milliseconds.
+pub const SAMPLE_PERIOD_MS: u64 = 250;
+pub const HIST_SECS: u64 = HIST_CAP as u64 * SAMPLE_PERIOD_MS / 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -164,14 +167,19 @@ impl Snap {
 pub struct StartupEntry {
     pub name: String,
     pub exec: String,
+    /// User-level file in `~/.config/autostart`. May not exist yet when the
+    /// entry comes from a system directory; toggling creates it.
     pub path: PathBuf,
+    /// System-level definition in `/etc/xdg/autostart` (or `$XDG_CONFIG_DIRS`).
+    pub system_path: Option<PathBuf>,
     pub enabled: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Revert {
     pub path: PathBuf,
-    pub previous: String,
+    /// `None` means the file did not exist before; undo removes it.
+    pub previous: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -255,42 +263,46 @@ impl AppState {
 pub mod theme {
     pub type Rgba = [u8; 4];
 
-    // x.ai dark tokens: jet canvas, charcoal cards, nimbus ink.
-    // Hierarchy is alpha-stepped, exactly like text-primary/60 and /30.
-    pub const INK: Rgba = [238, 240, 246, 255];
-    pub const DIM: Rgba = [238, 240, 246, 160];
-    pub const MUTED: Rgba = [238, 240, 246, 108];
-    pub const FAINT: Rgba = [238, 240, 246, 70];
+    // Mission-control monochrome. One ink, spectral white, stepped by alpha
+    // (100 / 62 / 38 / 22). Surfaces are hairlines and ghost fills on black
+    // glass; nothing is lifted, shaded, or tinted.
+    const SPECTRAL: [u8; 3] = [240, 240, 250];
+    const fn ink(a: u8) -> Rgba {
+        [SPECTRAL[0], SPECTRAL[1], SPECTRAL[2], a]
+    }
 
-    // Surfaces. Jet glass root; charcoal for lifted cards and pills.
-    pub const WELL: Rgba = [10, 10, 10, 205];
-    pub const CARD: Rgba = [26, 26, 26, 225];
-    pub const WELL_BORDER: Rgba = [238, 240, 246, 18];
-    pub const DIVIDER: Rgba = [238, 240, 246, 12];
-    pub const HOVER: Rgba = [238, 240, 246, 9];
-    pub const SELECTED: Rgba = [238, 240, 246, 15];
-    pub const SOFT: Rgba = [238, 240, 246, 8];
-    pub const SOFT_BORDER: Rgba = [238, 240, 246, 16];
+    pub const INK: Rgba = ink(255);
+    pub const INK_2: Rgba = ink(170);
+    pub const INK_3: Rgba = ink(118);
+    pub const INK_4: Rgba = ink(80);
 
-    // White is the accent; solid white pill + near-black text is the
-    // primary-action signature.
-    pub const ACCENT: Rgba = [245, 246, 250, 255];
-    pub const ACCENT_DIM: Rgba = [238, 240, 246, 180];
-    pub const ACCENT_SOFT: Rgba = [238, 240, 246, 15];
-    pub const ACCENT_LINE: Rgba = [238, 240, 246, 44];
-    pub const ON_ACCENT: Rgba = [12, 12, 14, 255];
+    // Glass root and its edge.
+    pub const CANVAS: Rgba = [0, 0, 0, 200];
+    pub const CANVAS_LINE: Rgba = ink(36);
 
-    // Heat: the only chroma, and only when something runs hot.
-    pub const WARN: Rgba = [240, 183, 104, 255];
-    pub const HOT: Rgba = [255, 112, 112, 255];
-    pub const DANGER_SOFT: Rgba = [255, 100, 100, 24];
-    pub const DANGER_INK: Rgba = [255, 168, 168, 255];
+    // Structure.
+    pub const HAIRLINE: Rgba = ink(30);
+    pub const GRID: Rgba = ink(14);
+    pub const GHOST: Rgba = ink(22);
+    pub const GHOST_LINE: Rgba = ink(66);
+    pub const HOVER: Rgba = ink(16);
+    pub const SELECTED: Rgba = ink(30);
+
+    // The one filled element: white pill, black label.
+    pub const ACCENT: Rgba = [255, 255, 255, 255];
+    pub const ACCENT_LINE: Rgba = ink(140);
+    pub const ON_ACCENT: Rgba = [0, 0, 0, 255];
+
+    // Status chroma, and only status.
+    pub const WARN: Rgba = [245, 166, 35, 255];
+    pub const HOT: Rgba = [255, 92, 92, 255];
+    pub const DANGER_LINE: Rgba = [255, 92, 92, 150];
+    pub const DANGER_INK: Rgba = [255, 138, 138, 255];
 
     // Traces.
-    pub const TRACE: Rgba = [238, 240, 246, 220];
-    pub const TRACE_SOFT: Rgba = [238, 240, 246, 115];
-    pub const TRACE_DIM: Rgba = [140, 142, 150, 165];
+    pub const TRACE: Rgba = ink(235);
+    pub const TRACE_2: Rgba = ink(110);
 
-    // Floating toast.
-    pub const TOAST: Rgba = [22, 22, 24, 245];
+    // Floating notice: solid black glass, ghost edge.
+    pub const TOAST: Rgba = [0, 0, 0, 230];
 }

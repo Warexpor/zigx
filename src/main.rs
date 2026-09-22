@@ -36,7 +36,7 @@ struct App {
 
 impl App {
     fn new(hub: Hub) -> Self {
-        let mut state = AppState::new(1180.0, 740.0);
+        let mut state = AppState::new(1240.0, 780.0);
         load_ui(&mut state);
         Self {
             hub,
@@ -187,7 +187,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let mut attrs = WindowAttributes::default()
             .with_title("ZIGX")
-            .with_inner_size(LogicalSize::new(1180.0, 740.0))
+            .with_inner_size(LogicalSize::new(1240.0, 780.0))
             .with_min_inner_size(LogicalSize::new(420.0, 320.0))
             .with_transparent(true)
             .with_decorations(false);

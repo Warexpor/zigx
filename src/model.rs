@@ -237,8 +237,8 @@ impl AppState {
             scroll: 0.0,
             perf_scroll: 0.0,
             startup_scroll: 0.0,
-            nav_w: 188.0,
-            sub_w: 176.0,
+            nav_w: 200.0,
+            sub_w: 196.0,
             drag: None,
             armed: None,
             undo: None,
@@ -254,17 +254,43 @@ impl AppState {
 
 pub mod theme {
     pub type Rgba = [u8; 4];
-    pub const INK: Rgba = [220, 220, 220, 255];
-    pub const DIM: Rgba = [186, 186, 186, 255];
-    pub const MUTED: Rgba = [138, 138, 138, 255];
-    pub const FAINT: Rgba = [108, 108, 108, 230];
-    pub const WELL: Rgba = [6, 6, 6, 122];
-    pub const WELL_BORDER: Rgba = [255, 255, 255, 72];
-    pub const HOVER: Rgba = [255, 255, 255, 24];
-    pub const SELECTED: Rgba = [255, 255, 255, 40];
-    pub const PILL: Rgba = [255, 255, 255, 30];
-    pub const TRACE: Rgba = [214, 214, 214, 235];
-    pub const TRACE_DIM: Rgba = [132, 132, 132, 210];
-    pub const GRID: Rgba = [255, 255, 255, 32];
-    pub const CELL: Rgba = [255, 255, 255, 14];
+
+    // x.ai dark tokens: jet canvas, charcoal cards, nimbus ink.
+    // Hierarchy is alpha-stepped, exactly like text-primary/60 and /30.
+    pub const INK: Rgba = [238, 240, 246, 255];
+    pub const DIM: Rgba = [238, 240, 246, 160];
+    pub const MUTED: Rgba = [238, 240, 246, 108];
+    pub const FAINT: Rgba = [238, 240, 246, 70];
+
+    // Surfaces. Jet glass root; charcoal for lifted cards and pills.
+    pub const WELL: Rgba = [10, 10, 10, 205];
+    pub const CARD: Rgba = [26, 26, 26, 225];
+    pub const WELL_BORDER: Rgba = [238, 240, 246, 18];
+    pub const DIVIDER: Rgba = [238, 240, 246, 12];
+    pub const HOVER: Rgba = [238, 240, 246, 9];
+    pub const SELECTED: Rgba = [238, 240, 246, 15];
+    pub const SOFT: Rgba = [238, 240, 246, 8];
+    pub const SOFT_BORDER: Rgba = [238, 240, 246, 16];
+
+    // White is the accent; solid white pill + near-black text is the
+    // primary-action signature.
+    pub const ACCENT: Rgba = [245, 246, 250, 255];
+    pub const ACCENT_DIM: Rgba = [238, 240, 246, 180];
+    pub const ACCENT_SOFT: Rgba = [238, 240, 246, 15];
+    pub const ACCENT_LINE: Rgba = [238, 240, 246, 44];
+    pub const ON_ACCENT: Rgba = [12, 12, 14, 255];
+
+    // Heat: the only chroma, and only when something runs hot.
+    pub const WARN: Rgba = [240, 183, 104, 255];
+    pub const HOT: Rgba = [255, 112, 112, 255];
+    pub const DANGER_SOFT: Rgba = [255, 100, 100, 24];
+    pub const DANGER_INK: Rgba = [255, 168, 168, 255];
+
+    // Traces.
+    pub const TRACE: Rgba = [238, 240, 246, 220];
+    pub const TRACE_SOFT: Rgba = [238, 240, 246, 115];
+    pub const TRACE_DIM: Rgba = [140, 142, 150, 165];
+
+    // Floating toast.
+    pub const TOAST: Rgba = [22, 22, 24, 245];
 }

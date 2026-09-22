@@ -112,35 +112,6 @@ pub fn nice_ceil(v: f32) -> f32 {
     nice * base
 }
 
-/// Column count and square cell size for `n` cores across `width`.
-pub fn square_grid(n: usize, width: f32) -> (usize, usize, f32) {
-    if n == 0 || width <= 1.0 {
-        return (1, 1, width.max(1.0));
-    }
-    let mut best_cols = 1;
-    let mut best_err = f32::MAX;
-    for cols in 1..=n {
-        let cw = width / cols as f32;
-        let size_pen = if cw < 108.0 {
-            (108.0 - cw) / 80.0
-        } else if cw > 230.0 {
-            (cw - 230.0) / 120.0
-        } else {
-            0.0
-        };
-        // Prefer a grid that isn't a single long row when there are many cores.
-        let rows = (n + cols - 1) / cols;
-        let err = size_pen + (cw - 150.0).abs() / 400.0 + rows as f32 * 0.002;
-        if err < best_err {
-            best_err = err;
-            best_cols = cols;
-        }
-    }
-    let rows = (n + best_cols - 1) / best_cols;
-    let cell = width / best_cols as f32;
-    (best_cols, rows, cell)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,14 +128,6 @@ mod tests {
         assert_eq!(nice_ceil(0.0), 1.0);
         assert_eq!(nice_ceil(120.0), 200.0);
         assert_eq!(nice_ceil(900.0), 1000.0);
-    }
-
-    #[test]
-    fn grid_is_square_cells() {
-        let (cols, rows, cell) = square_grid(12, 900.0);
-        assert_eq!(cols * rows >= 12, true);
-        assert!((cell - 900.0 / cols as f32).abs() < 0.1);
-        assert!((2..=6).contains(&cols));
     }
 
     #[test]

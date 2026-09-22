@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use glyphon::{
     Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport, Wrap,
+    TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
 use wgpu::util::DeviceExt;
 use wgpu::*;
@@ -30,7 +30,7 @@ struct VertexOut {
     @location(1) size: vec2<f32>,
     @location(2) fill: vec4<f32>,
     @location(3) border: vec4<f32>,
-    @location(4) params: vec2<f32>,
+    @location(4) params: vec4<f32>,
 };
 
 fn ndc(p: vec2<f32>) -> vec4<f32> {
@@ -47,14 +47,16 @@ fn vs_main(@builtin(vertex_index) vi: u32, ins: Instance) -> VertexOut {
     );
     let uv = corners[vi];
     let size = ins.rect.zw;
-    let pos = ins.rect.xy + uv * size;
+    // Grow the quad so the fragment shader can paint a soft shadow outside.
+    let pad = select(0.0, ins.params.z + 4.0, ins.params.z > 0.5);
+    let pos = ins.rect.xy - pad + uv * (size + 2.0 * pad);
     var out: VertexOut;
     out.clip = ndc(pos);
-    out.local = uv * size;
+    out.local = uv * (size + 2.0 * pad) - pad;
     out.size = size;
     out.fill = ins.fill;
     out.border = ins.border;
-    out.params = ins.params.xy;
+    out.params = ins.params;
     return out;
 }
 
@@ -70,17 +72,37 @@ fn fs_main(v: VertexOut) -> @location(0) vec4<f32> {
     let bw = max(v.params.y, 0.0);
     let p = v.local - size * 0.5;
     let dist = sd_round_box(p, size * 0.5, radius);
-    let cover = 1.0 - smoothstep(-0.8, 0.6, dist);
-    let band = 1.0 - smoothstep(bw, bw + 1.2, abs(dist));
-    let top = 1.0 - smoothstep(0.0, size.y * 0.72, v.local.y);
+    let cover = 1.0 - smoothstep(-0.75, 0.75, dist);
+
+    // Vertical light: gentle lift toward the top plus a soft sheen band.
+    let top = 1.0 - smoothstep(0.0, size.y * 0.85, v.local.y);
+    let fill_rgb = v.fill.rgb + vec3<f32>(top * 0.028 + top * top * 0.026);
     let fill_a = v.fill.a * cover;
-    let border_a = v.border.a * band * (0.4 + 0.6 * top);
-    let fill_rgb = v.fill.rgb + vec3<f32>(top * 0.04);
-    let border_rgb = mix(v.border.rgb * 0.45, min(v.border.rgb + vec3<f32>(0.25), vec3<f32>(1.0)), top);
-    var premul = vec4<f32>(fill_rgb * fill_a, fill_a);
-    let brim = vec4<f32>(border_rgb * border_a, border_a);
-    premul = brim + premul * (1.0 - brim.a);
-    return premul;
+
+    // Hairline border, brighter toward the top edge.
+    let band = 1.0 - smoothstep(max(bw - 0.5, 0.0), bw + 0.9, abs(dist));
+    let border_a = v.border.a * band * (0.55 + 0.45 * top);
+    let border_rgb = mix(v.border.rgb * 0.6, min(v.border.rgb + vec3<f32>(0.22), vec3<f32>(1.0)), top);
+
+    // Compose fill, then a thin inner highlight just inside the top edge,
+    // then the border. Everything premultiplied.
+    var col_a = fill_a;
+    var col_rgb = fill_rgb * fill_a;
+    let inl = (1.0 - smoothstep(0.5, 1.8, abs(dist + bw + 1.1))) * top * step(0.004, v.fill.a);
+    let inl_a = inl * 0.13 * cover;
+    col_rgb = vec3<f32>(1.0) * inl_a + col_rgb * (1.0 - inl_a);
+    col_a = inl_a + col_a * (1.0 - inl_a);
+    col_rgb = border_rgb * border_a + col_rgb * (1.0 - border_a);
+    col_a = border_a + col_a * (1.0 - border_a);
+
+    // Soft drop shadow, only outside the box, shifted slightly downward.
+    var shadow_a = 0.0;
+    if v.params.z > 0.5 {
+        let sd = sd_round_box(p - vec2<f32>(0.0, v.params.z * 0.25), size * 0.5, radius);
+        shadow_a = v.params.w * (1.0 - smoothstep(0.0, v.params.z, sd)) * (1.0 - cover);
+    }
+    let a = col_a + shadow_a * (1.0 - col_a);
+    return vec4<f32>(col_rgb, a);
 }
 "#;
 
@@ -169,7 +191,7 @@ pub struct Gfx {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     buffers: Vec<Buffer>,
-    buffer_keys: Vec<(String, u32, bool)>,
+    buffer_keys: Vec<(String, u32, bool, u16)>,
     prepared: Vec<Prepared>,
     logged_text_error: bool,
 }
@@ -432,7 +454,12 @@ impl Gfx {
                 rect: [s.x * scale, s.y * scale, s.w * scale, s.h * scale],
                 fill: straight(s.fill),
                 border: straight(s.border),
-                params: [s.radius * scale, s.border_w * scale, 0.0, 0.0],
+                params: [
+                    s.radius * scale,
+                    s.border_w * scale,
+                    s.shadow * scale,
+                    s.shadow_a,
+                ],
             });
         }
         self.ensure_instances(self.instance_cpu.len());
@@ -455,9 +482,18 @@ impl Gfx {
                 .collect();
             let color = premul(stroke.color);
             if let Some(base) = stroke.baseline {
-                let mut fill = stroke.color;
-                fill[3] = 36;
-                fill_under(&pts, base * scale, premul(fill), &mut self.vertex_cpu);
+                // Gradient wash under the line: tinted at the trace, gone at the baseline.
+                let mut top = stroke.color;
+                top[3] = ((stroke.color[3] as f32 * 0.26).min(64.0)) as u8;
+                let mut bottom = top;
+                bottom[3] = 0;
+                fill_under(
+                    &pts,
+                    base * scale,
+                    premul(top),
+                    premul(bottom),
+                    &mut self.vertex_cpu,
+                );
             }
             stroke_line(
                 &pts,
@@ -505,7 +541,7 @@ impl Gfx {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
             buf.set_wrap(Wrap::None);
             self.buffers.push(buf);
-            self.buffer_keys.push((String::new(), 0, false));
+            self.buffer_keys.push((String::new(), 0, false, 400));
         }
         self.buffers.truncate(n);
         self.buffer_keys.truncate(n);
@@ -516,13 +552,15 @@ impl Gfx {
             let size_key = (size_px * 10.0).round() as u32;
             let changed = self.buffer_keys[i].0 != label.text
                 || self.buffer_keys[i].1 != size_key
-                || self.buffer_keys[i].2 != label.mono;
+                || self.buffer_keys[i].2 != label.mono
+                || self.buffer_keys[i].3 != label.weight;
             if changed {
                 let attrs = if label.mono {
                     Attrs::new().family(Family::Monospace)
                 } else {
                     Attrs::new().family(Family::SansSerif)
-                };
+                }
+                .weight(Weight(label.weight));
                 let buf = &mut self.buffers[i];
                 buf.set_metrics(Metrics::new(size_px, (label.h * scale).max(size_px)));
                 buf.set_size(
@@ -530,7 +568,7 @@ impl Gfx {
                     Some((label.h * scale).max(1.0)),
                 );
                 buf.set_text(&label.text, &attrs, Shaping::Advanced, None);
-                self.buffer_keys[i] = (label.text.clone(), size_key, label.mono);
+                self.buffer_keys[i] = (label.text.clone(), size_key, label.mono, label.weight);
                 dirty[i] = true;
             }
             let x = (label.x * scale).round();
@@ -693,12 +731,29 @@ fn premul(c: [u8; 4]) -> [f32; 4] {
     ]
 }
 
-fn fill_under(pts: &[[f32; 2]], baseline: f32, color: [f32; 4], out: &mut Vec<Vert>) {
+fn fill_under(
+    pts: &[[f32; 2]],
+    baseline: f32,
+    top: [f32; 4],
+    bottom: [f32; 4],
+    out: &mut Vec<Vert>,
+) {
     for w in pts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        tri(out, [a[0], a[1]], [b[0], b[1]], [a[0], baseline], color);
-        tri(out, [b[0], b[1]], [b[0], baseline], [a[0], baseline], color);
+        vert(out, a, top);
+        vert(out, b, top);
+        vert(out, [a[0], baseline], bottom);
+        vert(out, b, top);
+        vert(out, [b[0], baseline], bottom);
+        vert(out, [a[0], baseline], bottom);
     }
+}
+
+fn vert(out: &mut Vec<Vert>, p: [f32; 2], color: [f32; 4]) {
+    out.push(Vert {
+        pos: [p[0], p[1], 0.0, 1.0],
+        color,
+    });
 }
 
 fn stroke_line(pts: &[[f32; 2]], width: f32, color: [f32; 4], out: &mut Vec<Vert>) {

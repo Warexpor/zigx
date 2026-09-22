@@ -17,3 +17,7 @@ The Wayland app id is `zigx`. If the desktop blur does not pick the window up:
 ```
 windowrule = blur on, match:class zigx
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

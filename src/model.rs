@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Sampler period. Every metric in the app updates once per tick.
-pub const SAMPLE_PERIOD_MS: u64 = 1000;
-/// Samples spanned by a graph, right edge to left edge.
-pub const HIST_WINDOW: usize = 30;
+use crate::settings::Settings;
+
+/// Longest graph window in samples: 2 min of history at 0.5 s updates. The
+/// window actually drawn comes from [`Settings::window`].
+pub const MAX_WINDOW: usize = 240;
 /// Ring capacity: the window plus the playback delay and interpolation taps.
-pub const HIST_CAP: usize = HIST_WINDOW + 6;
-pub const HIST_SECS: u64 = HIST_WINDOW as u64 * SAMPLE_PERIOD_MS / 1000;
+pub const HIST_CAP: usize = MAX_WINDOW + 6;
 /// Graphs play back this many samples behind the newest one. A curve segment
 /// depends on the sample after its end, so the right edge must stay two
 /// samples back for every drawn segment to be final: nothing already on screen
@@ -20,6 +20,7 @@ pub enum Page {
     Processes,
     Performance,
     Startup,
+    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -198,6 +199,7 @@ pub enum ScrollBar {
     Processes,
     Performance,
     Startup,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -285,6 +287,12 @@ pub struct AppState {
     pub scroll: f32,
     pub perf_scroll: f32,
     pub startup_scroll: f32,
+    pub settings_scroll: f32,
+    pub settings: Settings,
+    /// Sampling is halted. Session only: ZIGX always launches live.
+    pub paused: bool,
+    /// Reset on the Settings page was clicked once and waits for a second click.
+    pub reset_armed: Option<Instant>,
     pub nav_w: f32,
     pub sub_w: f32,
     pub drag: Option<Drag>,
@@ -316,6 +324,9 @@ pub struct PerfSmooth {
     /// Playback position in sample sequence units; the right edge of every graph.
     pos: f64,
     seq: u64,
+    /// Reduced motion: the right edge moves in whole samples.
+    stepped: bool,
+    window: usize,
     /// VRAM fill fraction per GPU.
     pub vram: Vec<f32>,
     /// Graph scale per I/O device, keyed `disk:<name>` / `net:<name>`.
@@ -337,6 +348,8 @@ impl Default for PerfSmooth {
             at: Instant::now(),
             pos: 0.0,
             seq: 0,
+            stepped: false,
+            window: 30,
             vram: Vec::new(),
             io_max: BTreeMap::new(),
         }
@@ -352,27 +365,36 @@ const SCALE_GROW: f32 = 0.35;
 const SCALE_SHRINK: f32 = 0.9;
 
 impl PerfSmooth {
-    pub fn tick(&mut self, snap: &Snap) {
+    pub fn tick(&mut self, snap: &Snap, settings: &Settings, paused: bool) {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.at).as_secs_f32();
         self.at = now;
-        let period = SAMPLE_PERIOD_MS as f64 / 1000.0;
-        let lag = snap.hist_at.elapsed().as_secs_f64() / period;
+        let period = settings.speed.ms() as f64 / 1000.0;
+        let reduced = settings.reduced();
+        self.stepped = reduced;
+        self.window = settings.window();
+        // Capped so a resume after a pause glides back instead of jumping ahead.
+        let lag = (snap.hist_at.elapsed().as_secs_f64() / period).min(1.5);
         let target = snap.hist_seq as f64 - GRAPH_DELAY + lag;
 
         // Advance at exactly one sample per period, then bleed off drift and
-        // jitter slowly so the scroll speed never visibly changes.
+        // jitter slowly so the scroll speed never visibly changes. Paused
+        // holds the playhead where it is.
         let fresh = !self.primed || (target - self.pos).abs() > 2.0;
         if fresh {
             self.pos = target;
-        } else {
+        } else if !paused {
             self.pos += dt as f64 / period;
             self.pos += (target - self.pos) * rate(dt, CLOCK_TAU) as f64;
         }
         self.pos = self.pos.min(snap.hist_seq as f64);
         self.seq = snap.hist_seq;
 
-        let bar = if fresh { 1.0 } else { rate(dt, BAR_TAU) };
+        let bar = if fresh || reduced {
+            1.0
+        } else {
+            rate(dt, BAR_TAU)
+        };
         let vram: Vec<f32> = snap
             .gpus
             .iter()
@@ -398,12 +420,12 @@ impl PerfSmooth {
                     .map(|n| (format!("net:{}", n.name), &n.rx_hist, &n.tx_hist)),
             );
         for (key, a, b) in devs {
-            let goal = io_scale(a, b, head).ln();
+            let goal = io_scale(a, b, head, self.window).ln();
             let m = self.io_max.entry(key.clone()).or_insert(Damp {
                 value: goal,
                 vel: 0.0,
             });
-            if fresh {
+            if fresh || reduced {
                 *m = Damp {
                     value: goal,
                     vel: 0.0,
@@ -424,7 +446,17 @@ impl PerfSmooth {
 
     /// Right edge of the graphs, in samples relative to the newest one (<= 0).
     pub fn head(&self) -> f32 {
-        (self.pos - self.seq as f64) as f32
+        let pos = if self.stepped {
+            self.pos.floor()
+        } else {
+            self.pos
+        };
+        (pos - self.seq as f64) as f32
+    }
+
+    /// Samples spanned by a graph, right edge to left edge.
+    pub fn window(&self) -> usize {
+        self.window
     }
 
     pub fn io_max(&self, key: &str) -> Option<f32> {
@@ -435,16 +467,16 @@ impl PerfSmooth {
 /// Target scale for a pair of rate histories: the nice ceiling of what the
 /// graph shows at `head`, plus the samples the curve is heading into, so the
 /// scale grows before a burst is drawn and relaxes once it scrolls out.
-pub fn io_scale(a: &[f32], b: &[f32], head: f32) -> f32 {
-    crate::format::nice_ceil(window_peak(a, head).max(window_peak(b, head)))
+pub fn io_scale(a: &[f32], b: &[f32], head: f32, window: usize) -> f32 {
+    crate::format::nice_ceil(window_peak(a, head, window).max(window_peak(b, head, window)))
 }
 
-fn window_peak(h: &[f32], head: f32) -> f32 {
+fn window_peak(h: &[f32], head: f32, window: usize) -> f32 {
     if h.is_empty() {
         return 0.0;
     }
     let right = (h.len() - 1) as f32 + head;
-    let lo = ((right - HIST_WINDOW as f32).floor() - 1.0).max(0.0) as usize;
+    let lo = ((right - window as f32).floor() - 1.0).max(0.0) as usize;
     let hi = ((right.floor() + 2.0).max(0.0) as usize).min(h.len() - 1);
     if lo > hi {
         return 0.0;
@@ -503,6 +535,10 @@ impl AppState {
             scroll: 0.0,
             perf_scroll: 0.0,
             startup_scroll: 0.0,
+            settings_scroll: 0.0,
+            settings: Settings::default(),
+            paused: false,
+            reset_armed: None,
             nav_w: 200.0,
             sub_w: 196.0,
             drag: None,

@@ -3,8 +3,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::{AppState, Col, Density, Page, ProcView, Section, Sort};
+use crate::settings::OpenOn;
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
             return PathBuf::from(xdg).join("zigx");
@@ -14,7 +15,25 @@ fn config_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("zigx")
 }
 
+/// Load settings, then the remembered layout, then apply "Open on".
 pub fn load_ui(state: &mut AppState) {
+    state.settings = crate::settings::load_settings();
+    load_layout(state);
+    state.page = match state.settings.open_on {
+        OpenOn::Last => state.page,
+        OpenOn::Processes => Page::Processes,
+        OpenOn::Performance => Page::Performance,
+        OpenOn::Startup => Page::Startup,
+    };
+}
+
+/// Persist both files. Settings failures are the ones worth reporting.
+pub fn save_ui(state: &AppState) -> io::Result<()> {
+    save_layout(state)?;
+    crate::settings::save_settings(&state.settings)
+}
+
+fn load_layout(state: &mut AppState) {
     let path = config_dir().join("ui.txt");
     let Ok(text) = fs::read_to_string(path) else {
         return;
@@ -38,6 +57,7 @@ pub fn load_ui(state: &mut AppState) {
                 state.page = match v {
                     "performance" => Page::Performance,
                     "startup" => Page::Startup,
+                    "settings" => Page::Settings,
                     _ => Page::Processes,
                 };
             }
@@ -83,7 +103,7 @@ pub fn load_ui(state: &mut AppState) {
     }
 }
 
-pub fn save_ui(state: &AppState) -> io::Result<()> {
+fn save_layout(state: &AppState) -> io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
     let path = dir.join("ui.txt");
@@ -125,6 +145,7 @@ fn page_name(p: Page) -> &'static str {
         Page::Processes => "processes",
         Page::Performance => "performance",
         Page::Startup => "startup",
+        Page::Settings => "settings",
     }
 }
 

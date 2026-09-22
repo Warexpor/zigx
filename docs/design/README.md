@@ -9,7 +9,7 @@ these documents the contract for changing it.
 | --- | --- |
 | [Foundations](foundations.md) | Color, type, shape, iconography |
 | [Layout](layout.md) | Window shell, pages, measurements, scaling |
-| [Components](components.md) | Pills, segmented control, search, rows, switches, toast, context menu |
+| [Components](components.md) | Pills, segmented control, chips, stepper, search, rows, switches, setting rows, toast, context menu |
 | [Motion and graphics](motion.md) | Data cadence, graph playback, curves, easing, rendering |
 
 ## Principles
@@ -47,6 +47,13 @@ information.
 | Graph playback clock and easing | `PerfSmooth` in `src/model.rs` |
 | Sampling cadence | `spawn` and `Engine::tick` in `src/sample.rs` |
 | Input, drags, zoom | `src/interact.rs`, `src/main.rs` |
+| User preferences and `settings.txt` | `src/settings.rs` |
+| Remembered layout state and `ui.txt` | `src/persist.rs` |
+
+**Settings change looks, never truth.** A preference may hide, recolor,
+rescale, slow down or pause what is shown, but never alters a measured value.
+Every new setting belongs in `Settings`, gets a row on the Settings page, and
+round-trips through `settings.txt` with a test.
 
 ## Changing the design
 

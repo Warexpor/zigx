@@ -1,20 +1,31 @@
 # Motion and graphics
 
-The rule: **text changes once per second, graphics move continuously, and
-nothing shows a value that was not measured.**
+The rule: **text changes once per sample, graphics move continuously, and
+nothing shows a value that was not measured.** The default sample period is
+one second; the rest of this page says "second" for it.
 
 ## Data cadence
 
 The sampler (`spawn` in `src/sample.rs`) runs on its own thread with a fixed
 deadline clock.
 
-| Constant | Value | Meaning |
+| Constant or setting | Value | Meaning |
 | --- | --- | --- |
-| `SAMPLE_PERIOD_MS` | 1000 | One sample per second for every metric in the app |
+| Update speed | 0.5, 1 or 2 s | Sample period for every metric in the app |
 | `PRIME_MS` | 250 | Gap between the priming read and the first real sample |
-| `HIST_WINDOW` | 30 | Samples across a graph, so a 30 s window |
-| `HIST_CAP` | 36 | Ring size: the window plus playback delay and curve taps |
+| History | 30 s, 1 min, 2 min | Time across a graph; the window in samples is history / period |
+| `MAX_WINDOW` | 240 | Longest window: 2 min at 0.5 s |
+| `HIST_CAP` | 246 | Ring size: the longest window plus playback delay and curve taps |
 | `GRAPH_DELAY` | 2.15 | How many samples behind the newest the graphs play back |
+
+- The period lives in an atomic on the `Hub`. The sampler re-reads it at least
+  every 50 ms while it waits, so a new speed or a pause applies at once instead
+  of after the old period.
+- **Pause** sets the period to 0: no reads, no new snapshot, and the graph
+  playhead holds still. Resuming re-primes the engine, so no rate is averaged
+  across the gap and the first sample after it is an honest one-period read.
+- Changing speed keeps the samples already in the ring; they are spaced as
+  they were taken.
 
 - Deadlines advance by exactly one period, so ticks do not drift by the cost
   of each sample. After a stall or suspend the clock re-anchors instead of
@@ -54,9 +65,12 @@ samples, for two reasons:
    minus the delay, plus time since that sample) with a 0.6 s time constant. Sampler jitter
    and drift are absorbed without a visible change in speed.
 3. It is clamped so it never passes the newest sample. If the sampler is late
-   by more than the 0.15 margin, the graph holds rather than invents data.
+   by more than the 0.15 margin, the graph holds rather than invents data. The
+   time-since-sample term is capped at 1.5 samples, so resuming from a pause
+   glides back into place rather than jumping.
 4. If it is more than two samples off, for example after the page was hidden,
    it snaps.
+5. While paused it does not advance at all.
 
 `head()` exposes the right edge relative to the newest sample (always <= 0).
 Graphs and per-core bars both read from it, so they move on one clock.
@@ -80,6 +94,20 @@ samples:
 
 Unit tests guard these properties: `curve_stays_inside_its_samples`, and
 `drawn_segments_ignore_samples_that_have_not_played` for the playback delay.
+
+The Curves setting can switch to **Linear**: straight segments through every
+sample (`sample_linear`). Peaks read at their exact height and corners are
+visible. The per-core bars follow the same choice.
+
+## Reduced motion
+
+The Motion setting's Reduced mode keeps every value honest and removes the
+movement between them:
+
+- The graph right edge moves in whole samples (`head()` floors the playhead),
+  so traces step once per sample instead of scrolling.
+- The VRAM meter and I/O graph scales jump to their target.
+- The context menu appears in place with no fade or slide.
 
 ### Rigid polylines
 
@@ -130,7 +158,9 @@ sample.
 - **Strokes** (`stroke_line` in `src/gfx.rs`) are one mitered ribbon per
   polyline, so semi-transparent ink never doubles up at joins. Joins sharper
   than about 88 degrees fall back to a bevel so spikes do not throw long miters.
-  Coverage is a signed distance with a 1.1 px soft fringe.
+  Coverage is a signed distance with a 1.1 px soft fringe. A polyline whose
+  last point equals its first is closed: the seam is mitered like any other
+  join and gets no caps (the cog glyph relies on this).
 - **Wash** (`fill_under`) is a fill from the trace down to the baseline. Each
   vertex carries the trace height at its column and the baseline, which are
   linear across each slice. The fragment shader computes the fade per pixel

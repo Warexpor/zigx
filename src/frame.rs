@@ -6,8 +6,9 @@ use crate::format::{
 use crate::interact::selection_label;
 use crate::model::{
     io_scale, theme, AppState, Col, Density, MenuAction, Page, Proc, ProcView, Section, Snap, Sort,
-    StartupEntry, HIST_WINDOW,
+    StartupEntry,
 };
+use crate::settings::{Choice, Curve, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rect {
@@ -106,6 +107,11 @@ pub enum HitKind {
     MenuItem(crate::model::MenuAction),
     /// Menu body outside any item: swallows the click.
     MenuPanel,
+    /// Settings control: a segment index, or 0 / 1 for a switch.
+    Setting(Opt, u8),
+    /// Interface scale stepper, -1 or +1.
+    Zoom(i8),
+    ResetSettings,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,25 +188,29 @@ pub struct DrawList {
     pub list_rect: Option<Rect>,
     pub detail_rect: Option<Rect>,
     pub startup_rect: Option<Rect>,
+    pub settings_rect: Option<Rect>,
     clip: Option<Rect>,
     layer: usize,
     /// Alpha multiplier for everything drawn, used to fade overlays in.
     fade: f32,
+    prefs: Settings,
 }
 
 const NONE: theme::Rgba = [0, 0, 0, 0];
 
 impl DrawList {
-    fn new() -> Self {
+    fn new(prefs: Settings) -> Self {
         Self {
             layers: [Layer::default(), Layer::default()],
             hits: Vec::new(),
             list_rect: None,
             detail_rect: None,
             startup_rect: None,
+            settings_rect: None,
             clip: None,
             layer: BASE,
             fade: 1.0,
+            prefs,
         }
     }
 
@@ -358,29 +368,30 @@ impl DrawList {
 
     /// Telemetry graph: faint quarter grid, hairline baseline, thin traces.
     ///
-    /// X spans a fixed `HIST_WINDOW` of samples so the scale does not stretch
-    /// as the ring fills. `head` places the right edge relative to the newest
-    /// sample (<= 0) and moves continuously, so the trace scrolls at a constant
-    /// speed and new data is drawn in rather than popped in. Curves are
-    /// uniform cubic B-splines: C2-smooth, and never outside the samples
-    /// around them.
+    /// X spans a fixed window of samples (from the settings) so the scale does
+    /// not stretch as the ring fills. `head` places the right edge relative to
+    /// the newest sample (<= 0) and moves continuously, so the trace scrolls at
+    /// a constant speed and new data is drawn in rather than popped in. Smooth
+    /// curves are uniform cubic B-splines: C2-smooth, and never outside the
+    /// samples around them.
     fn graph(&mut self, r: Rect, series: &[(&[f32], theme::Rgba)], max: f32, head: f32) {
         if r.w < 4.0 || r.h < 4.0 || !self.visible(r) {
             return;
         }
         let max = max.max(0.001);
         let head = head.min(0.0);
+        let curve = self.prefs.curve;
         // Stroke width + miter + AA fringe need room above a 100% sample.
         let top_pad = 6.0;
         let usable = (r.h - top_pad).max(1.0);
-        if r.h >= 80.0 {
+        if r.h >= 80.0 && self.prefs.grid {
             for k in 1..4 {
                 let gy = r.y + r.h * (k as f32) / 4.0;
                 self.fill(Rect::new(r.x, gy, r.w, 1.0), 0.0, theme::GRID);
             }
         }
         self.hairline(Rect::new(r.x, r.bottom(), r.w, 1.0));
-        let span = HIST_WINDOW as f32;
+        let span = self.prefs.window() as f32;
         let slot_w = r.w / span;
         // Vertices sit at fixed fractions of each sample slot, so the polyline
         // is rigid in data space and only translates as it scrolls. Resampling
@@ -402,7 +413,7 @@ impl DrawList {
             let vals: Vec<(f32, f32)> = (lo..=hi)
                 .map(|j| {
                     let idx = j as f32 / sub as f32;
-                    (x_of(idx), sample_hist(values, idx))
+                    (x_of(idx), curve_at(values, idx, curve))
                 })
                 .collect();
             // Never clip a trace flat against the top while an eased scale
@@ -421,11 +432,31 @@ impl DrawList {
                 pts,
                 width: 1.25,
                 color: *color,
-                baseline: Some(r.bottom()),
+                baseline: self.prefs.fill.then_some(r.bottom()),
                 round: false,
             });
         }
     }
+}
+
+fn curve_at(values: &[f32], idx: f32, curve: Curve) -> f32 {
+    match curve {
+        Curve::Smooth => sample_hist(values, idx),
+        Curve::Linear => sample_linear(values, idx),
+    }
+}
+
+/// Straight segments through the samples: exact peaks, visible corners.
+fn sample_linear(values: &[f32], idx: f32) -> f32 {
+    let n = values.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let idx = idx.clamp(0.0, (n - 1) as f32);
+    let i = (idx.floor() as usize).min(n.saturating_sub(2));
+    let t = idx - i as f32;
+    let b = values[(i + 1).min(n - 1)];
+    values[i] + (b - values[i]) * t
 }
 
 /// Uniform cubic B-spline sample. C2-smooth, so climbs bend over a whole
@@ -539,6 +570,8 @@ enum Icon {
     List,
     Pulse,
     Power,
+    /// Settings: a six-tooth cog with a hub.
+    Cog,
     Chip,
     Mem,
     Gpu,
@@ -657,6 +690,32 @@ fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
             d.line(&arc, GLYPH_W, c);
             bar(d, cx, y + 0.6, cx, y + 6.4, GLYPH_W, c);
         }
+        // Cog: six teeth as one closed outline, so no ink stacks at the
+        // joins, around a hub dot.
+        Icon::Cog => {
+            let (cx, cy) = (x + 7.0, y + 7.0);
+            // Radius follows a softened square wave, so teeth have flat tops
+            // and rounded shoulders instead of corners.
+            let (teeth, r_mid, amp, soft) = (6.0_f32, 5.0_f32, 0.85_f32, 2.2_f32);
+            let n = 144;
+            let mut pts: Vec<[f32; 2]> = (0..n)
+                .map(|i| {
+                    let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                    let wave = (soft * (teeth * a).cos()).tanh() / soft.tanh();
+                    let r = r_mid + amp * wave;
+                    [cx + r * a.cos(), cy + r * a.sin()]
+                })
+                .collect();
+            pts.push(pts[0]);
+            d.line(&pts, w, c);
+            let hub: Vec<[f32; 2]> = (0..=40)
+                .map(|i| {
+                    let a = i as f32 / 40.0 * std::f32::consts::TAU;
+                    [cx + 1.9 * a.cos(), cy + 1.9 * a.sin()]
+                })
+                .collect();
+            d.line(&hub, w, c);
+        }
         // Resources. Five silhouettes that cannot be confused for each other:
         // a square with pins, a bar with legs, a card with a fan, a platter,
         // and a pair of arrows. Bodies at glyph weight, pins at hairline,
@@ -730,13 +789,16 @@ fn icon(d: &mut DrawList, kind: Icon, x: f32, y: f32, c: theme::Rgba) {
     }
 }
 
-fn heat(v: f32) -> theme::Rgba {
-    if v >= 90.0 {
+/// Status chroma for a usage value; `base` when it is not hot or status color is off.
+fn heat(d: &DrawList, v: f32, base: theme::Rgba) -> theme::Rgba {
+    if !d.prefs.heat {
+        base
+    } else if v >= 90.0 {
         theme::HOT
     } else if v >= 70.0 {
         theme::WARN
     } else {
-        theme::INK
+        base
     }
 }
 
@@ -800,6 +862,49 @@ fn ghost_pill(
     }
 }
 
+// Inset from the outer ring; equal side padding inside each cell so every
+// label, short "Flat" or long "Grouped", sits on the same rhythm.
+const SEG_INSET: f32 = 3.0;
+const SEG_PAD_X: f32 = 16.0;
+
+fn segmented_w(items: &[(&str, bool, HitKind)]) -> f32 {
+    items
+        .iter()
+        .map(|(l, ..)| measure(l, PILL) + SEG_PAD_X * 2.0)
+        .sum::<f32>()
+        + SEG_INSET * 2.0
+}
+
+/// Segmented control: one ghost outline, the active segment is the white pill.
+fn segmented(
+    d: &mut DrawList,
+    x: f32,
+    y: f32,
+    items: &[(&str, bool, HitKind)],
+    mouse: [f32; 2],
+) -> Rect {
+    let seg = Rect::new(x, y, segmented_w(items), PILL_H);
+    d.outline(seg, PILL_H * 0.5, theme::GHOST_LINE);
+    let mut x = seg.x + SEG_INSET;
+    for (label, on, kind) in items {
+        let w = measure(label, PILL) + SEG_PAD_X * 2.0;
+        let r = Rect::new(x, y + SEG_INSET, w, PILL_H - SEG_INSET * 2.0);
+        let hot = r.contains(mouse[0], mouse[1]);
+        if *on {
+            d.fill(r, r.h * 0.5, theme::ACCENT);
+            d.text_c(label, r, PILL_ON, theme::ON_ACCENT);
+        } else {
+            if hot {
+                d.fill(r, r.h * 0.5, theme::HOVER);
+            }
+            d.text_c(label, r, PILL, if hot { theme::INK } else { theme::INK_2 });
+        }
+        d.hit(r, *kind);
+        x += w;
+    }
+    seg
+}
+
 /// Stat: mono value over a tracked micro label. No box.
 fn stat(d: &mut DrawList, x: f32, y: f32, w: f32, value: &str, label: &str) {
     d.text(value, Rect::new(x, y, w, 20.0), STAT, theme::INK);
@@ -830,7 +935,8 @@ pub fn build(
     startup: &[StartupEntry],
     mouse: [f32; 2],
 ) -> DrawList {
-    let mut d = DrawList::new();
+    let mut d = DrawList::new(state.settings);
+    crate::format::set_decimal(state.settings.units == Units::Decimal);
     // An open menu is modal: nothing beneath it hovers.
     let pointer = mouse;
     let mouse = if state.menu.is_some() {
@@ -840,14 +946,19 @@ pub fn build(
     };
     state.scroll_bar = None;
     if state.page == Page::Performance {
-        state.perf_smooth.tick(snap);
+        state.perf_smooth.tick(snap, &state.settings, state.paused);
+    }
+    if state.reset_armed.is_some_and(|t| t <= Instant::now()) {
+        state.reset_armed = None;
     }
     let w = state.width.max(420.0);
     let h = state.height.max(320.0);
 
     // One window, one sheet of black glass.
     let root = Rect::new(0.0, 0.0, w, h);
-    d.slab(root, 10.0, theme::CANVAS, theme::CANVAS_LINE, 1.0);
+    let mut canvas = theme::CANVAS;
+    canvas[3] = state.settings.glass.alpha();
+    d.slab(root, 10.0, canvas, theme::CANVAS_LINE, 1.0);
 
     let bar = Rect::new(0.0, 0.0, w, BAR_H);
     let body = Rect::new(0.0, bar.bottom(), w, (h - bar.bottom()).max(80.0));
@@ -873,7 +984,7 @@ pub fn build(
         d.hairline(Rect::new(sub.right(), body.y, 1.0, body.h));
     }
 
-    title_bar(&mut d, snap, bar, mouse);
+    title_bar(&mut d, state, snap, bar, mouse);
     nav_items(&mut d, state, nav, mouse);
 
     d.hit(
@@ -891,6 +1002,7 @@ pub fn build(
         }
         (Page::Startup, _) => startup_page(&mut d, state, startup, main, mouse),
         (Page::Processes, _) => processes(&mut d, state, snap, main, mouse),
+        (Page::Settings, _) => settings_page(&mut d, state, main, mouse),
         _ => {}
     }
 
@@ -913,10 +1025,11 @@ const MENU_SEP_H: f32 = 11.0;
 
 /// True while something on screen is mid-animation and needs frames.
 pub fn animating(state: &AppState) -> bool {
-    state
-        .menu
-        .as_ref()
-        .is_some_and(|m| m.opened.elapsed().as_secs_f32() * 1000.0 < MENU_FADE_MS + 20.0)
+    !state.settings.reduced()
+        && state
+            .menu
+            .as_ref()
+            .is_some_and(|m| m.opened.elapsed().as_secs_f32() * 1000.0 < MENU_FADE_MS + 20.0)
 }
 
 enum MenuRow {
@@ -1065,7 +1178,11 @@ fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, 
     let x = x.clamp(margin, (win.right() - margin - w).max(margin));
     let y = y.clamp(margin, (win.bottom() - margin - h).max(margin));
 
-    let t = (menu.opened.elapsed().as_secs_f32() * 1000.0 / MENU_FADE_MS).clamp(0.0, 1.0);
+    let t = if d.prefs.reduced() {
+        1.0
+    } else {
+        (menu.opened.elapsed().as_secs_f32() * 1000.0 / MENU_FADE_MS).clamp(0.0, 1.0)
+    };
     let ease = 1.0 - (1.0 - t).powi(3);
     let y = y - 4.0 * (1.0 - ease);
     let focus = menu.focus;
@@ -1152,7 +1269,7 @@ fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, 
     d.layer = BASE;
 }
 
-fn title_bar(d: &mut DrawList, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
+fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
     d.hit(bar, HitKind::DragWindow);
 
     d.text(
@@ -1195,25 +1312,39 @@ fn title_bar(d: &mut DrawList, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
     }
 
     // Live readout, instrument style, ahead of the controls.
-    let gpu = snap
-        .gpus
-        .first()
-        .and_then(|g| g.util)
-        .map(percent)
-        .unwrap_or_else(|| "—".into());
-    let readout = format!(
-        "cpu {}   mem {}   gpu {}",
-        percent(snap.cpu_total),
-        mem_short(snap),
-        gpu
-    );
-    let rw = measure(&readout.to_uppercase(), MICRO_NUM);
-    d.text_r(
-        &readout,
-        Rect::new(left_edge - 24.0 - rw, bar.y, rw + 2.0, bar.h),
-        MICRO_NUM,
-        theme::INK_3,
-    );
+    let mut right = left_edge - 24.0;
+    if state.settings.readout {
+        let gpu = snap
+            .gpus
+            .first()
+            .and_then(|g| g.util)
+            .map(percent)
+            .unwrap_or_else(|| "—".into());
+        let readout = format!(
+            "cpu {}   mem {}   gpu {}",
+            percent(snap.cpu_total),
+            mem_short(snap),
+            gpu
+        );
+        let rw = measure(&readout.to_uppercase(), MICRO_NUM);
+        d.text_r(
+            &readout,
+            Rect::new(right - rw, bar.y, rw + 2.0, bar.h),
+            MICRO_NUM,
+            theme::INK_3,
+        );
+        right -= rw + 24.0;
+    }
+    // Frozen numbers must never pass for live ones, so this shows either way.
+    if state.paused {
+        let pw = measure("PAUSED", MICRO_NUM);
+        d.text_r(
+            "paused",
+            Rect::new(right - pw, bar.y, pw + 2.0, bar.h),
+            MICRO_NUM,
+            theme::WARN,
+        );
+    }
 }
 
 fn side_item(
@@ -1259,6 +1390,24 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2]) {
         d.hit(r, HitKind::Page(page));
         y += 38.0;
     }
+    // Settings is about the app, not the machine: pinned to the foot, clear
+    // of the monitor pages, just above the version.
+    let r = Rect::new(
+        nav.x + 10.0,
+        (nav.bottom() - 82.0).max(y + 8.0),
+        nav.w - 20.0,
+        34.0,
+    );
+    side_item(
+        d,
+        r,
+        Icon::Cog,
+        "Settings",
+        None,
+        state.page == Page::Settings,
+        mouse,
+    );
+    d.hit(r, HitKind::Page(Page::Settings));
     d.text(
         &format!("v{}", env!("CARGO_PKG_VERSION")),
         Rect::new(nav.x + 20.0, nav.bottom() - 30.0, nav.w - 40.0, 14.0),
@@ -1301,15 +1450,10 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         ("User", ProcView::User),
         ("System", ProcView::System),
     ];
-    // Inset from the outer ring; equal side padding inside each cell so every
-    // label — short "Flat" or long "Grouped" — sits on the same rhythm.
-    let seg_inset = 3.0;
-    let seg_pad_x = 16.0;
-    let seg_w: f32 = views
+    let view_items: Vec<(&str, bool, HitKind)> = views
         .iter()
-        .map(|(l, _)| measure(l, PILL) + seg_pad_x * 2.0)
-        .sum::<f32>()
-        + seg_inset * 2.0;
+        .map(|(l, v)| (*l, state.view == *v, HitKind::View(*v)))
+        .collect();
 
     let end = selection_label(state);
     let ew = pill_w(&end, false);
@@ -1320,24 +1464,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     };
     let dw = pill_w(dense, true);
 
-    // Segmented control: one ghost outline, the active segment is the white pill.
-    let seg = Rect::new(inner.x, y, seg_w, ctl_h);
-    d.outline(seg, ctl_h * 0.5, theme::GHOST_LINE);
-    let mut x = seg.x + seg_inset;
-    for (label, view) in views {
-        let w = measure(label, PILL) + seg_pad_x * 2.0;
-        let r = Rect::new(x, y + seg_inset, w, ctl_h - seg_inset * 2.0);
-        let on = state.view == view;
-        let hot = r.contains(mouse[0], mouse[1]);
-        if on {
-            d.fill(r, r.h * 0.5, theme::ACCENT);
-            d.text_c(label, r, PILL_ON, theme::ON_ACCENT);
-        } else {
-            d.text_c(label, r, PILL, if hot { theme::INK } else { theme::INK_2 });
-        }
-        d.hit(r, HitKind::View(view));
-        x += w;
-    }
+    let seg = segmented(d, inner.x, y, &view_items, mouse);
 
     // Right cluster anchors the trailing edge; search fills the mid band so the
     // gap matches PILL_GAP on both sides (a 240px cap left a dead hole before).
@@ -1405,7 +1532,11 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     // Column header metrics — painted after the list so scrolled row ink
     // cannot cover the labels / hairline.
     let y = y + ctl_h + 20.0;
-    let cols = columns(state.density, inner.w);
+    let cols = columns(state.density, &state.settings, inner.w);
+    let cpu_div = match state.settings.proc_cpu {
+        ProcCpu::Core => 1.0,
+        ProcCpu::Machine => snap.cpu_per.len().max(1) as f32,
+    };
     let header = Rect::new(inner.x, y, inner.w, 16.0);
     let hair_y = y + 24.0;
     let y = y + 25.0;
@@ -1496,7 +1627,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                 } else if hot {
                     d.fill(rr, 6.0, theme::HOVER);
                 }
-                draw_proc(d, &cols, rr, p);
+                draw_proc(d, &cols, rr, p, cpu_div);
                 d.hit(rr, HitKind::Proc { pid: p.pid });
             }
         }
@@ -1674,8 +1805,8 @@ struct ColSpec {
     mono: bool,
 }
 
-fn columns(density: Density, width: f32) -> Vec<ColSpec> {
-    let spec: &[(Col, f32, bool, bool)] = if density == Density::Compact {
+fn columns(density: Density, prefs: &Settings, width: f32) -> Vec<ColSpec> {
+    let all: &[(Col, f32, bool, bool)] = if density == Density::Compact {
         &[
             (Col::Pid, 68.0, true, true),
             (Col::Memory, 88.0, true, true),
@@ -1693,6 +1824,11 @@ fn columns(density: Density, width: f32) -> Vec<ColSpec> {
             (Col::Cpu, 72.0, true, true),
         ]
     };
+    let spec: Vec<(Col, f32, bool, bool)> = all
+        .iter()
+        .copied()
+        .filter(|(c, ..)| prefs.shows(*c))
+        .collect();
     let fixed: f32 = spec.iter().map(|(_, w, _, _)| *w).sum();
     let x = width - fixed;
     let mut cols = vec![ColSpec {
@@ -1769,12 +1905,15 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort) {
     }
 }
 
-fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
+/// `cpu_div` rescales per-process CPU: 1 for share of one core, the core
+/// count for share of the whole machine.
+fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f32) {
+    let cpu = p.cpu / cpu_div;
     for c in cols {
         let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
         let text = match c.col {
             Col::Name => p.name.clone(),
-            Col::Cpu => cpu_pct(p.cpu),
+            Col::Cpu => cpu_pct(cpu),
             Col::Gpu => cpu_pct(p.gpu),
             Col::Memory => bytes(p.rss),
             Col::Disk => disk_cell(p.read_bps, p.write_bps),
@@ -1784,7 +1923,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
         };
         // Idle cells step back so the rows doing something read first.
         let idle = match c.col {
-            Col::Cpu => p.cpu < 0.05,
+            Col::Cpu => cpu < 0.05,
             Col::Gpu => p.gpu < 0.05,
             Col::Disk => disk_sum(p) < 1.0,
             _ => false,
@@ -1793,9 +1932,9 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
             Col::Name if p.stopped => theme::INK_3,
             Col::Name => theme::INK,
             Col::Cpu if idle => theme::INK_4,
-            Col::Cpu => heat(p.cpu),
+            Col::Cpu => heat(d, cpu, theme::INK),
             Col::Gpu if idle => theme::INK_4,
-            Col::Gpu => heat(p.gpu),
+            Col::Gpu => heat(d, p.gpu, theme::INK),
             _ if idle => theme::INK_4,
             _ => theme::INK_2,
         };
@@ -1814,6 +1953,10 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
         }
     }
 }
+
+/// Room kept free at the right of a scrolling list so its thumb never sits
+/// on a row's trailing control.
+const SCROLL_GUTTER: f32 = 16.0;
 
 fn scrollbar(
     d: &mut DrawList,
@@ -1937,8 +2080,8 @@ fn performance(
     );
 }
 
-fn window_label() -> String {
-    format!("{} s window", crate::model::HIST_SECS)
+fn window_label(prefs: &Settings) -> String {
+    format!("{} window", prefs.history.label())
 }
 
 fn mem_short_n(used: f32, total: u64) -> String {
@@ -2001,6 +2144,7 @@ fn scaled_graph(
 
 fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) -> f32 {
     let top = y;
+    let prefs = d.prefs;
     y = page_title(d, "Processor", &snap.cpu_model, view, y);
     y = readout(d, view, y, &percent(snap.cpu_total), "Total utilization");
 
@@ -2032,7 +2176,14 @@ fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) ->
     let graph_h = (spare * if n > 0 { 0.62 } else { 1.0 }).clamp(110.0, 320.0);
     let cores_h = (spare * 0.38).clamp(60.0, 150.0);
 
-    eyebrow(d, view.x, y, view.w, "Utilization", Some(&window_label()));
+    eyebrow(
+        d,
+        view.x,
+        y,
+        view.w,
+        "Utilization",
+        Some(&window_label(&prefs)),
+    );
     y += 24.0;
     scaled_graph(
         d,
@@ -2067,7 +2218,7 @@ fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) ->
             if idx < 0.0 {
                 0.0
             } else {
-                sample_hist(h, idx)
+                curve_at(h, idx, prefs.curve)
             }
         })
         .collect();
@@ -2093,13 +2244,7 @@ fn equalizer(d: &mut DrawList, r: Rect, values: &[f32]) {
     for (i, v) in values.iter().enumerate() {
         let h = ((v / 100.0).clamp(0.0, 1.0) * r.h).max(2.0);
         let x = r.x + i as f32 * slot + (slot - bw) * 0.5;
-        let color = if *v >= 90.0 {
-            theme::HOT
-        } else if *v >= 70.0 {
-            theme::WARN
-        } else {
-            theme::INK_2
-        };
+        let color = heat(d, *v, theme::INK_2);
         d.fill(Rect::new(x, r.bottom() - h, bw, h), 1.0, color);
     }
     d.hairline(Rect::new(r.x, r.bottom(), r.w, 1.0));
@@ -2107,6 +2252,7 @@ fn equalizer(d: &mut DrawList, r: Rect, values: &[f32]) {
 
 fn memory_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) -> f32 {
     let top = y;
+    let prefs = d.prefs;
     y = page_title(d, "Memory", "Physical RAM", view, y);
     let used = bytes(snap.mem_used);
     d.text(
@@ -2151,7 +2297,7 @@ fn memory_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32)
     let graph_h = (spare * if has_swap { 0.68 } else { 1.0 }).clamp(110.0, 320.0);
     let swap_h = (spare * 0.32).clamp(56.0, 120.0);
 
-    eyebrow(d, view.x, y, view.w, "Usage", Some(&window_label()));
+    eyebrow(d, view.x, y, view.w, "Usage", Some(&window_label(&prefs)));
     y += 24.0;
     scaled_graph(
         d,
@@ -2197,6 +2343,7 @@ fn gpu_page(
     head: f32,
 ) -> f32 {
     let top = y;
+    let prefs = d.prefs;
     if snap.gpus.is_empty() {
         y = page_title(d, "Graphics", "No GPU reported", view, y);
         return y;
@@ -2209,7 +2356,7 @@ fn gpu_page(
         // Telemetry as a stat row.
         let mut stats: Vec<(String, &str)> = Vec::new();
         if let Some(t) = g.temp_c {
-            stats.push((format!("{t} °C"), "Temp"));
+            stats.push((prefs.temp(t), "Temp"));
         }
         if let Some(p) = g.power_w {
             stats.push((format!("{p:.0} W"), "Power"));
@@ -2250,7 +2397,14 @@ fn gpu_page(
         } else {
             120.0
         };
-        eyebrow(d, view.x, y, view.w, "Utilization", Some(&window_label()));
+        eyebrow(
+            d,
+            view.x,
+            y,
+            view.w,
+            "Utilization",
+            Some(&window_label(&prefs)),
+        );
         y += 24.0;
         scaled_graph(
             d,
@@ -2375,7 +2529,7 @@ fn io_page(
             theme::INK_3,
         );
         y += 26.0;
-        let goal = io_scale(a_hist, b_hist, head);
+        let goal = io_scale(a_hist, b_hist, head, state.settings.window());
         let key = format!("{}:{name}", if disk { "disk" } else { "net" });
         let max = state.perf_smooth.io_max(&key).unwrap_or(goal);
         let gr = Rect::new(view.x, y, view.w, graph_h);
@@ -2463,19 +2617,14 @@ fn startup_page(
     let first = (state.startup_scroll / row_h).floor() as usize;
     let nvis = ((list.h / row_h).ceil() as usize) + 2;
     d.clip = Some(list);
+    let full = list;
+    let list = Rect::new(list.x, list.y, (list.w - SCROLL_GUTTER).max(40.0), list.h);
     for (i, entry) in startup.iter().enumerate().skip(first).take(nvis) {
         let ry = list.y + i as f32 * row_h - state.startup_scroll;
         if ry + row_h < list.y || ry > list.bottom() {
             continue;
         }
-        let rr = Rect::new(list.x, ry, list.w, row_h);
-        if rr.contains(mouse[0], mouse[1]) {
-            d.fill(
-                Rect::new(list.x - 10.0, ry, list.w + 20.0, row_h),
-                6.0,
-                theme::HOVER,
-            );
-        }
+        let rr = Rect::new(full.x, ry, full.w, row_h);
         let name_ink = if entry.enabled {
             theme::INK
         } else {
@@ -2513,7 +2662,7 @@ fn startup_page(
         d.hairline(Rect::new(list.x, ry + row_h - 1.0, list.w, 1.0));
         switch(
             d,
-            Rect::new(list.right() - 36.0, ry + 17.0, 32.0, 18.0),
+            Rect::new(list.right() - 32.0, ry + 17.0, 32.0, 18.0),
             entry.enabled,
         );
         d.hit(rr, HitKind::Startup(i));
@@ -2522,10 +2671,380 @@ fn startup_page(
     scrollbar(
         d,
         state,
-        list,
+        full,
         content_h,
         state.startup_scroll,
         crate::model::ScrollBar::Startup,
+        mouse,
+    );
+}
+
+// --- Settings ---------------------------------------------------------------
+
+enum Ctl {
+    /// Segmented control. Items are (label, on, hit).
+    Choice(Vec<(&'static str, bool, HitKind)>),
+    Switch(Opt, bool),
+    /// Independent toggles, one ghost pill each; on is the white pill.
+    Chips(Vec<(&'static str, bool, HitKind)>),
+    Scale(f32),
+    Reset(bool),
+}
+
+struct SetRow {
+    label: &'static str,
+    desc: &'static str,
+    ctl: Ctl,
+}
+
+fn choice<T: Choice>(opt: Opt, current: T) -> Ctl {
+    Ctl::Choice(
+        T::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.label(), *v == current, HitKind::Setting(opt, i as u8)))
+            .collect(),
+    )
+}
+
+fn settings_groups(state: &AppState) -> Vec<(&'static str, Vec<SetRow>)> {
+    let s = &state.settings;
+    let row = |label, desc, ctl| SetRow { label, desc, ctl };
+    let mut speed = match choice(Opt::Speed, s.speed) {
+        Ctl::Choice(items) => items,
+        _ => unreachable!(),
+    };
+    if state.paused {
+        for item in &mut speed {
+            item.1 = false;
+        }
+    }
+    speed.push((
+        "Pause",
+        state.paused,
+        HitKind::Setting(Opt::Speed, Speed::ALL.len() as u8),
+    ));
+    let density = if state.density == Density::Compact {
+        1
+    } else {
+        0
+    };
+    vec![
+        (
+            "Appearance",
+            vec![
+                row(
+                    "Interface scale",
+                    "Ctrl + and Ctrl - work anywhere, Ctrl 0 resets",
+                    Ctl::Scale(state.ui_scale),
+                ),
+                row(
+                    "Glass",
+                    "How much of the desktop blur shows through the window",
+                    choice(Opt::Glass, s.glass),
+                ),
+                row(
+                    "Motion",
+                    "Reduced drops fades and moves graphs in whole samples",
+                    choice(Opt::Motion, s.motion),
+                ),
+                row(
+                    "Row density",
+                    "Spacing of the process list",
+                    Ctl::Choice(vec![
+                        (
+                            "Comfortable",
+                            density == 0,
+                            HitKind::Setting(Opt::Density, 0),
+                        ),
+                        ("Compact", density == 1, HitKind::Setting(Opt::Density, 1)),
+                    ]),
+                ),
+                row(
+                    "Status color",
+                    "Amber from 70% and red from 90%. Off keeps everything monochrome",
+                    Ctl::Switch(Opt::Heat, s.heat),
+                ),
+                row(
+                    "Title bar readout",
+                    "CPU, memory and GPU beside the window controls",
+                    Ctl::Switch(Opt::Readout, s.readout),
+                ),
+            ],
+        ),
+        (
+            "Graphs",
+            vec![
+                row(
+                    "History",
+                    "Time span across every graph",
+                    choice(Opt::History, s.history),
+                ),
+                row(
+                    "Curves",
+                    "Smooth bends between samples. Linear hits every peak exactly",
+                    choice(Opt::Curve, s.curve),
+                ),
+                row(
+                    "Fill",
+                    "Faint wash under each trace",
+                    Ctl::Switch(Opt::Fill, s.fill),
+                ),
+                row(
+                    "Grid",
+                    "Quarter lines behind large graphs",
+                    Ctl::Switch(Opt::Grid, s.grid),
+                ),
+            ],
+        ),
+        (
+            "Data",
+            vec![
+                row(
+                    "Update speed",
+                    "How often every reading refreshes. Space pauses on Performance",
+                    Ctl::Choice(speed),
+                ),
+                row(
+                    "Process CPU",
+                    "Per core counts one busy core as 100%. Whole machine divides by core count",
+                    choice(Opt::ProcCpu, s.proc_cpu),
+                ),
+                row(
+                    "Byte units",
+                    "Bytes per kilobyte",
+                    choice(Opt::Units, s.units),
+                ),
+                row(
+                    "Temperature",
+                    "GPU temperature unit",
+                    choice(Opt::Temp, s.temp),
+                ),
+            ],
+        ),
+        (
+            "Processes",
+            vec![
+                row(
+                    "Columns",
+                    "Name, CPU and Memory always show. Compact also hides Disk, User and Threads",
+                    Ctl::Chips(
+                        OPTIONAL_COLS
+                            .iter()
+                            .map(|c| {
+                                let on = s.shows(*c);
+                                (
+                                    col_title(*c),
+                                    on,
+                                    HitKind::Setting(Opt::Column(*c), !on as u8),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+                row(
+                    "Confirm ending",
+                    "End task and Force kill ask for a second click",
+                    Ctl::Switch(Opt::Confirm, s.confirm),
+                ),
+            ],
+        ),
+        (
+            "General",
+            vec![
+                row(
+                    "Open on",
+                    "Page shown when ZIGX starts",
+                    choice(Opt::OpenOn, s.open_on),
+                ),
+                row(
+                    "Reset",
+                    "Every setting, the zoom and row density back to defaults",
+                    Ctl::Reset(state.reset_armed.is_some()),
+                ),
+            ],
+        ),
+    ]
+}
+
+const CHIP_GAP: f32 = 8.0;
+const STEP_D: f32 = 32.0;
+const STEP_VALUE_W: f32 = 64.0;
+
+fn reset_label(armed: bool) -> &'static str {
+    if armed {
+        "Click again to reset"
+    } else {
+        "Reset all"
+    }
+}
+
+fn ctl_w(ctl: &Ctl) -> f32 {
+    match ctl {
+        Ctl::Choice(items) => segmented_w(items),
+        Ctl::Switch(..) => 32.0,
+        Ctl::Chips(items) => {
+            items.iter().map(|(l, ..)| pill_w(l, false)).sum::<f32>()
+                + CHIP_GAP * (items.len().saturating_sub(1)) as f32
+        }
+        Ctl::Scale(_) => STEP_D * 2.0 + STEP_VALUE_W,
+        Ctl::Reset(armed) => pill_w(reset_label(*armed), false),
+    }
+}
+
+fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
+    match ctl {
+        Ctl::Choice(items) => {
+            segmented(d, x, y, items, mouse);
+        }
+        Ctl::Switch(_, on) => switch(d, Rect::new(x, y + 7.0, 32.0, 18.0), *on),
+        Ctl::Chips(items) => {
+            let mut cx = x;
+            for (label, on, kind) in items {
+                let r = Rect::new(cx, y, pill_w(label, false), PILL_H);
+                if *on {
+                    d.fill(r, r.h * 0.5, theme::ACCENT);
+                    d.text_c(label, r, PILL_ON, theme::ON_ACCENT);
+                } else {
+                    ghost_pill(d, r, None, label, mouse, true, false);
+                }
+                d.hit(r, *kind);
+                cx += r.w + CHIP_GAP;
+            }
+        }
+        Ctl::Scale(scale) => {
+            let lo = crate::model::step_ui_scale(*scale, -1) < *scale - 0.001;
+            let hi = crate::model::step_ui_scale(*scale, 1) > *scale + 0.001;
+            for (dx, delta, enabled) in [(0.0, -1_i8, lo), (STEP_D + STEP_VALUE_W, 1, hi)] {
+                let r = Rect::new(x + dx, y, STEP_D, STEP_D);
+                ghost_pill(d, r, None, "", mouse, enabled, false);
+                let hot = enabled && r.contains(mouse[0], mouse[1]);
+                let ink = if !enabled {
+                    theme::INK_4
+                } else if hot {
+                    theme::INK
+                } else {
+                    theme::INK_2
+                };
+                let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+                bar(d, cx - 4.5, cy, cx + 4.5, cy, ICON_W, ink);
+                if delta > 0 {
+                    bar(d, cx, cy - 4.5, cx, cy + 4.5, ICON_W, ink);
+                }
+                if enabled {
+                    d.hit(r, HitKind::Zoom(delta));
+                }
+            }
+            d.text_c(
+                &percent(scale * 100.0),
+                Rect::new(x + STEP_D, y, STEP_VALUE_W, STEP_D),
+                NUM,
+                theme::INK,
+            );
+        }
+        Ctl::Reset(armed) => {
+            let label = reset_label(*armed);
+            let r = Rect::new(x, y, pill_w(label, false), PILL_H);
+            ghost_pill(d, r, None, label, mouse, true, *armed);
+            d.hit(r, HitKind::ResetSettings);
+        }
+    }
+}
+
+const SET_ROW_H: f32 = 60.0;
+const SET_GROUP_H: f32 = 44.0;
+
+fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32; 2]) {
+    let inner = Rect::new(main.x + 28.0, main.y + 22.0, main.w - 56.0, main.h - 46.0);
+    let path = crate::settings::settings_path();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shown = match path.to_str() {
+        Some(p) if !home.is_empty() && p.starts_with(&home) => format!("~{}", &p[home.len()..]),
+        Some(p) => p.to_string(),
+        None => "settings.txt".into(),
+    };
+    let sub = format!("Changes apply at once and are saved to {shown}");
+    let y = page_title(d, "Settings", &sub, inner, inner.y);
+    d.hairline(Rect::new(inner.x, y - 8.0, inner.w, 1.0));
+    let list = Rect::new(
+        inner.x,
+        y - 7.0,
+        inner.w,
+        (inner.bottom() - y + 7.0).max(20.0),
+    );
+    d.settings_rect = Some(list);
+
+    let groups = settings_groups(state);
+    let list_full = list;
+    let list = Rect::new(list.x, list.y, (list.w - SCROLL_GUTTER).max(40.0), list.h);
+    // Controls that would crowd the label drop below it.
+    let stacked = |ctl: &Ctl| ctl_w(ctl) > list.w * 0.58;
+    let row_h = |ctl: &Ctl| {
+        if stacked(ctl) {
+            SET_ROW_H + PILL_H + 8.0
+        } else {
+            SET_ROW_H
+        }
+    };
+    let content_h: f32 = groups
+        .iter()
+        .map(|(_, rows)| SET_GROUP_H + rows.iter().map(|r| row_h(&r.ctl)).sum::<f32>())
+        .sum::<f32>()
+        + 12.0;
+    let max_scroll = (content_h - list.h).max(0.0);
+    if state.settings_scroll > max_scroll {
+        state.settings_scroll = max_scroll;
+    }
+
+    d.clip = Some(list_full);
+    let mut y = list.y - state.settings_scroll;
+    for (title, rows) in &groups {
+        eyebrow(d, list.x, y + 20.0, list.w, title, None);
+        y += SET_GROUP_H;
+        for row in rows {
+            let h = row_h(&row.ctl);
+            let rr = Rect::new(list.x, y, list.w, h);
+            let cw = ctl_w(&row.ctl);
+            let stack = stacked(&row.ctl);
+            let text_w = if stack {
+                list.w
+            } else {
+                (list.w - cw - 24.0).max(40.0)
+            };
+            if let Ctl::Switch(opt, on) = row.ctl {
+                // The whole row is the switch, like a startup entry.
+                d.hit(rr, HitKind::Setting(opt, !on as u8));
+            }
+            d.text(
+                row.label,
+                Rect::new(list.x, y + 12.0, text_w, 18.0),
+                BODY,
+                theme::INK,
+            );
+            d.text(
+                row.desc,
+                Rect::new(list.x, y + 32.0, text_w, 16.0),
+                SUB,
+                theme::INK_3,
+            );
+            let (cx, cy) = if stack {
+                (list.x, y + SET_ROW_H - 4.0)
+            } else {
+                (list.right() - cw, y + (SET_ROW_H - PILL_H) * 0.5)
+            };
+            draw_ctl(d, &row.ctl, cx, cy, mouse);
+            d.hairline(Rect::new(list.x, y + h - 1.0, list.w, 1.0));
+            y += h;
+        }
+    }
+    d.clip = None;
+    scrollbar(
+        d,
+        state,
+        list_full,
+        content_h,
+        state.settings_scroll,
+        crate::model::ScrollBar::Settings,
         mouse,
     );
 }

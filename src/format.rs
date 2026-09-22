@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub fn percent(v: f32) -> String {
     if !v.is_finite() {
         return "—".into();
@@ -17,12 +19,25 @@ pub fn cpu_pct(v: f32) -> String {
     }
 }
 
+static DECIMAL: AtomicBool = AtomicBool::new(false);
+
+/// Byte sizes step by 1000 instead of 1024. A display preference, set once
+/// per frame from the settings.
+pub fn set_decimal(on: bool) {
+    DECIMAL.store(on, Ordering::Relaxed);
+}
+
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let step = if DECIMAL.load(Ordering::Relaxed) {
+        1000.0
+    } else {
+        1024.0
+    };
     let mut v = n as f64;
     let mut i = 0;
-    while v >= 1024.0 && i < 4 {
-        v /= 1024.0;
+    while v >= step && i < 4 {
+        v /= step;
         i += 1;
     }
     if i == 0 {

@@ -31,15 +31,14 @@ struct App {
     list_rect: Option<Rect>,
     detail_rect: Option<Rect>,
     startup_rect: Option<Rect>,
+    settings_rect: Option<Rect>,
     cursor: CursorIcon,
     gfx: Option<Gfx>,
     window: Option<Arc<Window>>,
 }
 
 impl App {
-    fn new(hub: Hub) -> Self {
-        let mut state = AppState::new(1240.0, 780.0);
-        load_ui(&mut state);
+    fn new(hub: Hub, state: AppState) -> Self {
         Self {
             hub,
             startup: load_startup(),
@@ -50,6 +49,7 @@ impl App {
             list_rect: None,
             detail_rect: None,
             startup_rect: None,
+            settings_rect: None,
             cursor: CursorIcon::Default,
             state,
             gfx: None,
@@ -77,6 +77,7 @@ impl App {
         self.list_rect = draw.list_rect;
         self.detail_rect = draw.detail_rect;
         self.startup_rect = draw.startup_rect;
+        self.settings_rect = draw.settings_rect;
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -118,8 +119,16 @@ impl App {
                 },
                 Effect::FlipStartup(index) => self.flip_startup(index),
                 Effect::Persist => {
-                    let _ = save_ui(&self.state);
+                    self.hub.set_period(if self.state.paused {
+                        0
+                    } else {
+                        self.state.settings.speed.ms()
+                    });
+                    if let Err(err) = save_ui(&self.state) {
+                        self.notify(format!("Could not save settings: {err}"), 6);
+                    }
                 }
+                Effect::Notify(label) => self.notify(label, 3),
             }
         }
     }
@@ -351,15 +360,18 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
                     MouseScrollDelta::PixelDelta(p) => -p.y as f32,
                 };
-                let x = self.mouse[0];
-                let y = self.mouse[1];
-                on_wheel(
-                    &mut self.state,
-                    self.list_rect.is_some_and(|r| r.contains(x, y)),
-                    self.detail_rect.is_some_and(|r| r.contains(x, y)),
-                    self.startup_rect.is_some_and(|r| r.contains(x, y)),
-                    dy,
-                );
+                let [x, y] = self.mouse;
+                let panes = [
+                    (self.list_rect, ScrollBar::Processes),
+                    (self.detail_rect, ScrollBar::Performance),
+                    (self.startup_rect, ScrollBar::Startup),
+                    (self.settings_rect, ScrollBar::Settings),
+                ];
+                let over = panes
+                    .into_iter()
+                    .find(|(r, _)| r.is_some_and(|r| r.contains(x, y)))
+                    .map(|(_, which)| which);
+                on_wheel(&mut self.state, over, dy);
                 self.redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -388,6 +400,7 @@ fn map_key(key: Key) -> Option<KeyIn> {
         Key::Named(NamedKey::PageDown) => KeyIn::PageDown,
         Key::Named(NamedKey::ArrowUp) => KeyIn::Up,
         Key::Named(NamedKey::ArrowDown) => KeyIn::Down,
+        Key::Named(NamedKey::Space) => KeyIn::Char(' '),
         Key::Character(s) => KeyIn::Char(s.chars().next()?),
         _ => return None,
     })
@@ -422,9 +435,11 @@ fn main() {
         .build()
         .expect("event loop");
     let proxy = event_loop.create_proxy();
-    let hub = spawn(move || {
+    let mut state = AppState::new(1240.0, 780.0);
+    load_ui(&mut state);
+    let hub = spawn(state.settings.speed.ms(), move || {
         let _ = proxy.send_event(UserEvent::Sample);
     });
-    let mut app = App::new(hub);
+    let mut app = App::new(hub, state);
     event_loop.run_app(&mut app).expect("run");
 }

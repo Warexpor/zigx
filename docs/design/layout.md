@@ -14,7 +14,8 @@ frame from scratch every paint; there is no retained widget tree.
 | Perform.  |                                                      |
 | Startup   |                                                      |
 |           |                                                      |
-| v0.3.9    |                                                      |
+| Settings  |                                                      |
+| v0.4.0    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -28,7 +29,11 @@ frame from scratch every paint; there is no retained widget tree.
   and hovering close turns its glyph `DANGER_INK`.
 - **Nav.** 200 wide by default, resizable by dragging its right hairline from
   160 to 300. It shows a "Monitor" eyebrow at 18, then side items from 44 on a
-  38 pitch, with the version pinned 30 above the bottom.
+  38 pitch, with the version pinned 30 above the bottom. Settings is about the
+  app rather than the machine, so it is pinned to the foot, 82 above the
+  bottom, apart from the monitor pages.
+- **Readout.** Hidden when Title bar readout is off. While sampling is paused
+  a `WARN` "PAUSED" flag sits ahead of it (or in its place).
 - **Dividers.** Hairlines under the title bar, right of the nav, and right of
   the Performance sub-nav. Resize handles are 5 px hit strips centered on
   their hairlines.
@@ -52,7 +57,8 @@ Content is inset 24 horizontally, 18 at the top, and 24 at the bottom.
    collapsible "User" and "System" header rows with a chevron and a count.
 
 Columns are right-aligned mono numbers, filled from the right edge. Name takes
-the rest.
+the rest. GPU, Disk, PID, User and Threads can be hidden in Settings; hidden
+columns drop out of the table below and Name takes their width.
 
 | Density | Columns, left to right after Name |
 | --- | --- |
@@ -102,7 +108,27 @@ Clicking empty list space clears the selection and unpins them.
 Same insets as Processes. A title with an explanatory subtitle, then an
 "Entries" eyebrow with an on-count, a hairline, and a list of 52 tall rows:
 name (`BODY`), an optional "system" tag, the Exec line (`NUM_SMALL`), and a
-switch at the right edge. Disabled entries drop to `INK_3` and `INK_4`.
+switch at the right edge. Disabled entries drop to `INK_3` and `INK_4`. Like
+Settings, the rows stop 16 short of the right edge (`SCROLL_GUTTER`) so the
+scrollbar never sits on a switch.
+
+## Settings
+
+Same insets as Startup. A title whose subtitle names the settings file, a
+hairline, then a scrolling list of groups. Each group is a 44 high eyebrow
+followed by setting rows (see [Components](components.md#setting-row)). A 16
+gutter on the right (`SCROLL_GUTTER`) keeps the scrollbar clear of the controls.
+
+| Group | Rows |
+| --- | --- |
+| Appearance | Interface scale, Glass, Motion, Row density, Status color, Title bar readout |
+| Graphs | History, Curves, Fill, Grid |
+| Data | Update speed (with Pause), Process CPU, Byte units, Temperature |
+| Processes | Columns, Confirm ending |
+| General | Open on, Reset |
+
+Every change applies on the next frame and is saved at once. Typing on this
+page does not start a process search.
 
 ## Scaling
 
@@ -112,7 +138,11 @@ user zoom.
 - Zoom stops: 80, 90, 100, 110, 125, 140, 160, 180%. `Ctrl++` and `Ctrl+-`
   step between them and `Ctrl+0` resets.
 - Zoom, pane widths, page, Performance section, process view, density, and sort
-  persist in `~/.config/zigx/ui.txt`.
+  persist in `~/.config/zigx/ui.txt`: state the app remembers on its own.
+- Preferences set on the Settings page persist in
+  `~/.config/zigx/settings.txt`, a commented `key=value` file that is safe to
+  edit by hand. Unknown keys and values fall back to defaults. Pause is never
+  saved, so ZIGX always launches live.
 - Keep geometry on whole or half design pixels where possible. Hairlines are 1
   design pixel and are antialiased at fractional scales rather than snapped.
 

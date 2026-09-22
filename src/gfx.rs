@@ -991,20 +991,26 @@ fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: 
         })
         .collect();
     let normal = |d: [f32; 2]| [-d[1], d[0]];
+    // A path that ends where it starts is closed: the seam is one more miter
+    // join, with no caps stacking ink over it.
+    let closed =
+        n >= 4 && (p[0][0] - p[n - 1][0]).abs() < 1e-3 && (p[0][1] - p[n - 1][1]).abs() < 1e-3;
+    let round = round && !closed;
 
-    // Left-side offset at every point: plain normal at the ends, miter inside.
+    // Left-side offset at every point: plain normal at open ends, miter inside.
     let offs: Vec<[f32; 2]> = (0..n)
         .map(|i| {
-            if i == 0 {
-                let nn = normal(dirs[0]);
-                return [nn[0] * outer, nn[1] * outer];
-            }
-            if i == n - 1 {
-                let nn = normal(dirs[n - 2]);
-                return [nn[0] * outer, nn[1] * outer];
-            }
-            let n0 = normal(dirs[i - 1]);
-            let n1 = normal(dirs[i]);
+            let (d0, d1) = if i == 0 || i == n - 1 {
+                if !closed {
+                    let nn = normal(dirs[if i == 0 { 0 } else { n - 2 }]);
+                    return [nn[0] * outer, nn[1] * outer];
+                }
+                (dirs[n - 2], dirs[0])
+            } else {
+                (dirs[i - 1], dirs[i])
+            };
+            let n0 = normal(d0);
+            let n1 = normal(d1);
             let mx = n0[0] + n1[0];
             let my = n0[1] + n1[1];
             let ml = (mx * mx + my * my).sqrt();

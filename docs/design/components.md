@@ -6,7 +6,7 @@ gap between controls.
 
 ## Ghost pill
 
-`ghost_pill()`. The only button style: a transparent, fully rounded shape with
+`ghost_pill()`. The standard button style: a transparent, fully rounded shape with
 a 1 px outline.
 
 | State | Outline | Label | Fill |
@@ -23,10 +23,23 @@ a 1 px outline.
 
 ## Segmented control
 
-A single `GHOST_LINE` outline 32 high. Segments sit 3 inside it with 16 side
-padding each, so short and long labels share one rhythm. The active segment is
-the `ACCENT` pill with a `PILL_ON` label in `ON_ACCENT`. Inactive labels are
-`INK_2`, or `INK` on hover.
+`segmented()`. A single `GHOST_LINE` outline 32 high. Segments sit 3 inside it
+with 16 side padding each, so short and long labels share one rhythm. The
+active segment is the `ACCENT` pill with a `PILL_ON` label in `ON_ACCENT`.
+Inactive labels are `INK_2`; hover gives a `HOVER` pill and `INK`. It is used
+for the process view and for every one-of-many setting.
+
+## Chips
+
+Independent toggles in a row with an 8 gap, one per value (the optional process
+columns). Off is a text-only ghost pill; on is the `ACCENT` pill with a
+`PILL_ON` label. Unlike a segmented control, any number can be on.
+
+## Stepper
+
+The interface scale control: two 32 x 32 round ghost pills holding a hairline
+minus and plus, with the value in `NUM` / `INK` centered in 64 between them. A
+button at the end of the zoom range is disabled.
 
 ## Search field
 
@@ -47,7 +60,8 @@ A ghost pill whose label follows the selection; the context menu offers the
 same action without the confirm step. With nothing selected it is
 disabled and reads "End task". The first press, or `Delete`, arms it for 4
 seconds: it switches to the danger style and reads "Confirm N". A second press,
-or `Enter`, sends SIGTERM. Changing the selection disarms it.
+or `Enter`, sends SIGTERM. Changing the selection disarms it. With Confirm
+ending off in Settings, the first press sends SIGTERM.
 
 ## Side item
 
@@ -101,6 +115,8 @@ is a sort target with 4 px of extra hit area above and below.
 
 - On: a filled `ACCENT` track with an `ON_ACCENT` knob at the right.
 - Off: a `GHOST_LINE` outline with an `INK_3` knob at the left.
+- A row that carries a switch (startup entries, setting rows) is clickable end
+  to end but shows no hover fill: the switch is the only state on the row.
 
 ## Toast
 
@@ -139,14 +155,14 @@ pointer on the overlay layer.
     PID or PIDs.
 - **Force kill.** The label is `DANGER_INK` on hover. The first click arms it:
   a `DANGER_LINE` outline and "Click again to force kill". The second click
-  sends the signal.
+  sends the signal. With Confirm ending off, the first click sends it.
 - **Modal hover.** While the menu is open nothing beneath it shows hover.
 - **Dismissal.** Any click outside, `Esc`, the wheel, a right-click off a row,
   or leaving the page closes it without acting. The menu also closes by itself
   if every target process exits.
 - **Keyboard.** Up and Down move focus, wrapping; `Enter` activates.
 - **Motion.** It fades in and settles 4 px downward over 140 ms with an
-  ease-out cubic.
+  ease-out cubic. With reduced motion it appears in place at once.
 
 Suspended processes show a `MICRO` "suspended" tag after their name in
 `INK_4`, and their name drops to `INK_3`.
@@ -155,9 +171,9 @@ Suspended processes show a `MICRO` "suspended" tag after their name in
 
 `DrawList::graph()`.
 
-- A quarter grid in `GRID` when the graph is at least 80 tall, and a
-  `HAIRLINE` baseline.
-- Traces 1.25 wide with a wash beneath each.
+- A quarter grid in `GRID` when the graph is at least 80 tall and Grid is on,
+  and a `HAIRLINE` baseline.
+- Traces 1.25 wide with a wash beneath each when Fill is on.
 - 6 px of headroom above 100% so the stroke and its antialiasing are never
   clipped.
 - A scale note sits above the top-right corner in `MICRO_NUM` / `INK_4`.
@@ -177,6 +193,18 @@ of its slot, between 2 and 10 wide, with a minimum height of 2. Bars are
 
 The VRAM meter is a 2 px `GRID` track with an `INK` fill. Its eyebrow reads
 "used / total".
+
+## Setting row
+
+`settings_page()`. 60 high, closed by a hairline. The label is `BODY` / `INK`
+at 12 and a one-line description `SUB` / `INK_3` at 32; the control sits at the
+right edge, centered vertically. When the control is wider than 58% of the
+row, it drops below the description (row 100 high) so narrow windows never
+crowd the label. A switch row is clickable end to end, like a startup entry.
+
+Reset is a ghost pill, "Reset all". The first click arms it for 4 seconds in the
+danger style ("Click again to reset"); the second restores every setting, the
+zoom and row density, and confirms with a toast.
 
 ## Window controls
 

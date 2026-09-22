@@ -10,6 +10,7 @@ mod interact;
 mod model;
 mod persist;
 mod sample;
+mod settings;
 mod startup;
 
 pub use frame::{
@@ -22,4 +23,5 @@ pub use interact::{
 pub use model::*;
 pub use persist::{load_ui, save_ui};
 pub use sample::{spawn, Hub};
+pub use settings::{load_settings, Settings};
 pub use startup::{load_startup, write_enabled};

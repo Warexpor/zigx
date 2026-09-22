@@ -19,13 +19,13 @@ alpha out of 255.
 
 | Token | Value | Use |
 | --- | --- | --- |
-| `CANVAS` | black at 200 (78%) | The window sheet. The desktop blur shows through it |
+| `CANVAS` | black at 200 (78%) | The window sheet. The desktop blur shows through it. The Glass setting swaps the alpha: 140 clear, 200 glass, 248 solid |
 | `CANVAS_LINE` | ink at 36 (14%) | Window edge |
 | `HAIRLINE` | ink at 30 (12%) | Dividers, graph baselines, disabled pill outline |
 | `GRID` | ink at 14 (5%) | Graph quarter grid, VRAM track |
 | `GHOST` | ink at 22 (9%) | Active side item, focused search field |
 | `GHOST_LINE` | ink at 66 (26%) | Pill, segmented control, and off-switch outlines |
-| `HOVER` | ink at 16 (6%) | Hover fill for rows, side items, window controls |
+| `HOVER` | ink at 16 (6%) | Hover fill for process rows, side items, window controls (not rows with a switch) |
 | `SELECTED` | ink at 30 (12%) | Selected process rows |
 | `TOAST` | black at 230 (90%) | Notice toast |
 | `MENU` | black at 250 (98%) | Context menu, which sits over dense rows |
@@ -50,6 +50,10 @@ alpha out of 255.
 Load coloring goes through `heat()` in `src/frame.rs`: below 70 is the normal
 ink for that element, 70 is `WARN`, 90 is `HOT`. Idle process cells (CPU and
 GPU under 0.05%, disk under 1 B/s) drop to `INK_4` so active rows read first.
+With Status color off in Settings, `heat()` always returns the normal ink and
+the app is fully monochrome apart from danger states and the pause flag.
+The title bar "PAUSED" flag is `WARN`: frozen numbers must never pass for live
+ones.
 
 ### Traces
 
@@ -106,7 +110,9 @@ Helpers are in `src/format.rs`.
 - System percentages (`percent`): whole numbers, "37%".
 - Per-process CPU and GPU (`cpu_pct`): one decimal under 10%, whole above, so
   the many near-idle rows still sort visibly.
-- Bytes: binary steps shown as KB, MB, GB, TB.
+- Bytes: binary steps shown as KB, MB, GB, TB. The Byte units setting switches
+  to decimal steps of 1000 with the same labels.
+- Temperature: "62 °C", or whole degrees Fahrenheit when set.
 - Missing values: an em dash.
 
 ## Shape
@@ -137,6 +143,7 @@ Icons are 14 x 14 line drawings built from strokes, bars, rings, and dots in
 | Processes | Three records, each a dot and a rule of uneven length |
 | Performance | A trend line with one dip and a climb, over a baseline |
 | Startup | Power: an open ring with the switch bar in its gap |
+| Settings | Cog: one closed outline whose radius follows a softened square wave (six teeth with flat tops and rounded shoulders), around an open hub ring, both at hairline weight (1.35) |
 | CPU | Square die with two pins per side |
 | Memory | Long module over three contacts |
 | GPU | Card with a fan disc and a front bracket |

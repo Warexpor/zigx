@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::model::{AppState, Col, ContextMenu, Density, Drag, MenuAction, Page, ScrollBar};
+use crate::settings::{Choice, Opt, Settings, Speed};
 
 use super::frame::HitKind;
 
@@ -46,6 +47,7 @@ pub enum Effect {
     CopyCommand(i32),
     FlipStartup(usize),
     Persist,
+    Notify(String),
 }
 
 pub fn expire(state: &mut AppState) {
@@ -122,6 +124,9 @@ pub fn on_press(
         }
         HitKind::EndTask => end_task(state),
         HitKind::MenuItem(_) | HitKind::MenuPanel => vec![],
+        HitKind::Setting(opt, v) => set_option(state, opt, v),
+        HitKind::Zoom(delta) => zoom(state, delta as i32),
+        HitKind::ResetSettings => reset_settings(state),
         HitKind::Group(user_group) => {
             if user_group {
                 state.user_open = !state.user_open;
@@ -208,23 +213,15 @@ pub fn on_move(state: &mut AppState, x: f32, y: f32) -> bool {
     }
 }
 
-pub fn on_wheel(
-    state: &mut AppState,
-    over_list: bool,
-    over_detail: bool,
-    over_startup: bool,
-    dy: f32,
-) {
+/// Scroll whichever pane the pointer is over.
+pub fn on_wheel(state: &mut AppState, over: Option<ScrollBar>, dy: f32) {
     if state.menu.is_some() {
         close_menu(state);
         return;
     }
-    if over_list {
-        state.scroll = (state.scroll + dy).max(0.0);
-    } else if over_detail {
-        state.perf_scroll = (state.perf_scroll + dy).max(0.0);
-    } else if over_startup {
-        state.startup_scroll = (state.startup_scroll + dy).max(0.0);
+    if let Some(which) = over {
+        let v = get_scroll(state, which) + dy;
+        set_scroll(state, which, v);
     }
 }
 
@@ -244,8 +241,14 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                 return zoom_reset(state);
             }
             if ctrl && (c == 'f' || c == 'F') {
+                state.page = Page::Processes;
                 state.search_focused = true;
-                return vec![];
+                return vec![Effect::Persist];
+            }
+            if ctrl && c == ',' {
+                state.page = Page::Settings;
+                state.search_focused = false;
+                return vec![Effect::Persist];
             }
             if ctrl {
                 return vec![];
@@ -262,6 +265,14 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                     }
                     '3' => {
                         state.page = Page::Startup;
+                        return vec![Effect::Persist];
+                    }
+                    '4' => {
+                        state.page = Page::Settings;
+                        return vec![Effect::Persist];
+                    }
+                    ' ' if state.page == Page::Performance => {
+                        state.paused = !state.paused;
                         return vec![Effect::Persist];
                     }
                     'c' | 'C' if state.page == Page::Performance => {
@@ -289,6 +300,7 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                         state.perf_scroll = 0.0;
                         return vec![Effect::Persist];
                     }
+                    _ if state.page == Page::Settings => return vec![],
                     _ => state.search_focused = true,
                 }
             }
@@ -398,7 +410,7 @@ fn menu_action(state: &mut AppState, action: MenuAction) -> Vec<Effect> {
         return vec![];
     };
     let pids = menu.pids.clone();
-    if action == MenuAction::ForceKill && !menu.confirm_kill {
+    if action == MenuAction::ForceKill && !menu.confirm_kill && state.settings.confirm {
         menu.confirm_kill = true;
         return vec![];
     }
@@ -420,6 +432,76 @@ fn menu_action(state: &mut AppState, action: MenuAction) -> Vec<Effect> {
             vec![Effect::Copy(text)]
         }
     }
+}
+
+/// Apply a Settings page control. `v` is a segment index, or 0 / 1 for a switch.
+fn set_option(state: &mut AppState, opt: Opt, v: u8) -> Vec<Effect> {
+    fn pick<T: Choice>(slot: &mut T, v: u8) {
+        if let Some(x) = T::from_index(v as usize) {
+            *slot = x;
+        }
+    }
+    let on = v != 0;
+    let s = &mut state.settings;
+    match opt {
+        Opt::Glass => pick(&mut s.glass, v),
+        Opt::Motion => pick(&mut s.motion, v),
+        Opt::Density => {
+            state.density = if on {
+                Density::Compact
+            } else {
+                Density::Comfortable
+            }
+        }
+        Opt::Heat => s.heat = on,
+        Opt::Readout => s.readout = on,
+        Opt::History => pick(&mut s.history, v),
+        Opt::Curve => pick(&mut s.curve, v),
+        Opt::Fill => s.fill = on,
+        Opt::Grid => s.grid = on,
+        Opt::Speed => {
+            // The trailing segment is Pause; picking a speed also resumes.
+            if (v as usize) < Speed::ALL.len() {
+                pick(&mut s.speed, v);
+                state.paused = false;
+            } else {
+                state.paused = !state.paused;
+            }
+        }
+        Opt::ProcCpu => pick(&mut s.proc_cpu, v),
+        Opt::Units => pick(&mut s.units, v),
+        Opt::Temp => pick(&mut s.temp, v),
+        Opt::Column(col) => {
+            if let Some(slot) = s.show_mut(col) {
+                *slot = on;
+            }
+        }
+        Opt::Confirm => {
+            s.confirm = on;
+            state.armed = None;
+        }
+        Opt::OpenOn => pick(&mut s.open_on, v),
+    }
+    state.reset_armed = None;
+    vec![Effect::Persist]
+}
+
+/// First click arms for a few seconds; the second restores every default.
+fn reset_settings(state: &mut AppState) -> Vec<Effect> {
+    let now = Instant::now();
+    if !state.reset_armed.is_some_and(|t| t > now) {
+        state.reset_armed = Some(now + Duration::from_secs(4));
+        return vec![];
+    }
+    state.reset_armed = None;
+    state.settings = Settings::default();
+    state.density = Density::Comfortable;
+    state.ui_scale = 1.0;
+    state.paused = false;
+    vec![
+        Effect::Persist,
+        Effect::Notify("Settings reset to defaults".into()),
+    ]
 }
 
 fn zoom(state: &mut AppState, delta: i32) -> Vec<Effect> {
@@ -444,6 +526,7 @@ fn nudge_scroll(state: &mut AppState, dy: f32) {
         Page::Processes => state.scroll = (state.scroll + dy).max(0.0),
         Page::Performance => state.perf_scroll = (state.perf_scroll + dy).max(0.0),
         Page::Startup => state.startup_scroll = (state.startup_scroll + dy).max(0.0),
+        Page::Settings => state.settings_scroll = (state.settings_scroll + dy).max(0.0),
     }
 }
 
@@ -515,6 +598,7 @@ fn get_scroll(state: &AppState, which: ScrollBar) -> f32 {
         ScrollBar::Processes => state.scroll,
         ScrollBar::Performance => state.perf_scroll,
         ScrollBar::Startup => state.startup_scroll,
+        ScrollBar::Settings => state.settings_scroll,
     }
 }
 
@@ -523,6 +607,7 @@ fn set_scroll(state: &mut AppState, which: ScrollBar, v: f32) {
         ScrollBar::Processes => state.scroll = v.max(0.0),
         ScrollBar::Performance => state.perf_scroll = v.max(0.0),
         ScrollBar::Startup => state.startup_scroll = v.max(0.0),
+        ScrollBar::Settings => state.settings_scroll = v.max(0.0),
     }
 }
 
@@ -542,6 +627,13 @@ fn sync_pins(state: &mut AppState) {
 fn end_task(state: &mut AppState) -> Vec<Effect> {
     if state.selected.is_empty() {
         return vec![];
+    }
+    if !state.settings.confirm {
+        state.armed = None;
+        return vec![Effect::Signal(
+            state.selected.iter().copied().collect(),
+            Sig::Term,
+        )];
     }
     let now = Instant::now();
     if let Some(armed) = &state.armed {
@@ -640,6 +732,48 @@ mod tests {
         assert!(fx.is_empty());
         assert!(state.menu.is_none());
         assert!(state.armed.is_none(), "dismiss click must not arm End task");
+    }
+
+    #[test]
+    fn confirm_off_ends_on_the_first_click() {
+        let mut state = menu_state();
+        state.settings.confirm = false;
+        state.selected.insert(20);
+        let fx = on_press(&mut state, HitKind::EndTask, false, false, [0.0, 0.0]);
+        assert!(matches!(fx.as_slice(), [Effect::Signal(p, Sig::Term)] if p == &vec![20]));
+        open_menu(&mut state, 10, [0.0, 0.0]);
+        let kill = HitKind::MenuItem(MenuAction::ForceKill);
+        let fx = on_press(&mut state, kill, false, false, [0.0, 0.0]);
+        assert!(matches!(fx.as_slice(), [Effect::Signal(_, Sig::Kill)]));
+    }
+
+    #[test]
+    fn pause_segment_toggles_and_a_speed_resumes() {
+        let mut state = menu_state();
+        let pause = HitKind::Setting(Opt::Speed, Speed::ALL.len() as u8);
+        on_press(&mut state, pause, false, false, [0.0, 0.0]);
+        assert!(state.paused);
+        on_press(
+            &mut state,
+            HitKind::Setting(Opt::Speed, 2),
+            false,
+            false,
+            [0.0, 0.0],
+        );
+        assert!(!state.paused);
+        assert_eq!(state.settings.speed, Speed::Slow);
+    }
+
+    #[test]
+    fn reset_needs_a_second_click() {
+        let mut state = menu_state();
+        state.settings.fill = false;
+        state.ui_scale = 1.4;
+        assert!(on_press(&mut state, HitKind::ResetSettings, false, false, [0.0, 0.0]).is_empty());
+        assert!(!state.settings.fill);
+        on_press(&mut state, HitKind::ResetSettings, false, false, [0.0, 0.0]);
+        assert_eq!(state.settings, Settings::default());
+        assert!((state.ui_scale - 1.0).abs() < 0.001);
     }
 
     #[test]

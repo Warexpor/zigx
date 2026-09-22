@@ -3,11 +3,12 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::model::{Disk, Gpu, Net, Proc, Snap, HIST_CAP, SAMPLE_PERIOD_MS};
+use crate::model::{Disk, Gpu, Net, Proc, Snap, HIST_CAP};
 
 const PF_KTHREAD: u64 = 0x00200000;
 /// Gap between the priming read and the first real sample.
@@ -15,30 +16,70 @@ const PRIME_MS: u64 = 250;
 /// Shortest delta a rate is computed over; guards against divide-by-tiny.
 const MIN_DT_SECS: f64 = 0.2;
 
+/// Longest sleep between checks for a period change or pause.
+const POLL_MS: u64 = 50;
+
 pub struct Hub {
     snap: Arc<Mutex<Arc<Snap>>>,
+    /// Sampling period in ms; 0 halts sampling.
+    period: Arc<AtomicU64>,
 }
 
 impl Hub {
     pub fn load(&self) -> Arc<Snap> {
         self.snap.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    /// Change the sampling period, or pause with 0. Takes effect within
+    /// `POLL_MS`, without waiting out the old period.
+    pub fn set_period(&self, ms: u64) {
+        self.period.store(ms, Ordering::Relaxed);
+    }
 }
 
-pub fn spawn(wake: impl Fn() + Send + 'static) -> Hub {
+pub fn spawn(period_ms: u64, wake: impl Fn() + Send + 'static) -> Hub {
     let snap = Arc::new(Mutex::new(Arc::new(Snap::placeholder())));
     let slot = Arc::clone(&snap);
-    let hub = Hub { snap };
+    let period = Arc::new(AtomicU64::new(period_ms));
+    let shared = Arc::clone(&period);
+    let hub = Hub { snap, period };
     thread::Builder::new()
         .name("zigx-sample".into())
         .spawn(move || {
             let mut engine = Engine::new();
-            let period = Duration::from_millis(SAMPLE_PERIOD_MS);
-            // Deadline clock: ticks stay on a fixed 1 s grid instead of drifting
-            // by the sample cost. The first deadline is short so real numbers
+            let mut ms = shared.load(Ordering::Relaxed);
+            // Deadline clock: ticks stay on a fixed grid instead of drifting by
+            // the sample cost. The first deadline is short so real numbers
             // replace the priming zeros quickly.
             let mut next = Instant::now() + Duration::from_millis(PRIME_MS);
             loop {
+                loop {
+                    let want = shared.load(Ordering::Relaxed);
+                    let now = Instant::now();
+                    if want != ms {
+                        if ms == 0 {
+                            // Resume: prime again so no rate spans the pause.
+                            engine.reprime();
+                            next = now;
+                        } else if want != 0 {
+                            next = next
+                                .checked_sub(Duration::from_millis(ms))
+                                .map_or(now, |last| last + Duration::from_millis(want))
+                                .max(now);
+                        }
+                        ms = want;
+                    }
+                    if ms != 0 && now >= next {
+                        break;
+                    }
+                    let wait = if ms == 0 {
+                        Duration::from_millis(POLL_MS)
+                    } else {
+                        (next - now).min(Duration::from_millis(POLL_MS))
+                    };
+                    thread::sleep(wait);
+                }
+                let priming = !engine.primed;
                 let snap = engine.tick();
                 {
                     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -46,12 +87,16 @@ pub fn spawn(wake: impl Fn() + Send + 'static) -> Hub {
                 }
                 wake();
                 let now = Instant::now();
-                if next <= now {
-                    // Fell behind (suspend, stall): re-anchor instead of bursting.
-                    next = now + period;
+                let period = Duration::from_millis(ms);
+                if priming {
+                    next = now + Duration::from_millis(PRIME_MS);
+                } else {
+                    next += period;
+                    if next <= now {
+                        // Fell behind (suspend, stall): re-anchor instead of bursting.
+                        next = now + period;
+                    }
                 }
-                thread::sleep(next - now);
-                next += period;
             }
         })
         .expect("sampler thread");
@@ -136,6 +181,12 @@ impl Engine {
             bytes: Vec::new(),
             path: PathBuf::new(),
         }
+    }
+
+    /// Treat the next tick as a first read: counters are refreshed but no
+    /// rate or history sample is produced from the gap before it.
+    pub fn reprime(&mut self) {
+        self.primed = false;
     }
 
     pub fn tick(&mut self) -> Snap {
@@ -1259,5 +1310,39 @@ mod tests {
             "NVML is installed but no GPU was reported"
         );
         assert!(snap.gpus[0].mem_total > 0);
+    }
+
+    #[test]
+    fn hub_pauses_and_resumes_sampling() {
+        use std::sync::atomic::AtomicUsize;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ticks);
+        let hub = spawn(100, move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        // Debug builds sample slowly under a parallel test run: wait, don't count.
+        let wait_for = |what: &str, ok: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !ok() {
+                assert!(Instant::now() < until, "timed out: {what}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_for("samples while live", &|| ticks.load(Ordering::Relaxed) >= 3);
+        hub.set_period(0);
+        // Let a tick already in flight land.
+        thread::sleep(Duration::from_millis(500));
+        let held = ticks.load(Ordering::Relaxed);
+        let seq = hub.load().hist_seq;
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            ticks.load(Ordering::Relaxed),
+            held,
+            "no samples while paused"
+        );
+        hub.set_period(100);
+        wait_for("history advances after resume", &|| {
+            hub.load().hist_seq > seq && ticks.load(Ordering::Relaxed) > held + 1
+        });
     }
 }

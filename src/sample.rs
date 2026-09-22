@@ -412,6 +412,7 @@ impl Engine {
                 write_bps,
                 threads: stat.threads.max(1),
                 is_user: uid == self.uid,
+                stopped: stat.stopped,
             });
         }
         self.prev_proc.retain(|pid, _| seen.contains(pid));
@@ -656,6 +657,7 @@ struct GpuRaw {
 
 struct ParsedStat {
     comm: String,
+    stopped: bool,
     flags: u64,
     utime: u64,
     stime: u64,
@@ -780,6 +782,7 @@ fn parse_proc_stat(s: &str) -> Option<ParsedStat> {
     let num = |i: usize| rest.get(i)?.parse::<u64>().ok();
     Some(ParsedStat {
         comm,
+        stopped: rest.first() == Some(&"T"),
         flags: num(6)?,
         utime: num(11)?,
         stime: num(12)?,

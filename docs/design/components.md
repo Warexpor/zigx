@@ -43,7 +43,8 @@ Typing anywhere on the Processes page starts a search. `Ctrl+F` focuses it,
 
 ## End task
 
-A ghost pill whose label follows the selection. With nothing selected it is
+A ghost pill whose label follows the selection; the context menu offers the
+same action without the confirm step. With nothing selected it is
 disabled and reads "End task". The first press, or `Delete`, arms it for 4
 seconds: it switches to the danger style and reads "Confirm N". A second press,
 or `Enter`, sends SIGTERM. Changing the selection disarms it.
@@ -103,18 +104,52 @@ is a sort target with 4 px of extra hit area above and below.
 
 ## Toast
 
-`toast()`. A floating notice centered at the bottom of the main area, 60 above
-the edge. It is 38 high and fully rounded, with a `TOAST` fill, `GHOST_LINE`
-outline, and a `BODY` label.
+`toast()`. A status notice centered at the bottom of the main area, 60 above
+the edge: 38 high, fully rounded, `TOAST` fill, `GHOST_LINE` outline, `BODY`
+label. It reports results (signals sent, copies, errors) and carries no
+actions. It draws on the overlay layer so rows never show through it.
 
-When the action can be reverted, it also holds an `ACCENT` "Undo" pill, 62 x 24,
-at its right end.
-
-| Action | Duration |
+| Notice | Duration |
 | --- | --- |
-| End task result | 4 s |
-| Startup toggle (with Undo) | 10 s |
-| Errors | 6 s |
+| Signal result | 4 s |
+| Copied, opening a folder | 3 s |
+| Errors | 4 to 6 s |
+
+## Context menu
+
+`context_menu()`. Right-clicking a process row opens a floating panel at the
+pointer on the overlay layer.
+
+- **Target.** A row outside the selection becomes the selection first. The
+  menu acts on the selection as it was when the menu opened.
+- **Panel.** Radius 10, `MENU` fill, `GHOST_LINE` outline, 6 padding, 200 to
+  320 wide from its longest label. It opens down and right of the pointer and
+  flips at the window edges with an 8 margin.
+- **Header.** 44 high: the process name (`BODY` / `INK`) over "PID n" or
+  "Selection" (`MICRO_NUM` / `INK_4`), closed by a full-width hairline with a
+  5 gap before the first item so its highlight clears the rule.
+- **Items.** 30 high, radius 6, `BODY` label 10 in, optional right-aligned
+  `MICRO_NUM` hint in `INK_4` naming the signal. At rest the label is `INK_2`;
+  hover or keyboard focus gives a `HOVER` fill and `INK`.
+- **Groups**, split by inset hairlines:
+  - End task (SIGTERM) and Force kill (SIGKILL).
+  - Suspend (SIGSTOP) and Resume (SIGCONT), each shown only when some target
+    can use it.
+  - Open file location and Copy command line (single process only), then Copy
+    PID or PIDs.
+- **Force kill.** The label is `DANGER_INK` on hover. The first click arms it:
+  a `DANGER_LINE` outline and "Click again to force kill". The second click
+  sends the signal.
+- **Modal hover.** While the menu is open nothing beneath it shows hover.
+- **Dismissal.** Any click outside, `Esc`, the wheel, a right-click off a row,
+  or leaving the page closes it without acting. The menu also closes by itself
+  if every target process exits.
+- **Keyboard.** Up and Down move focus, wrapping; `Enter` activates.
+- **Motion.** It fades in and settles 4 px downward over 140 ms with an
+  ease-out cubic.
+
+Suspended processes show a `MICRO` "suspended" tag after their name in
+`INK_4`, and their name drops to `INK_3`.
 
 ## Graph
 

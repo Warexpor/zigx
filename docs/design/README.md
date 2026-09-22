@@ -9,7 +9,7 @@ these documents the contract for changing it.
 | --- | --- |
 | [Foundations](foundations.md) | Color, type, shape, iconography |
 | [Layout](layout.md) | Window shell, pages, measurements, scaling |
-| [Components](components.md) | Pills, segmented control, search, rows, switches, toast |
+| [Components](components.md) | Pills, segmented control, search, rows, switches, toast, context menu |
 | [Motion and graphics](motion.md) | Data cadence, graph playback, curves, easing, rendering |
 
 ## Principles

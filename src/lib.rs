@@ -12,12 +12,14 @@ mod persist;
 mod sample;
 mod startup;
 
-pub use frame::{build, hit_at, DrawList, Hit, HitKind, Rect};
+pub use frame::{
+    animating, build, hit_at, DrawList, Hit, HitKind, Label, Layer, Rect, Slab, Stroke,
+};
 pub use interact::{
-    clear_selection, expire, note_drag_origin, on_key, on_move, on_press, on_release, on_wheel,
-    terminate, Effect, KeyIn,
+    clear_selection, close_menu, expire, note_drag_origin, on_key, on_move, on_press, on_release,
+    on_wheel, open_menu, send_signal, Effect, KeyIn, Sig,
 };
 pub use model::*;
 pub use persist::{load_ui, save_ui};
 pub use sample::{spawn, Hub};
-pub use startup::{load_startup, restore_startup, write_enabled};
+pub use startup::{load_startup, write_enabled};

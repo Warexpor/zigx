@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 use wgpu::*;
 use winit::window::Window;
 
-use zigx::DrawList;
+use zigx::{DrawList, Label};
 
 const SHAPE: &str = r#"
 struct Globals {
@@ -187,6 +187,22 @@ struct Vert {
     axis: [f32; 2],
 }
 
+struct TextLayer {
+    renderer: TextRenderer,
+    buffers: Vec<Buffer>,
+    keys: Vec<(String, u32, bool, u16, i32)>,
+}
+
+impl TextLayer {
+    fn new(atlas: &mut TextAtlas, device: &Device) -> Self {
+        Self {
+            renderer: TextRenderer::new(atlas, device, MultisampleState::default(), None),
+            buffers: Vec::new(),
+            keys: Vec::new(),
+        }
+    }
+}
+
 struct Prepared {
     index: usize,
     left: f32,
@@ -210,14 +226,14 @@ pub struct Gfx {
     vertex_cap: usize,
     instance_cpu: Vec<ShapeInstance>,
     vertex_cpu: Vec<Vert>,
+    /// Per draw layer: end of its shape instances and stroke vertices.
+    layer_ends: [(u32, u32); 2],
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
-    text_renderer: TextRenderer,
-    buffers: Vec<Buffer>,
-    buffer_keys: Vec<(String, u32, bool, u16, i32)>,
-    prepared: Vec<Prepared>,
+    /// One text batch per draw layer, so overlay text sits above base shapes.
+    text: [TextLayer; 2],
     fonts: Fonts,
     logged_text_error: bool,
 }
@@ -351,8 +367,10 @@ impl Gfx {
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text_renderer =
-            TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
+        let text = [
+            TextLayer::new(&mut atlas, &device),
+            TextLayer::new(&mut atlas, &device),
+        ];
 
         Self {
             surface,
@@ -369,14 +387,12 @@ impl Gfx {
             vertex_cap,
             instance_cpu: Vec::new(),
             vertex_cpu: Vec::new(),
+            layer_ends: [(0, 0); 2],
             font_system,
             swash_cache,
             viewport,
             atlas,
-            text_renderer,
-            buffers: Vec::new(),
-            buffer_keys: Vec::new(),
-            prepared: Vec::new(),
+            text,
             fonts,
             logged_text_error: false,
         }
@@ -400,9 +416,24 @@ impl Gfx {
                 pad: [0.0, 0.0],
             }),
         );
-        self.upload_shapes(draw, scale);
-        self.upload_strokes(draw, scale);
-        self.prepare_text(draw, scale);
+        self.instance_cpu.clear();
+        self.vertex_cpu.clear();
+        for (i, layer) in draw.layers.iter().enumerate() {
+            self.push_shapes(&layer.slabs, scale);
+            self.push_strokes(&layer.strokes, scale);
+            self.layer_ends[i] = (self.instance_cpu.len() as u32, self.vertex_cpu.len() as u32);
+        }
+        self.upload_geometry();
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.config.width,
+                height: self.config.height,
+            },
+        );
+        for (i, layer) in draw.layers.iter().enumerate() {
+            self.prepare_text(i, &layer.labels, scale);
+        }
 
         let frame = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => frame,
@@ -421,9 +452,8 @@ impl Gfx {
         let bind_group = &self.bind_group;
         let instance_buf = &self.instance_buf;
         let vertex_buf = &self.vertex_buf;
-        let n_inst = self.instance_cpu.len() as u32;
-        let n_vert = self.vertex_cpu.len() as u32;
-        let text_renderer = &self.text_renderer;
+        let layer_ends = self.layer_ends;
+        let text = &self.text;
         let atlas = &self.atlas;
         let viewport = &self.viewport;
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
@@ -447,19 +477,25 @@ impl Gfx {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_bind_group(0, bind_group, &[]);
-            if n_inst > 0 {
-                pass.set_pipeline(shape_pipeline);
-                pass.set_vertex_buffer(0, instance_buf.slice(..));
-                pass.draw(0..6, 0..n_inst);
-            }
-            if n_vert > 0 {
-                pass.set_pipeline(stroke_pipeline);
-                pass.set_vertex_buffer(0, vertex_buf.slice(..));
-                pass.draw(0..n_vert, 0..1);
-            }
-            if let Err(err) = text_renderer.render(atlas, viewport, &mut pass) {
-                text_err = Some(err);
+            let mut start = (0u32, 0u32);
+            for (i, &(inst_end, vert_end)) in layer_ends.iter().enumerate() {
+                // Text rendering binds glyphon's atlas at group 0; restore ours
+                // before every layer's geometry.
+                pass.set_bind_group(0, bind_group, &[]);
+                if inst_end > start.0 {
+                    pass.set_pipeline(shape_pipeline);
+                    pass.set_vertex_buffer(0, instance_buf.slice(..));
+                    pass.draw(0..6, start.0..inst_end);
+                }
+                if vert_end > start.1 {
+                    pass.set_pipeline(stroke_pipeline);
+                    pass.set_vertex_buffer(0, vertex_buf.slice(..));
+                    pass.draw(start.1..vert_end, 0..1);
+                }
+                if let Err(err) = text[i].renderer.render(atlas, viewport, &mut pass) {
+                    text_err = Some(err);
+                }
+                start = (inst_end, vert_end);
             }
         }
         if let Some(err) = text_err {
@@ -474,9 +510,8 @@ impl Gfx {
         self.atlas.trim();
     }
 
-    fn upload_shapes(&mut self, draw: &DrawList, scale: f32) {
-        self.instance_cpu.clear();
-        for s in &draw.slabs {
+    fn push_shapes(&mut self, slabs: &[zigx::Slab], scale: f32) {
+        for s in slabs {
             self.instance_cpu.push(ShapeInstance {
                 rect: [s.x * scale, s.y * scale, s.w * scale, s.h * scale],
                 fill: straight(s.fill),
@@ -489,19 +524,10 @@ impl Gfx {
                 ],
             });
         }
-        self.ensure_instances(self.instance_cpu.len());
-        if !self.instance_cpu.is_empty() {
-            self.queue.write_buffer(
-                &self.instance_buf,
-                0,
-                bytemuck::cast_slice(&self.instance_cpu),
-            );
-        }
     }
 
-    fn upload_strokes(&mut self, draw: &DrawList, scale: f32) {
-        self.vertex_cpu.clear();
-        for stroke in &draw.strokes {
+    fn push_strokes(&mut self, strokes: &[zigx::Stroke], scale: f32) {
+        for stroke in strokes {
             let pts: Vec<[f32; 2]> = stroke
                 .pts
                 .iter()
@@ -520,6 +546,17 @@ impl Gfx {
                 stroke.round,
                 color,
                 &mut self.vertex_cpu,
+            );
+        }
+    }
+
+    fn upload_geometry(&mut self) {
+        self.ensure_instances(self.instance_cpu.len());
+        if !self.instance_cpu.is_empty() {
+            self.queue.write_buffer(
+                &self.instance_buf,
+                0,
+                bytemuck::cast_slice(&self.instance_cpu),
             );
         }
         self.ensure_verts(self.vertex_cpu.len());
@@ -555,32 +592,43 @@ impl Gfx {
         });
     }
 
-    fn prepare_text(&mut self, draw: &DrawList, scale: f32) {
-        let n = draw.labels.len();
-        while self.buffers.len() < n {
-            let mut buf = Buffer::new(&mut self.font_system, Metrics::new(14.0, 18.0));
+    fn prepare_text(&mut self, layer: usize, labels: &[Label], scale: f32) {
+        let Gfx {
+            font_system,
+            swash_cache,
+            viewport,
+            atlas,
+            device,
+            queue,
+            fonts,
+            text,
+            ..
+        } = &mut *self;
+        let tl = &mut text[layer];
+        let n = labels.len();
+        while tl.buffers.len() < n {
+            let mut buf = Buffer::new(font_system, Metrics::new(14.0, 18.0));
             buf.set_wrap(Wrap::None);
-            self.buffers.push(buf);
-            self.buffer_keys.push((String::new(), 0, false, 400, 0));
+            tl.buffers.push(buf);
+            tl.keys.push((String::new(), 0, false, 400, 0));
         }
-        self.buffers.truncate(n);
-        self.buffer_keys.truncate(n);
-        self.prepared.clear();
-        let mut dirty = vec![false; n];
-        for (i, label) in draw.labels.iter().enumerate() {
+        tl.buffers.truncate(n);
+        tl.keys.truncate(n);
+        let mut prepared = Vec::with_capacity(n);
+        for (i, label) in labels.iter().enumerate() {
             let size_px = (label.size * scale).max(1.0);
             let size_key = (size_px * 10.0).round() as u32;
             let track_key = (label.tracking * 1000.0).round() as i32;
-            let changed = self.buffer_keys[i].0 != label.text
-                || self.buffer_keys[i].1 != size_key
-                || self.buffer_keys[i].2 != label.mono
-                || self.buffer_keys[i].3 != label.weight
-                || self.buffer_keys[i].4 != track_key;
+            let changed = tl.keys[i].0 != label.text
+                || tl.keys[i].1 != size_key
+                || tl.keys[i].2 != label.mono
+                || tl.keys[i].3 != label.weight
+                || tl.keys[i].4 != track_key;
             if changed {
                 let weight = if label.mono {
-                    self.fonts.mono.snap(label.weight)
+                    fonts.mono.snap(label.weight)
                 } else {
-                    self.fonts.sans.snap(label.weight)
+                    fonts.sans.snap(label.weight)
                 };
                 let mut attrs = if label.mono {
                     Attrs::new().family(Family::Monospace)
@@ -591,21 +639,21 @@ impl Gfx {
                 if label.tracking != 0.0 {
                     attrs = attrs.letter_spacing(label.tracking);
                 }
-                let buf = &mut self.buffers[i];
+                let buf = &mut tl.buffers[i];
                 buf.set_metrics(Metrics::new(size_px, (label.h * scale).max(size_px)));
                 buf.set_size(
                     Some((label.w * scale).max(1.0)),
                     Some((label.h * scale).max(1.0)),
                 );
                 buf.set_text(&label.text, &attrs, Shaping::Advanced, None);
-                self.buffer_keys[i] = (
+                buf.shape_until_scroll(font_system, false);
+                tl.keys[i] = (
                     label.text.clone(),
                     size_key,
                     label.mono,
                     label.weight,
                     track_key,
                 );
-                dirty[i] = true;
             }
             let x = (label.x * scale).round();
             let y = (label.y * scale).round();
@@ -628,7 +676,7 @@ impl Gfx {
                     continue;
                 }
             }
-            self.prepared.push(Prepared {
+            prepared.push(Prepared {
                 index: i,
                 left: x,
                 top: y,
@@ -641,66 +689,32 @@ impl Gfx {
                 ),
             });
         }
-        {
-            let Gfx {
-                buffers,
-                font_system,
-                ..
-            } = &mut *self;
-            for (i, buf) in buffers.iter_mut().enumerate() {
-                if dirty.get(i).copied().unwrap_or(false) {
-                    buf.shape_until_scroll(font_system, false);
-                }
-            }
-        }
-        self.viewport.update(
-            &self.queue,
-            Resolution {
-                width: self.config.width,
-                height: self.config.height,
-            },
-        );
-        let prepared = std::mem::take(&mut self.prepared);
-        {
-            let Gfx {
-                buffers,
-                text_renderer,
-                font_system,
-                atlas,
-                viewport,
-                device,
-                queue,
-                swash_cache,
-                ..
-            } = &mut *self;
-            let empty: &[glyphon::CustomGlyph] = &[];
-            let areas: Vec<TextArea> = prepared
-                .iter()
-                .filter_map(|p| {
-                    Some(TextArea {
-                        buffer: buffers.get(p.index)?,
-                        left: p.left,
-                        top: p.top,
-                        scale: 1.0,
-                        bounds: p.bounds,
-                        default_color: p.color,
-                        custom_glyphs: empty,
-                    })
+        let empty: &[glyphon::CustomGlyph] = &[];
+        let areas: Vec<TextArea> = prepared
+            .iter()
+            .filter_map(|p| {
+                Some(TextArea {
+                    buffer: tl.buffers.get(p.index)?,
+                    left: p.left,
+                    top: p.top,
+                    scale: 1.0,
+                    bounds: p.bounds,
+                    default_color: p.color,
+                    custom_glyphs: empty,
                 })
-                .collect();
-            if let Err(err) = text_renderer.prepare(
-                device,
-                queue,
-                font_system,
-                atlas,
-                viewport,
-                areas,
-                swash_cache,
-            ) {
-                eprintln!("zigx text prepare: {err}");
-            }
+            })
+            .collect();
+        if let Err(err) = tl.renderer.prepare(
+            device,
+            queue,
+            font_system,
+            atlas,
+            viewport,
+            areas,
+            swash_cache,
+        ) {
+            eprintln!("zigx text prepare: {err}");
         }
-        self.prepared = prepared;
     }
 }
 

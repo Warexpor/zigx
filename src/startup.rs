@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::model::{Revert, StartupEntry};
+use crate::model::StartupEntry;
 use crate::persist::atomic_write;
 
 pub fn autostart_dir() -> PathBuf {
@@ -126,7 +126,7 @@ fn user_path_for(path: &Path) -> io::Result<PathBuf> {
 /// Flip an entry. Existing user files are edited in place with a one-time
 /// `.bak`. Entries that only exist system-wide get a user override created,
 /// seeded from the system file so the override stays readable on its own.
-pub fn write_enabled(path: &Path, system_path: Option<&Path>, enable: bool) -> io::Result<Revert> {
+pub fn write_enabled(path: &Path, system_path: Option<&Path>, enable: bool) -> io::Result<()> {
     let target = user_path_for(path)?;
     let previous = match fs::read_to_string(&target) {
         Ok(text) => Some(text),
@@ -152,23 +152,7 @@ pub fn write_enabled(path: &Path, system_path: Option<&Path>, enable: bool) -> i
     if enable {
         next = set_key(&next, "X-GNOME-Autostart-enabled", "true");
     }
-    atomic_write(&target, &next)?;
-    Ok(Revert {
-        path: target,
-        previous,
-    })
-}
-
-pub fn restore_startup(revert: &Revert) -> io::Result<()> {
-    let target = user_path_for(&revert.path)?;
-    match &revert.previous {
-        Some(text) => atomic_write(&target, text),
-        None => match fs::remove_file(&target) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        },
-    }
+    atomic_write(&target, &next)
 }
 
 struct DesktopFields {
@@ -307,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn user_mask_overrides_system_entry_and_undo_removes_created_file() {
+    fn user_mask_overrides_system_entry() {
         let root = std::env::temp_dir().join(format!("zigx-startup-{}", std::process::id()));
         let sys = root.join("sys").join("autostart");
         let usr = root.join("home").join("autostart");
@@ -340,14 +324,10 @@ mod tests {
         assert!(a.system_path.is_some());
         assert!(!a.path.exists());
 
-        let revert = write_enabled(&a.path, a.system_path.as_deref(), false).unwrap();
+        write_enabled(&a.path, a.system_path.as_deref(), false).unwrap();
         assert!(a.path.exists());
-        assert!(revert.previous.is_none());
         let reloaded = load_startup();
         assert!(!reloaded.iter().find(|e| e.name == "Alpha").unwrap().enabled);
-
-        restore_startup(&revert).unwrap();
-        assert!(!a.path.exists(), "undo removes the file we created");
         let _ = fs::remove_dir_all(&root);
     }
 }

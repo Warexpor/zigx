@@ -27,13 +27,14 @@ alpha out of 255.
 | `GHOST_LINE` | ink at 66 (26%) | Pill, segmented control, and off-switch outlines |
 | `HOVER` | ink at 16 (6%) | Hover fill for rows, side items, window controls |
 | `SELECTED` | ink at 30 (12%) | Selected process rows |
-| `TOAST` | black at 230 (90%) | Floating notice body |
+| `TOAST` | black at 230 (90%) | Notice toast |
+| `MENU` | black at 250 (98%) | Context menu, which sits over dense rows |
 
 ### Accent
 
 | Token | Value | Use |
 | --- | --- | --- |
-| `ACCENT` | white, opaque | The one filled element: active segment, Undo, on switch |
+| `ACCENT` | white, opaque | The one filled element: active segment, on switch |
 | `ON_ACCENT` | black, opaque | Text and knob on `ACCENT` |
 | `ACCENT_LINE` | ink at 140 (55%) | Hovered pill and focused search outline |
 
@@ -43,8 +44,8 @@ alpha out of 255.
 | --- | --- | --- |
 | `WARN` | `#F5A623` | Load at or above 70% |
 | `HOT` | `#FF5C5C` | Load at or above 90% |
-| `DANGER_LINE` | `#FF5C5C` at 150 (59%) | Armed End task outline |
-| `DANGER_INK` | `#FF8A8A` | Armed End task label, hovered close glyph |
+| `DANGER_LINE` | `#FF5C5C` at 150 (59%) | Armed End task outline, armed Force kill item |
+| `DANGER_INK` | `#FF8A8A` | Armed End task label, Force kill item, hovered close glyph |
 
 Load coloring goes through `heat()` in `src/frame.rs`: below 70 is the normal
 ink for that element, 70 is `WARN`, 90 is `HOT`. Idle process cells (CPU and

@@ -1,5 +1,7 @@
 mod gfx;
 
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -104,32 +106,93 @@ impl App {
                         let _ = window.drag_window();
                     }
                 }
-                Effect::Kill(pids) => {
-                    let asked = pids.len();
-                    let n = terminate(&pids);
-                    let label = match (n, asked) {
-                        (0, _) => "Could not signal the selected process".to_string(),
-                        (1, 1) => "SIGTERM sent".to_string(),
-                        (n, asked) if n == asked => format!("SIGTERM sent to {n} processes"),
-                        (n, asked) => format!("SIGTERM sent to {n} of {asked} processes"),
-                    };
-                    // Dead PIDs can be recycled; do not leave them armed.
-                    self.state.selected.clear();
-                    self.state.pinned.clear();
-                    self.state.anchor = None;
-                    self.state.undo = Some(Undo {
-                        until: Instant::now() + Duration::from_secs(4),
-                        label,
-                        revert: None,
-                    });
+                Effect::Signal(pids, sig) => self.signal(&pids, sig),
+                Effect::OpenLocation(pid) => self.open_location(pid),
+                Effect::Copy(text) => {
+                    let what = if text.contains(' ') { "PIDs" } else { "PID" };
+                    self.copy(&text, what);
                 }
+                Effect::CopyCommand(pid) => match read_cmdline(pid) {
+                    Some(cmd) => self.copy(&cmd, "command line"),
+                    None => self.notify("Command line is not readable", 4),
+                },
                 Effect::FlipStartup(index) => self.flip_startup(index),
-                Effect::UndoStartup => self.undo_startup(),
                 Effect::Persist => {
                     let _ = save_ui(&self.state);
                 }
             }
         }
+    }
+
+    fn notify(&mut self, label: impl Into<String>, secs: u64) {
+        self.state.notice = Some(Notice {
+            until: Instant::now() + Duration::from_secs(secs),
+            label: label.into(),
+        });
+    }
+
+    fn signal(&mut self, pids: &[i32], sig: Sig) {
+        let asked = pids.len();
+        let n = send_signal(pids, sig);
+        let (name, verb) = match sig {
+            Sig::Term => ("SIGTERM", "sent"),
+            Sig::Kill => ("SIGKILL", "sent"),
+            Sig::Stop => ("Suspend", "requested"),
+            Sig::Cont => ("Resume", "requested"),
+        };
+        let label = match (n, asked) {
+            (0, _) => "Could not signal the selected process".to_string(),
+            (1, 1) => format!("{name} {verb}"),
+            (n, asked) if n == asked => format!("{name} {verb} for {n} processes"),
+            (n, asked) => format!("{name} {verb} for {n} of {asked} processes"),
+        };
+        if matches!(sig, Sig::Term | Sig::Kill) {
+            // Dead PIDs can be recycled; do not leave them armed.
+            self.state.selected.clear();
+            self.state.pinned.clear();
+            self.state.anchor = None;
+        }
+        self.notify(label, 4);
+    }
+
+    fn open_location(&mut self, pid: i32) {
+        let dir = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
+        let Some(dir) = dir else {
+            self.notify("Executable path is not readable", 4);
+            return;
+        };
+        match spawn_detached(Command::new("xdg-open").arg(&dir)) {
+            Ok(()) => self.notify(format!("Opening {}", dir.display()), 3),
+            Err(_) => self.notify("xdg-open is not available", 4),
+        }
+    }
+
+    fn copy(&mut self, text: &str, what: &str) {
+        let tools: [(&str, &[&str]); 3] = [
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        for (bin, args) in tools {
+            let child = Command::new(bin)
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let Ok(mut child) = child else { continue };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            self.notify(format!("Copied {what}"), 3);
+            return;
+        }
+        self.notify("No clipboard tool found (install wl-clipboard)", 5);
     }
 
     fn flip_startup(&mut self, index: usize) {
@@ -140,39 +203,10 @@ impl App {
         let name = entry.name.clone();
         let path = entry.path.clone();
         let system_path = entry.system_path.clone();
-        match write_enabled(&path, system_path.as_deref(), enable) {
-            Ok(revert) => {
-                self.state.undo = Some(Undo {
-                    until: Instant::now() + Duration::from_secs(10),
-                    label: format!("{name} {}", if enable { "on" } else { "off" }),
-                    revert: Some(revert),
-                });
-                self.startup = load_startup();
-            }
-            Err(err) => {
-                self.state.undo = Some(Undo {
-                    until: Instant::now() + Duration::from_secs(6),
-                    label: format!("Could not update {name}: {err}"),
-                    revert: None,
-                });
-            }
+        if let Err(err) = write_enabled(&path, system_path.as_deref(), enable) {
+            self.notify(format!("Could not update {name}: {err}"), 6);
         }
-    }
-
-    fn undo_startup(&mut self) {
-        let Some(undo) = self.state.undo.take() else {
-            return;
-        };
-        if let Some(revert) = undo.revert {
-            if let Err(err) = restore_startup(&revert) {
-                self.state.undo = Some(Undo {
-                    until: Instant::now() + Duration::from_secs(6),
-                    label: format!("Undo failed: {err}"),
-                    revert: None,
-                });
-            }
-            self.startup = load_startup();
-        }
+        self.startup = load_startup();
     }
 
     fn pointer(&self, window: &Window, x: f64, y: f64) -> [f32; 2] {
@@ -227,8 +261,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.page == Page::Performance {
-            // Keep the chart phase and EMA readouts advancing at display rate.
+        if self.state.page == Page::Performance || animating(&self.state) {
+            // Keep graph playback and transitions advancing at display rate.
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
@@ -257,7 +291,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     (_, Some(HitKind::DragNav | HitKind::DragSub)) => CursorIcon::EwResize,
                     (_, Some(HitKind::Search)) => CursorIcon::Text,
-                    (_, Some(HitKind::DragWindow)) => CursorIcon::Default,
+                    (_, Some(HitKind::DragWindow | HitKind::MenuPanel)) => CursorIcon::Default,
                     (_, Some(_)) => CursorIcon::Pointer,
                     (_, None) => CursorIcon::Default,
                 };
@@ -271,6 +305,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Right {
+                    if state == ElementState::Pressed {
+                        match hit_at(&self.hits, self.mouse[0], self.mouse[1]) {
+                            Some(HitKind::Proc { pid }) if self.state.page == Page::Processes => {
+                                open_menu(&mut self.state, pid, self.mouse);
+                            }
+                            _ => close_menu(&mut self.state),
+                        }
+                        self.redraw();
+                    }
+                    return;
+                }
                 if button != MouseButton::Left {
                     return;
                 }
@@ -285,6 +331,8 @@ impl ApplicationHandler<UserEvent> for App {
                         );
                         note_drag_origin(&mut self.state, self.mouse[0], self.mouse[1]);
                         self.apply(effects, event_loop);
+                    } else if self.state.menu.is_some() {
+                        close_menu(&mut self.state);
                     } else {
                         self.state.search_focused = false;
                         // Empty chrome (no hit target) clears a process selection.
@@ -338,9 +386,35 @@ fn map_key(key: Key) -> Option<KeyIn> {
         Key::Named(NamedKey::Enter) => KeyIn::Enter,
         Key::Named(NamedKey::PageUp) => KeyIn::PageUp,
         Key::Named(NamedKey::PageDown) => KeyIn::PageDown,
+        Key::Named(NamedKey::ArrowUp) => KeyIn::Up,
+        Key::Named(NamedKey::ArrowDown) => KeyIn::Down,
         Key::Character(s) => KeyIn::Char(s.chars().next()?),
         _ => return None,
     })
+}
+
+/// Run a helper without blocking the UI, and reap it so it never lingers as a zombie.
+fn spawn_detached(cmd: &mut Command) -> std::io::Result<()> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// `/proc/<pid>/cmdline` with NUL separators turned into spaces.
+fn read_cmdline(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let parts: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn main() {

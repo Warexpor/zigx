@@ -5,7 +5,7 @@ use crate::format::{
 };
 use crate::interact::selection_label;
 use crate::model::{
-    io_scale, theme, AppState, Col, Density, Page, Proc, ProcView, Section, Snap, Sort,
+    io_scale, theme, AppState, Col, Density, MenuAction, Page, Proc, ProcView, Section, Snap, Sort,
     StartupEntry, HIST_WINDOW,
 };
 
@@ -93,7 +93,6 @@ pub enum HitKind {
     Sort(Col),
     Search,
     EndTask,
-    Undo,
     Group(bool),
     Proc {
         pid: i32,
@@ -104,6 +103,9 @@ pub enum HitKind {
     Startup(usize),
     DragNav,
     DragSub,
+    MenuItem(crate::model::MenuAction),
+    /// Menu body outside any item: swallows the click.
+    MenuPanel,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -162,15 +164,28 @@ fn measure(s: &str, t: Type) -> f32 {
     text_width_t(s, t.size, t.mono, t.tracking)
 }
 
-pub struct DrawList {
+/// One paint layer. The renderer draws each layer's shapes, strokes, and
+/// text before the next layer, so overlays fully cover what is under them.
+#[derive(Default)]
+pub struct Layer {
     pub slabs: Vec<Slab>,
     pub strokes: Vec<Stroke>,
     pub labels: Vec<Label>,
+}
+
+const BASE: usize = 0;
+const OVERLAY: usize = 1;
+
+pub struct DrawList {
+    pub layers: [Layer; 2],
     pub hits: Vec<Hit>,
     pub list_rect: Option<Rect>,
     pub detail_rect: Option<Rect>,
     pub startup_rect: Option<Rect>,
     clip: Option<Rect>,
+    layer: usize,
+    /// Alpha multiplier for everything drawn, used to fade overlays in.
+    fade: f32,
 }
 
 const NONE: theme::Rgba = [0, 0, 0, 0];
@@ -178,15 +193,19 @@ const NONE: theme::Rgba = [0, 0, 0, 0];
 impl DrawList {
     fn new() -> Self {
         Self {
-            slabs: Vec::new(),
-            strokes: Vec::new(),
-            labels: Vec::new(),
+            layers: [Layer::default(), Layer::default()],
             hits: Vec::new(),
             list_rect: None,
             detail_rect: None,
             startup_rect: None,
             clip: None,
+            layer: BASE,
+            fade: 1.0,
         }
+    }
+
+    fn ink(&self, c: theme::Rgba) -> theme::Rgba {
+        [c[0], c[1], c[2], (c[3] as f32 * self.fade).round() as u8]
     }
 
     fn visible(&self, r: Rect) -> bool {
@@ -218,7 +237,8 @@ impl DrawList {
         if r.w < 1.0 || r.h < 1.0 {
             return;
         }
-        self.slabs.push(Slab {
+        let (fill, border) = (self.ink(fill), self.ink(border));
+        self.layers[self.layer].slabs.push(Slab {
             x: r.x,
             y: r.y,
             w: r.w,
@@ -271,7 +291,8 @@ impl DrawList {
                 return;
             }
         }
-        self.strokes.push(Stroke {
+        let color = self.ink(color);
+        self.layers[self.layer].strokes.push(Stroke {
             pts: pts.to_vec(),
             width,
             color,
@@ -319,7 +340,8 @@ impl DrawList {
             Align::Center => r.x + (r.w - tw) * 0.5,
         };
         let y = r.y + (r.h - em) * 0.5 - em * 0.08;
-        self.labels.push(Label {
+        let color = self.ink(color);
+        self.layers[self.layer].labels.push(Label {
             text: fitted,
             x,
             y,
@@ -395,7 +417,7 @@ impl DrawList {
             if pts.len() < 2 {
                 continue;
             }
-            self.strokes.push(Stroke {
+            self.layers[self.layer].strokes.push(Stroke {
                 pts,
                 width: 1.25,
                 color: *color,
@@ -809,6 +831,13 @@ pub fn build(
     mouse: [f32; 2],
 ) -> DrawList {
     let mut d = DrawList::new();
+    // An open menu is modal: nothing beneath it hovers.
+    let pointer = mouse;
+    let mouse = if state.menu.is_some() {
+        [f32::NEG_INFINITY; 2]
+    } else {
+        mouse
+    };
     state.scroll_bar = None;
     if state.page == Page::Performance {
         state.perf_smooth.tick(snap);
@@ -866,7 +895,261 @@ pub fn build(
     }
 
     toast(&mut d, state, main);
+    if state.page == Page::Processes {
+        context_menu(&mut d, state, snap, Rect::new(0.0, 0.0, w, h), pointer);
+    } else {
+        state.menu = None;
+    }
     d
+}
+
+const MENU_FADE_MS: f32 = 140.0;
+const MENU_ITEM_H: f32 = 30.0;
+const MENU_PAD: f32 = 6.0;
+const MENU_HEAD_H: f32 = 44.0;
+/// Gap between the header rule and the first item, so its highlight clears it.
+const MENU_HEAD_GAP: f32 = 5.0;
+const MENU_SEP_H: f32 = 11.0;
+
+/// True while something on screen is mid-animation and needs frames.
+pub fn animating(state: &AppState) -> bool {
+    state
+        .menu
+        .as_ref()
+        .is_some_and(|m| m.opened.elapsed().as_secs_f32() * 1000.0 < MENU_FADE_MS + 20.0)
+}
+
+enum MenuRow {
+    Item {
+        action: MenuAction,
+        label: String,
+        hint: Option<&'static str>,
+        danger: bool,
+    },
+    Sep,
+}
+
+/// Right-click menu for the process list: a floating black-glass panel on the
+/// overlay layer. It fades in and settles 4 px down over `MENU_FADE_MS`.
+fn context_menu(d: &mut DrawList, state: &mut AppState, snap: &Snap, win: Rect, mouse: [f32; 2]) {
+    let Some(menu) = state.menu.as_mut() else {
+        return;
+    };
+    let procs: Vec<&Proc> = menu
+        .pids
+        .iter()
+        .filter_map(|pid| snap.procs.iter().find(|p| p.pid == *pid))
+        .collect();
+    if procs.is_empty() {
+        state.menu = None;
+        return;
+    }
+    let n = procs.len();
+    let single = n == 1;
+    let any_running = procs.iter().any(|p| !p.stopped);
+    let any_stopped = procs.iter().any(|p| p.stopped);
+
+    let mut rows = vec![
+        MenuRow::Item {
+            action: MenuAction::EndTask,
+            label: if single {
+                "End task".into()
+            } else {
+                format!("End {n} tasks")
+            },
+            hint: None,
+            danger: false,
+        },
+        MenuRow::Item {
+            action: MenuAction::ForceKill,
+            label: if menu.confirm_kill {
+                "Click again to force kill".into()
+            } else if single {
+                "Force kill".into()
+            } else {
+                format!("Force kill {n}")
+            },
+            hint: Some("SIGKILL"),
+            danger: true,
+        },
+        MenuRow::Sep,
+    ];
+    if any_running {
+        rows.push(MenuRow::Item {
+            action: MenuAction::Suspend,
+            label: "Suspend".into(),
+            hint: Some("SIGSTOP"),
+            danger: false,
+        });
+    }
+    if any_stopped {
+        rows.push(MenuRow::Item {
+            action: MenuAction::Resume,
+            label: "Resume".into(),
+            hint: Some("SIGCONT"),
+            danger: false,
+        });
+    }
+    rows.push(MenuRow::Sep);
+    if single {
+        rows.push(MenuRow::Item {
+            action: MenuAction::OpenLocation,
+            label: "Open file location".into(),
+            hint: None,
+            danger: false,
+        });
+        rows.push(MenuRow::Item {
+            action: MenuAction::CopyCommand,
+            label: "Copy command line".into(),
+            hint: None,
+            danger: false,
+        });
+    }
+    rows.push(MenuRow::Item {
+        action: MenuAction::CopyPid,
+        label: if single {
+            "Copy PID".into()
+        } else {
+            "Copy PIDs".into()
+        },
+        hint: None,
+        danger: false,
+    });
+    menu.items = rows
+        .iter()
+        .filter_map(|r| match r {
+            MenuRow::Item { action, .. } => Some(*action),
+            MenuRow::Sep => None,
+        })
+        .collect();
+    if menu.focus.is_some_and(|i| i >= menu.items.len()) {
+        menu.focus = None;
+    }
+
+    let (title, detail) = if single {
+        (procs[0].name.clone(), format!("PID {}", procs[0].pid))
+    } else {
+        (format!("{n} processes"), "Selection".to_string())
+    };
+    let label_w = rows
+        .iter()
+        .map(|r| match r {
+            MenuRow::Item { label, hint, .. } => {
+                measure(label, BODY) + hint.map_or(0.0, |h| measure(h, MICRO_NUM) + 24.0)
+            }
+            MenuRow::Sep => 0.0,
+        })
+        .fold(measure(&title, BODY), f32::max);
+    let w = (label_w + 28.0 + MENU_PAD * 2.0).clamp(200.0, 320.0);
+    let h = MENU_PAD * 2.0
+        + MENU_HEAD_H
+        + MENU_HEAD_GAP
+        + rows
+            .iter()
+            .map(|r| match r {
+                MenuRow::Item { .. } => MENU_ITEM_H,
+                MenuRow::Sep => MENU_SEP_H,
+            })
+            .sum::<f32>();
+
+    // Open down-right of the pointer; flip at the window edges.
+    let margin = 8.0;
+    let mut x = menu.x + 2.0;
+    if x + w > win.right() - margin {
+        x = menu.x - w - 2.0;
+    }
+    let mut y = menu.y + 2.0;
+    if y + h > win.bottom() - margin {
+        y = menu.y - h - 2.0;
+    }
+    let x = x.clamp(margin, (win.right() - margin - w).max(margin));
+    let y = y.clamp(margin, (win.bottom() - margin - h).max(margin));
+
+    let t = (menu.opened.elapsed().as_secs_f32() * 1000.0 / MENU_FADE_MS).clamp(0.0, 1.0);
+    let ease = 1.0 - (1.0 - t).powi(3);
+    let y = y - 4.0 * (1.0 - ease);
+    let focus = menu.focus;
+    let confirm = menu.confirm_kill;
+
+    d.layer = OVERLAY;
+    d.fade = ease;
+    let panel = Rect::new(x, y, w, h);
+    d.slab(panel, 10.0, theme::MENU, theme::GHOST_LINE, 1.0);
+    d.hit(panel, HitKind::MenuPanel);
+
+    let inner_x = x + MENU_PAD;
+    let inner_w = w - MENU_PAD * 2.0;
+    let mut cy = y + MENU_PAD;
+    d.text(
+        &title,
+        Rect::new(inner_x + 10.0, cy + 6.0, inner_w - 20.0, 16.0),
+        BODY,
+        theme::INK,
+    );
+    d.text(
+        &detail,
+        Rect::new(inner_x + 10.0, cy + 24.0, inner_w - 20.0, 12.0),
+        MICRO_NUM,
+        theme::INK_4,
+    );
+    cy += MENU_HEAD_H;
+    d.fill(Rect::new(x, cy - 1.0, w, 1.0), 0.0, theme::HAIRLINE);
+    cy += MENU_HEAD_GAP;
+
+    let mut index = 0;
+    for row in &rows {
+        match row {
+            MenuRow::Sep => {
+                d.fill(
+                    Rect::new(inner_x + 10.0, cy + MENU_SEP_H * 0.5, inner_w - 20.0, 1.0),
+                    0.0,
+                    theme::HAIRLINE,
+                );
+                cy += MENU_SEP_H;
+            }
+            MenuRow::Item {
+                action,
+                label,
+                hint,
+                danger,
+            } => {
+                let r = Rect::new(inner_x, cy, inner_w, MENU_ITEM_H);
+                let hot = r.contains(mouse[0], mouse[1]) || focus == Some(index);
+                let armed = *danger && confirm;
+                if armed {
+                    d.slab(r, 6.0, NONE, theme::DANGER_LINE, 1.0);
+                } else if hot {
+                    d.fill(r, 6.0, theme::HOVER);
+                }
+                let ink = if *danger && (hot || armed) {
+                    theme::DANGER_INK
+                } else if hot {
+                    theme::INK
+                } else {
+                    theme::INK_2
+                };
+                d.text(
+                    label,
+                    Rect::new(r.x + 10.0, r.y, r.w - 20.0, r.h),
+                    BODY,
+                    ink,
+                );
+                if let Some(hint) = hint {
+                    d.text_r(
+                        hint,
+                        Rect::new(r.x + 10.0, r.y, r.w - 20.0, r.h),
+                        MICRO_NUM,
+                        theme::INK_4,
+                    );
+                }
+                d.hit(r, HitKind::MenuItem(*action));
+                cy += MENU_ITEM_H;
+                index += 1;
+            }
+        }
+    }
+    d.fade = 1.0;
+    d.layer = BASE;
 }
 
 fn title_bar(d: &mut DrawList, snap: &Snap, bar: Rect, mouse: [f32; 2]) {
@@ -985,27 +1268,22 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2]) {
 }
 
 fn toast(d: &mut DrawList, state: &AppState, main: Rect) {
-    let Some(undo) = &state.undo else { return };
-    if undo.until <= Instant::now() {
+    let Some(notice) = &state.notice else { return };
+    if notice.until <= Instant::now() {
         return;
     }
-    let has_revert = undo.revert.is_some();
-    let label_w = measure(&undo.label, BODY);
-    let w = (label_w + 36.0 + if has_revert { 86.0 } else { 0.0 }).max(120.0);
+    let label_w = measure(&notice.label, BODY);
+    let w = (label_w + 36.0).max(120.0);
     let r = Rect::new(main.x + (main.w - w) * 0.5, main.bottom() - 60.0, w, 38.0);
+    d.layer = OVERLAY;
     d.slab(r, 19.0, theme::TOAST, theme::GHOST_LINE, 1.0);
     d.text(
-        &undo.label,
+        &notice.label,
         Rect::new(r.x + 18.0, r.y, label_w + 4.0, r.h),
         BODY,
         theme::INK,
     );
-    if has_revert {
-        let u = Rect::new(r.right() - 74.0, r.y + 7.0, 62.0, 24.0);
-        d.fill(u, 12.0, theme::ACCENT);
-        d.text_c("Undo", u, PILL_ON, theme::ON_ACCENT);
-        d.hit(u, HitKind::Undo);
-    }
+    d.layer = BASE;
 }
 
 // --- Processes --------------------------------------------------------------
@@ -1512,6 +1790,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
             _ => false,
         };
         let color = match c.col {
+            Col::Name if p.stopped => theme::INK_3,
             Col::Name => theme::INK,
             Col::Cpu if idle => theme::INK_4,
             Col::Cpu => heat(p.cpu),
@@ -1525,6 +1804,13 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc) {
             d.text_r(&text, r, t, color);
         } else {
             d.text(&text, r, t, color);
+        }
+        if c.col == Col::Name && p.stopped {
+            let nw = measure(&text, BODY);
+            let tag = Rect::new(r.x + nw + 10.0, r.y, (r.w - nw - 10.0).max(0.0), r.h);
+            if tag.w >= measure("SUSPENDED", MICRO) {
+                d.text("suspended", tag, MICRO, theme::INK_4);
+            }
         }
     }
 }

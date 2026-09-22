@@ -142,6 +142,15 @@ sample.
 - **Shapes** are rounded-box signed distance fields, antialiased over about 1.5
   px at any zoom.
 
+### Layers
+
+A frame has two paint layers: base and overlay. The renderer draws all of a
+layer's shapes, strokes, and text before the next layer, so floating surfaces
+(the toast and the context menu) fully cover the text beneath them. Overlay
+content also takes a fade multiplier, which the context menu uses for its
+140 ms entrance. While any entrance is running the app requests frames on
+every page; once it settles, a static page goes back to idle.
+
 ## Rules for new motion
 
 - Base motion on time, not frame count. Use `dt` and a time constant.

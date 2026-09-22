@@ -76,6 +76,8 @@ pub struct Proc {
     pub write_bps: Option<f64>,
     pub threads: u32,
     pub is_user: bool,
+    /// Stopped by a signal (state `T`), e.g. suspended from the context menu.
+    pub stopped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -191,13 +193,6 @@ pub struct StartupEntry {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct Revert {
-    pub path: PathBuf,
-    /// `None` means the file did not exist before; undo removes it.
-    pub previous: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScrollBar {
     Processes,
@@ -240,11 +235,39 @@ pub struct Armed {
     pub pids: BTreeSet<i32>,
 }
 
+/// Transient status line shown as a toast, e.g. the result of a signal.
 #[derive(Clone, Debug)]
-pub struct Undo {
+pub struct Notice {
     pub until: Instant,
     pub label: String,
-    pub revert: Option<Revert>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    EndTask,
+    ForceKill,
+    Suspend,
+    Resume,
+    OpenLocation,
+    CopyPid,
+    CopyCommand,
+}
+
+/// Right-click menu on the process list. Acts on `pids`, the selection at the
+/// moment it opened.
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    /// Pointer position at open, design pixels.
+    pub x: f32,
+    pub y: f32,
+    pub pids: Vec<i32>,
+    pub opened: Instant,
+    /// Actions in display order, set while building the frame.
+    pub items: Vec<MenuAction>,
+    /// Keyboard highlight, an index into `items`.
+    pub focus: Option<usize>,
+    /// Force kill was clicked once and waits for a second click.
+    pub confirm_kill: bool,
 }
 
 pub struct AppState {
@@ -268,7 +291,8 @@ pub struct AppState {
     /// Geometry of the active page scrollbar (set while building the frame).
     pub scroll_bar: Option<ScrollGeom>,
     pub armed: Option<Armed>,
-    pub undo: Option<Undo>,
+    pub notice: Option<Notice>,
+    pub menu: Option<ContextMenu>,
     pub user_open: bool,
     pub system_open: bool,
     pub width: f32,
@@ -484,7 +508,8 @@ impl AppState {
             drag: None,
             scroll_bar: None,
             armed: None,
-            undo: None,
+            notice: None,
+            menu: None,
             user_open: true,
             system_open: true,
             width,
@@ -567,6 +592,8 @@ pub mod theme {
 
     // Floating notice: solid black glass, ghost edge.
     pub const TOAST: Rgba = [0, 0, 0, 230];
+    // Menus sit over dense rows; near-opaque so nothing reads through.
+    pub const MENU: Rgba = [0, 0, 0, 250];
 }
 
 #[cfg(test)]

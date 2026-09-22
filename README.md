@@ -31,6 +31,7 @@ Keys, when the search box is not focused:
 - On Performance, `c` `m` `g` `d` `n` select CPU, memory, GPU, disk, and network.
 - Typing starts a search. `Ctrl+F` focuses it, `Esc` clears it, `Ctrl+Backspace` empties it.
 - Click selects a process; `Ctrl` and `Shift` extend the selection.
+- Right-click a process for its menu: End task, Force kill (click twice), Suspend or Resume, Open file location, Copy command line, and Copy PID. It acts on the whole selection when the row is part of it. Arrow keys and `Enter` drive it, `Esc` closes it. Copying uses `wl-copy` (or `xclip` / `xsel`).
 - `Delete` arms End task and a second press (or `Enter`) sends SIGTERM.
 - `PageUp` `PageDown` scroll the current page.
 
@@ -38,7 +39,7 @@ Keys, when the search box is not focused:
 
 `Ctrl++` / `Ctrl+=` zooms in and `Ctrl+-` zooms out. Stops run from 80% to 180% (80, 90, 100, 110, 125, 140, 160, 180). `Ctrl+0` resets to 100%. The scale is saved in `~/.config/zigx/ui.txt` with the other UI prefs.
 
-Startup lists every autostart entry the session sees: `/etc/xdg/autostart` (and `$XDG_CONFIG_DIRS`) merged with `~/.config/autostart`, where a user file overrides the system one of the same name. Turning an entry off writes `Hidden=true` into the user file, creating it from the system entry when needed, and keeps a one-time `.bak`. Undo lasts 10 seconds.
+Startup lists every autostart entry the session sees: `/etc/xdg/autostart` (and `$XDG_CONFIG_DIRS`) merged with `~/.config/autostart`, where a user file overrides the system one of the same name. Turning an entry off writes `Hidden=true` into the user file, creating it from the system entry when needed, and keeps a one-time `.bak`.
 
 ## Fonts
 

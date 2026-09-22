@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
-pub const HIST_CAP: usize = 120;
-/// Sampler period. History covers `HIST_CAP * SAMPLE_PERIOD_MS` milliseconds.
-pub const SAMPLE_PERIOD_MS: u64 = 250;
+pub const HIST_CAP: usize = 150;
+/// Graph sampler period. History covers `HIST_CAP * SAMPLE_PERIOD_MS` ms.
+pub const SAMPLE_PERIOD_MS: u64 = 200;
 pub const HIST_SECS: u64 = HIST_CAP as u64 * SAMPLE_PERIOD_MS / 1000;
+/// How often Performance readouts pick up a new target value.
+pub const METRIC_PERIOD_MS: u64 = 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -131,6 +133,8 @@ pub struct Snap {
     pub uptime_secs: u64,
     pub load: [f32; 3],
     pub sample_ms: f32,
+    /// Instant the ring buffers last advanced. Frame uses this for scroll phase.
+    pub hist_at: Instant,
 }
 
 impl Snap {
@@ -161,6 +165,7 @@ impl Snap {
             uptime_secs: 0,
             load: [0.0; 3],
             sample_ms: 0.0,
+            hist_at: Instant::now(),
         }
     }
 }
@@ -256,6 +261,207 @@ pub struct AppState {
     /// Interface zoom. Layout stays in design pixels; this scales them onto the window.
     pub ui_scale: f32,
     pub visible_pids: Vec<i32>,
+    /// EMA-smoothed performance readouts; advanced on each paint of that page.
+    pub perf_smooth: PerfSmooth,
+}
+
+/// Display-side smoothing for the Performance page.
+///
+/// Readout targets refresh once a second. Graph rings follow every sampler
+/// tick; only the tip eases so new samples glide in without morphing history.
+#[derive(Clone, Debug)]
+pub struct PerfSmooth {
+    pub primed: bool,
+    pub at: Instant,
+    pub hist_at: Option<Instant>,
+    pub cpu: f32,
+    pub mem_used: f32,
+    pub gpu: f32,
+    pub cpu_per: Vec<f32>,
+    pub cpu_hist: Vec<f32>,
+    pub mem_hist: Vec<f32>,
+    pub swap_hist: Vec<f32>,
+    pub gpu_hist: Vec<Vec<f32>>,
+    pub disk_hist: BTreeMap<String, (Vec<f32>, Vec<f32>)>,
+    pub net_hist: BTreeMap<String, (Vec<f32>, Vec<f32>)>,
+    metric_at: Instant,
+    tgt_cpu: f32,
+    tgt_mem: f32,
+    tgt_gpu: f32,
+    tgt_cpu_per: Vec<f32>,
+}
+
+impl Default for PerfSmooth {
+    fn default() -> Self {
+        Self {
+            primed: false,
+            at: Instant::now(),
+            hist_at: None,
+            cpu: 0.0,
+            mem_used: 0.0,
+            gpu: 0.0,
+            cpu_per: Vec::new(),
+            cpu_hist: Vec::new(),
+            mem_hist: Vec::new(),
+            swap_hist: Vec::new(),
+            gpu_hist: Vec::new(),
+            disk_hist: BTreeMap::new(),
+            net_hist: BTreeMap::new(),
+            metric_at: Instant::now(),
+            tgt_cpu: 0.0,
+            tgt_mem: 0.0,
+            tgt_gpu: 0.0,
+            tgt_cpu_per: Vec::new(),
+        }
+    }
+}
+
+impl PerfSmooth {
+    /// `metric_tau` / `tip_tau` are half-lives in seconds.
+    pub fn tick(&mut self, snap: &Snap, metric_tau: f32, tip_tau: f32) {
+        let now = Instant::now();
+        let dt = if self.primed {
+            now.saturating_duration_since(self.at).as_secs_f32()
+        } else {
+            1.0
+        };
+        self.at = now;
+        let am = 1.0 - (-dt / metric_tau.max(0.001)).exp();
+        let at = 1.0 - (-dt / tip_tau.max(0.001)).exp();
+        let gpu = snap.gpus.first().and_then(|g| g.util).unwrap_or(0.0);
+        let advanced = self.hist_at != Some(snap.hist_at);
+        self.hist_at = Some(snap.hist_at);
+
+        if !self.primed {
+            self.cpu = snap.cpu_total;
+            self.mem_used = snap.mem_used as f32;
+            self.gpu = gpu;
+            self.cpu_per = snap.cpu_per.clone();
+            self.tgt_cpu = self.cpu;
+            self.tgt_mem = self.mem_used;
+            self.tgt_gpu = self.gpu;
+            self.tgt_cpu_per = self.cpu_per.clone();
+            self.metric_at = now;
+            self.cpu_hist = snap.cpu_hist.clone();
+            self.mem_hist = snap.mem_hist.clone();
+            self.swap_hist = snap.swap_hist.clone();
+            self.gpu_hist = snap.gpus.iter().map(|g| g.util_hist.clone()).collect();
+            self.disk_hist = snap
+                .disks
+                .iter()
+                .map(|d| (d.name.clone(), (d.read_hist.clone(), d.write_hist.clone())))
+                .collect();
+            self.net_hist = snap
+                .nets
+                .iter()
+                .map(|n| (n.name.clone(), (n.rx_hist.clone(), n.tx_hist.clone())))
+                .collect();
+            self.primed = true;
+            return;
+        }
+
+        if self.metric_at.elapsed().as_millis() >= METRIC_PERIOD_MS as u128 {
+            self.tgt_cpu = snap.cpu_total;
+            self.tgt_mem = snap.mem_used as f32;
+            self.tgt_gpu = gpu;
+            self.tgt_cpu_per = snap.cpu_per.clone();
+            self.metric_at = now;
+        }
+
+        self.cpu += (self.tgt_cpu - self.cpu) * am;
+        self.mem_used += (self.tgt_mem - self.mem_used) * am;
+        self.gpu += (self.tgt_gpu - self.gpu) * am;
+        ease_vec(&mut self.cpu_per, &self.tgt_cpu_per, am);
+
+        track_ring(&mut self.cpu_hist, &snap.cpu_hist, advanced, at);
+        track_ring(&mut self.mem_hist, &snap.mem_hist, advanced, at);
+        track_ring(&mut self.swap_hist, &snap.swap_hist, advanced, at);
+
+        if self.gpu_hist.len() != snap.gpus.len() {
+            self.gpu_hist = snap.gpus.iter().map(|g| g.util_hist.clone()).collect();
+        } else {
+            for (dst, g) in self.gpu_hist.iter_mut().zip(&snap.gpus) {
+                track_ring(dst, &g.util_hist, advanced, at);
+            }
+        }
+
+        sync_pair_map(
+            &mut self.disk_hist,
+            snap.disks
+                .iter()
+                .map(|d| (d.name.as_str(), d.read_hist.as_slice(), d.write_hist.as_slice())),
+            advanced,
+            at,
+        );
+        sync_pair_map(
+            &mut self.net_hist,
+            snap.nets
+                .iter()
+                .map(|n| (n.name.as_str(), n.rx_hist.as_slice(), n.tx_hist.as_slice())),
+            advanced,
+            at,
+        );
+    }
+
+    pub fn disk_pair(&self, name: &str) -> Option<(&[f32], &[f32])> {
+        self.disk_hist
+            .get(name)
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+    }
+
+    pub fn net_pair(&self, name: &str) -> Option<(&[f32], &[f32])> {
+        self.net_hist
+            .get(name)
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+    }
+}
+
+fn ease_vec(dst: &mut Vec<f32>, src: &[f32], a: f32) {
+    if dst.len() != src.len() {
+        *dst = src.to_vec();
+        return;
+    }
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d += (*s - *d) * a;
+    }
+}
+
+/// Keep the ribbon shape locked to the sampler ring; only the tip eases.
+fn track_ring(dst: &mut Vec<f32>, src: &[f32], advanced: bool, tip_a: f32) {
+    if src.len() < 2 {
+        *dst = src.to_vec();
+        return;
+    }
+    if dst.len() != src.len() {
+        *dst = src.to_vec();
+        return;
+    }
+    if advanced {
+        let tip = dst.last().copied().unwrap_or(0.0);
+        dst.remove(0);
+        dst.push(tip);
+    }
+    let last = dst.len() - 1;
+    dst[..last].copy_from_slice(&src[..last]);
+    dst[last] += (src[last] - dst[last]) * tip_a;
+}
+
+fn sync_pair_map<'a, I>(
+    dst: &mut BTreeMap<String, (Vec<f32>, Vec<f32>)>,
+    src: I,
+    advanced: bool,
+    tip_a: f32,
+) where
+    I: IntoIterator<Item = (&'a str, &'a [f32], &'a [f32])>,
+{
+    let mut keep = BTreeSet::new();
+    for (name, a_hist, b_hist) in src {
+        keep.insert(name.to_string());
+        let entry = dst.entry(name.to_string()).or_default();
+        track_ring(&mut entry.0, a_hist, advanced, tip_a);
+        track_ring(&mut entry.1, b_hist, advanced, tip_a);
+    }
+    dst.retain(|k, _| keep.contains(k));
 }
 
 impl AppState {
@@ -289,6 +495,7 @@ impl AppState {
             height,
             ui_scale: 1.0,
             visible_pids: Vec::new(),
+            perf_smooth: PerfSmooth::default(),
         }
     }
 }

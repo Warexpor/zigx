@@ -75,10 +75,13 @@ pub struct Engine {
     kthreads: u32,
     last_proc: Instant,
     last_gpu: Instant,
+    last_cpu_total: f32,
+    last_cpu_per: Vec<f32>,
     cached_procs: Vec<Proc>,
     cached_gpus: Vec<GpuRaw>,
     cached_proc_gpu: HashMap<i32, f32>,
     sample_avg: f32,
+    hist_at: Instant,
     nvml: Option<Nvml>,
     text: String,
     bytes: Vec<u8>,
@@ -112,10 +115,13 @@ impl Engine {
             kthreads: 0,
             last_proc: Instant::now(),
             last_gpu: Instant::now(),
+            last_cpu_total: 0.0,
+            last_cpu_per: Vec::new(),
             cached_procs: Vec::new(),
             cached_gpus: Vec::new(),
             cached_proc_gpu: HashMap::new(),
             sample_avg: 0.0,
+            hist_at: Instant::now(),
             nvml: Nvml::open(),
             text: String::new(),
             bytes: Vec::new(),
@@ -152,7 +158,10 @@ impl Engine {
 
         let mut cpu_total = 0.0;
         let mut cpu_per = Vec::new();
-        if self.primed && dt > 0.05 {
+        // Floor matches a slightly late sample tick (~half of SAMPLE_PERIOD).
+        let min_dt = (SAMPLE_PERIOD_MS as f64 / 1000.0) * 0.4;
+        let advance = self.primed && dt > min_dt;
+        if advance {
             if let Some((idle0, total0)) = cpu_lines.first() {
                 if let Some((pi, pt)) = self.prev_cpu.first() {
                     cpu_total = pct_busy(*idle0, *total0, *pi, *pt);
@@ -178,13 +187,22 @@ impl Engine {
                     mem.swap_used as f32 / mem.swap_total as f32,
                 );
             }
-        } else if !cpu_lines.is_empty() {
-            cpu_per = vec![0.0; cpu_lines.len().saturating_sub(1)];
+            self.last_cpu_total = cpu_total;
+            self.last_cpu_per = cpu_per.clone();
+        } else {
+            cpu_total = self.last_cpu_total;
+            cpu_per = self.last_cpu_per.clone();
+            if cpu_per.is_empty() && !cpu_lines.is_empty() {
+                cpu_per = vec![0.0; cpu_lines.len().saturating_sub(1)];
+            }
         }
 
-        let disks = self.finish_disks(disks_raw, dt);
-        let nets = self.finish_nets(nets_raw, dt);
-        let gpus = self.finish_gpus(gpu_raw);
+        let disks = self.finish_disks(disks_raw, dt, min_dt);
+        let nets = self.finish_nets(nets_raw, dt, min_dt);
+        let gpus = self.finish_gpus(gpu_raw, advance);
+        if advance {
+            self.hist_at = now;
+        }
 
         self.prev_cpu = cpu_lines.iter().map(|(i, t)| (*i, *t)).collect();
         self.prev_at = now;
@@ -227,6 +245,7 @@ impl Engine {
             uptime_secs: uptime,
             load,
             sample_ms: self.sample_avg,
+            hist_at: self.hist_at,
         }
     }
 
@@ -500,12 +519,12 @@ impl Engine {
         name
     }
 
-    fn finish_disks(&mut self, raw: Vec<(String, u64, u64)>, dt: f64) -> Vec<Disk> {
+    fn finish_disks(&mut self, raw: Vec<(String, u64, u64)>, dt: f64, min_dt: f64) -> Vec<Disk> {
         let mut out = Vec::new();
         let mut keep = HashSet::new();
         for (name, sectors_r, sectors_w) in raw {
             keep.insert(name.clone());
-            let (read_bps, write_bps) = if self.primed && dt > 0.05 {
+            let (read_bps, write_bps) = if self.primed && dt > min_dt {
                 if let Some((pr, pw)) = self.prev_disk.get(&name) {
                     (
                         (sectors_r.saturating_sub(*pr) as f64) * 512.0 / dt,
@@ -522,7 +541,7 @@ impl Engine {
                 .disk_hist
                 .entry(name.clone())
                 .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
-            if self.primed && dt > 0.05 {
+            if self.primed && dt > min_dt {
                 push_hist(&mut hist.0, read_bps as f32);
                 push_hist(&mut hist.1, write_bps as f32);
             }
@@ -539,12 +558,12 @@ impl Engine {
         out
     }
 
-    fn finish_nets(&mut self, raw: Vec<(String, u64, u64)>, dt: f64) -> Vec<Net> {
+    fn finish_nets(&mut self, raw: Vec<(String, u64, u64)>, dt: f64, min_dt: f64) -> Vec<Net> {
         let mut out = Vec::new();
         let mut keep = HashSet::new();
         for (name, rx, tx) in raw {
             keep.insert(name.clone());
-            let (rx_bps, tx_bps) = if self.primed && dt > 0.05 {
+            let (rx_bps, tx_bps) = if self.primed && dt > min_dt {
                 if let Some((pr, pt)) = self.prev_net.get(&name) {
                     (
                         rx.saturating_sub(*pr) as f64 / dt,
@@ -561,7 +580,7 @@ impl Engine {
                 .net_hist
                 .entry(name.clone())
                 .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
-            if self.primed && dt > 0.05 {
+            if self.primed && dt > min_dt {
                 push_hist(&mut hist.0, rx_bps as f32);
                 push_hist(&mut hist.1, tx_bps as f32);
             }
@@ -578,14 +597,14 @@ impl Engine {
         out
     }
 
-    fn finish_gpus(&mut self, raw: Vec<GpuRaw>) -> Vec<Gpu> {
+    fn finish_gpus(&mut self, raw: Vec<GpuRaw>, advance: bool) -> Vec<Gpu> {
         if self.gpu_hist.len() != raw.len() {
             self.gpu_hist = (0..raw.len()).map(|_| VecDeque::new()).collect();
         }
         raw.into_iter()
             .enumerate()
             .map(|(i, g)| {
-                if self.primed {
+                if advance {
                     if let Some(u) = g.util {
                         push_hist(&mut self.gpu_hist[i], u);
                     }

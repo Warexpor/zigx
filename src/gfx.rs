@@ -500,7 +500,7 @@ impl Gfx {
             if let Some(base) = stroke.baseline {
                 // Faint wash under the line: tinted at the trace, gone at the baseline.
                 let mut top = stroke.color;
-                top[3] = ((stroke.color[3] as f32 * 0.12).min(30.0)) as u8;
+                top[3] = ((stroke.color[3] as f32 * 0.07).min(18.0)) as u8;
                 let mut bottom = top;
                 bottom[3] = 0;
                 fill_under(
@@ -1003,11 +1003,10 @@ fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: 
                 return [n0[0] * outer, n0[1] * outer];
             }
             let m = [mx / ml, my / ml];
-            // cos of the half turn. Clamp so a sharp spike cannot throw a
-            // miter far past the line; the AA is slightly off there, and the
-            // only sharp joins are 1px graph traces.
-            let cos = (m[0] * n0[0] + m[1] * n0[1]).max(0.35);
-            let len = outer / cos;
+            // Half-angle cosine. Acute turns use a bevel (no /cos stretch) so
+            // graph spikes do not throw a long miter that flickers under AA.
+            let cos = (m[0] * n0[0] + m[1] * n0[1]).clamp(0.0, 1.0);
+            let len = if cos < 0.72 { outer } else { outer / cos };
             [m[0] * len, m[1] * len]
         })
         .collect();

@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.5.1    |                                                      |
+| v0.5.2    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -76,9 +76,9 @@ window losing focus, sorts again. A key repeat does not recapture.
 
 ```
 | nav | RESOURCES  |  Processor                                  |
-|     | CPU    37% |  AMD Ryzen ...                              |
-|     | Memory 41% |  37%                                        |
-|     | GPU     3% |  TOTAL UTILIZATION                          |
+|     | CPU        |  AMD Ryzen ...                              |
+|     | Memory     |  37%                                        |
+|     | GPU        |  TOTAL UTILIZATION                          |
 |     | Disk       |  4.2 GHz   412   5,120   3d 2h   1.20       |
 |     | Network    |  UTILIZATION  30 S WINDOW             100%  |
 |     |            |  [graph]                                    |
@@ -87,8 +87,8 @@ window losing focus, sorts again. A key repeat does not recapture.
 ```
 
 - **Sub-nav.** 196 wide by default, resizable from 140 to 260, and never more
-  than 40% of the main area. It lists the five resources with their current
-  value right-aligned in `MICRO_NUM`.
+  than 40% of the main area. It lists the five resources by name only; live
+  values live on the detail sheet.
 - **Detail sheet.** Inset 28 horizontally, 22 at the top, 24 at the bottom,
   and scrollable when content overflows.
 - **Page anatomy**, top to bottom:

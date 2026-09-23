@@ -99,7 +99,7 @@ impl Glass {
         match self {
             Glass::Clear => 140,
             Glass::Frost => 200,
-            Glass::Solid => 248,
+            Glass::Solid => 255,
         }
     }
 }

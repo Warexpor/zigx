@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::anim::{self, cascade, key, lerp, mix_rgba, Anim, Key};
+use crate::anim::{self, key, lerp, mix_rgba, Anim, Key};
 use crate::format::{
     bytes, cpu_pct, disk_cell, duration, fit_t, freq_ghz, percent, rate, text_width_t,
 };
@@ -194,8 +194,6 @@ pub struct DrawList {
     layer: usize,
     /// Alpha multiplier for everything drawn: entrances, exits, overlays.
     fade: f32,
-    /// Entrance progress of the current page, 0 to 1.
-    enter: f32,
     prefs: Settings,
     anim: Anim,
 }
@@ -214,7 +212,6 @@ impl DrawList {
             clip: None,
             layer: BASE,
             fade: 1.0,
-            enter: 1.0,
             prefs,
             anim,
         }
@@ -869,6 +866,18 @@ fn ghost_pill(
     }
 }
 
+/// Frosted accent pill, cross-faded in by `t` from a resting fill and edge.
+fn accent_pill(d: &mut DrawList, r: Rect, t: f32, rest: theme::Rgba, rest_line: theme::Rgba) {
+    d.faded(t, |d| d.outline(r.inset(-1.0), r.h * 0.5 + 1.0, theme::ACCENT_HALO));
+    d.slab(
+        r,
+        r.h * 0.5,
+        mix_rgba(rest, theme::ACCENT, t),
+        mix_rgba(rest_line, theme::ACCENT_EDGE, t),
+        lerp(1.0, 0.5, t),
+    );
+}
+
 // Inset from the outer ring; equal side padding inside each cell so every
 // label, short "Flat" or long "Grouped", sits on the same rhythm.
 const SEG_INSET: f32 = 3.0;
@@ -882,8 +891,8 @@ fn segmented_w(items: &[(&str, bool, HitKind)]) -> f32 {
         + SEG_INSET * 2.0
 }
 
-/// Segmented control: one ghost outline, the active segment is the white pill.
-/// The pill glides between segments; each label inverts as the pill covers it.
+/// Segmented control: one ghost outline, the active segment is the accent pill.
+/// The pill glides between segments; each label brightens as the pill covers it.
 fn segmented(
     d: &mut DrawList,
     x: f32,
@@ -933,7 +942,7 @@ fn segmented(
     for (r, h) in cells.iter().zip(&hovers) {
         d.fill(*r, r.h * 0.5, mix_rgba(NONE, theme::HOVER, *h));
     }
-    d.faded(shown, |d| d.fill(pill, pill.h * 0.5, theme::ACCENT));
+    d.faded(shown, |d| accent_pill(d, pill, 1.0, NONE, NONE));
     for (((label, _, kind), r), h) in items.iter().zip(&cells).zip(&hovers) {
         let overlap = (pill.right().min(r.right()) - pill.x.max(r.x)).max(0.0);
         let cover = (overlap / r.w.max(1.0)).clamp(0.0, 1.0) * shown;
@@ -1036,25 +1045,22 @@ pub fn build(
         HitKind::DragNav,
     );
 
-    // A page enters by fading up from a short drop; list rows follow in a
-    // cascade (see `stagger`).
-    let enter = d
+    // A page fades in where it sits. Nothing travels, so switching pages
+    // never pulls the eye.
+    d.fade = d
         .anim
-        .mix_from(key("page", state.page), 0.0, 1.0, anim::ENTER);
-    d.enter = enter;
-    d.fade = enter;
-    let lift = |r: Rect| Rect::new(r.x, r.y + (1.0 - enter) * PAGE_RISE, r.w, r.h);
+        .mix_from(key("page", state.page), 0.0, 1.0, anim::PAGE);
     match (state.page, perf) {
         (Page::Performance, Some((sub, detail))) => {
             d.hit(
                 Rect::new(sub.right() - 2.0, body.y, 5.0, body.h),
                 HitKind::DragSub,
             );
-            performance(&mut d, state, snap, lift(sub), detail, mouse)
+            performance(&mut d, state, snap, sub, detail, mouse)
         }
-        (Page::Startup, _) => startup_page(&mut d, state, startup, lift(main), mouse),
-        (Page::Processes, _) => processes(&mut d, state, snap, lift(main), mouse),
-        (Page::Settings, _) => settings_page(&mut d, state, lift(main), mouse),
+        (Page::Startup, _) => startup_page(&mut d, state, startup, main, mouse),
+        (Page::Processes, _) => processes(&mut d, state, snap, main, mouse),
+        (Page::Settings, _) => settings_page(&mut d, state, main, mouse),
         _ => {}
     }
     d.fade = 1.0;
@@ -1071,25 +1077,10 @@ pub fn build(
     d
 }
 
-/// Drop a page or section rises from as it enters.
-const PAGE_RISE: f32 = 10.0;
-/// Drop each list row rises from in the entrance cascade.
+/// Drop a newly started process row rises from.
 const ROW_RISE: f32 = 8.0;
 /// Farthest a process row travels when re-sorted, in rows.
 const MAX_ROW_TRAVEL: f32 = 3.0;
-
-/// Extra fade for the `i`th visible row of a list while its page enters, on
-/// top of the page fade, so rows arrive in a quick cascade.
-fn stagger(d: &DrawList, i: usize) -> f32 {
-    let t = d.enter;
-    if t >= 1.0 {
-        1.0
-    } else if t <= 0.0 {
-        0.0
-    } else {
-        (cascade(t, i) / t).min(1.0)
-    }
-}
 
 const MENU_ITEM_H: f32 = 30.0;
 const MENU_PAD: f32 = 6.0;
@@ -1844,7 +1835,6 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     d.hit(list, HitKind::Deselect);
     d.clip = Some(list);
     let fresh_ok = !known.is_empty();
-    let mut shown = 0;
     let (near_lo, near_hi) = (scroll - row_h * 2.0, scroll + list.h + row_h * 2.0);
     let near = |y: f32| y > near_lo && y < near_hi;
     for (i, row) in rows.iter().enumerate() {
@@ -1871,18 +1861,18 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         if ry + drawn_h < list.y || ry > list.bottom() {
             continue;
         }
-        let mut a = stagger(d, shown);
-        shown += 1;
-        if let Row::Proc(p) = row {
-            let from = if fresh_ok && !known.contains(&p.pid) {
-                0.0
-            } else {
-                1.0
-            };
-            a *= d
-                .anim
-                .mix_from(key("row-in", p.pid), from, 1.0, anim::ENTER);
-        }
+        let a = match row {
+            Row::Proc(p) => {
+                let from = if fresh_ok && !known.contains(&p.pid) {
+                    0.0
+                } else {
+                    1.0
+                };
+                d.anim
+                    .mix_from(key("row-in", p.pid), from, 1.0, anim::ENTER)
+            }
+            Row::Header { .. } => 1.0,
+        };
         let ry = ry + (1.0 - a) * ROW_RISE;
         let rr = Rect::new(list.x, ry, list.w, drawn_h);
         let saved_fade = d.fade;
@@ -2395,21 +2385,11 @@ fn performance(
         None,
     );
     let items = [
-        (
-            Icon::Chip,
-            "CPU",
-            Section::Cpu,
-            Some(percent(snap.cpu_total)),
-        ),
-        (Icon::Mem, "Memory", Section::Memory, Some(mem_short(snap))),
-        (
-            Icon::Gpu,
-            "GPU",
-            Section::Gpu,
-            snap.gpus.first().and_then(|g| g.util.map(percent)),
-        ),
-        (Icon::Disk, "Disk", Section::Disk, None),
-        (Icon::Net, "Network", Section::Net, None),
+        (Icon::Chip, "CPU", Section::Cpu),
+        (Icon::Mem, "Memory", Section::Memory),
+        (Icon::Gpu, "GPU", Section::Gpu),
+        (Icon::Disk, "Disk", Section::Disk),
+        (Icon::Net, "Network", Section::Net),
     ];
     let slot = |i: usize| {
         Rect::new(
@@ -2419,9 +2399,10 @@ fn performance(
             34.0,
         )
     };
+    let sections: Vec<Section> = items.iter().map(|it| it.2).collect();
     let sel = items.iter().position(|it| it.2 == state.section).map(slot);
     side_highlight(d, "section", sub.y, sel);
-    for (i, (ic, label, section, extra)) in items.into_iter().enumerate() {
+    for (i, (ic, label, section)) in items.into_iter().enumerate() {
         let r = slot(i);
         let id = HitKind::Section(section);
         side_item(
@@ -2430,18 +2411,27 @@ fn performance(
             r,
             ic,
             label,
-            extra.as_deref(),
+            None,
             state.section == section,
             mouse,
         );
         d.hit(r, id);
     }
 
-    // A new section enters like a page, inside the detail pane only.
+    // Sections cross-fade in the detail pane: the new one fades in over the
+    // one it replaces, which fades out where it was scrolled to.
     let enter = d
         .anim
-        .mix_from(key("section", state.section), 0.0, 1.0, anim::ENTER);
-    let rise = (1.0 - enter.min(d.enter)) * PAGE_RISE;
+        .mix_from(key("section", state.section), 0.0, 1.0, anim::PAGE);
+    let leaving: Vec<(Section, f32)> = sections
+        .iter()
+        .filter(|&&s| s != state.section)
+        .filter_map(|&s| {
+            let k = key("section", s);
+            d.anim.peek(k).filter(|v| *v > 0.0)?;
+            Some((s, d.anim.mix(k, 0.0, anim::PAGE)))
+        })
+        .collect();
     let view = Rect::new(
         detail.x + 28.0,
         detail.y + 22.0,
@@ -2456,18 +2446,20 @@ fn performance(
         state.section,
         state.perf_scroll,
     );
-    let y0 = view.y - scroll + rise;
+    let y0 = view.y - scroll;
     let head = state.perf_smooth.head();
     d.clip = Some(view);
     let saved_fade = d.fade;
-    d.fade *= enter;
-    let content_bottom = match state.section {
-        Section::Cpu => cpu_page(d, snap, view, y0, head),
-        Section::Memory => memory_page(d, snap, view, y0, head),
-        Section::Gpu => gpu_page(d, state, snap, view, y0, head),
-        Section::Disk => io_page(d, state, view, y0, true, snap, head),
-        Section::Net => io_page(d, state, view, y0, false, snap, head),
-    };
+    for (s, a) in leaving {
+        // Hold the old scroll so the outgoing section fades without moving.
+        let k = key("scroll", (ScrollBar::Performance, s));
+        let held = d.anim.peek(k).unwrap_or(0.0);
+        d.anim.set(k, held);
+        d.fade = saved_fade * a;
+        section_page(d, state, snap, s, view, view.y - held, head);
+    }
+    d.fade = saved_fade * enter;
+    let content_bottom = section_page(d, state, snap, state.section, view, y0, head);
     d.fade = saved_fade;
     d.clip = None;
     let content_h = (content_bottom - y0).max(0.0);
@@ -2546,6 +2538,25 @@ fn scaled_graph(
         MICRO_NUM,
         theme::INK_4,
     );
+}
+
+/// Draw one Performance section's content from `y`. Returns its bottom.
+fn section_page(
+    d: &mut DrawList,
+    state: &AppState,
+    snap: &Snap,
+    section: Section,
+    view: Rect,
+    y: f32,
+    head: f32,
+) -> f32 {
+    match section {
+        Section::Cpu => cpu_page(d, snap, view, y, head),
+        Section::Memory => memory_page(d, snap, view, y, head),
+        Section::Gpu => gpu_page(d, state, snap, view, y, head),
+        Section::Disk => io_page(d, state, view, y, true, snap, head),
+        Section::Net => io_page(d, state, view, y, false, snap, head),
+    }
 }
 
 fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) -> f32 {
@@ -3026,21 +3037,11 @@ fn startup_page(
     d.clip = Some(list);
     let full = list;
     let list = Rect::new(list.x, list.y, (list.w - SCROLL_GUTTER).max(40.0), list.h);
-    for (n, (i, entry)) in startup
-        .iter()
-        .enumerate()
-        .skip(first)
-        .take(nvis)
-        .enumerate()
-    {
+    for (i, entry) in startup.iter().enumerate().skip(first).take(nvis) {
         let ry = list.y + i as f32 * row_h - scroll;
         if ry + row_h < list.y || ry > list.bottom() {
             continue;
         }
-        let a = stagger(d, n);
-        let ry = ry + (1.0 - a) * ROW_RISE;
-        let saved_fade = d.fade;
-        d.fade *= a;
         let rr = Rect::new(full.x, ry, full.w, row_h);
         let name_ink = if entry.enabled {
             theme::INK
@@ -3084,7 +3085,6 @@ fn startup_page(
             key("startup-switch", &entry.path),
         );
         d.hit(rr, HitKind::Startup(i));
-        d.fade = saved_fade;
     }
     d.clip = None;
     scrollbar(d, state, full, content_h, scroll, ScrollBar::Startup, mouse);
@@ -3096,7 +3096,7 @@ enum Ctl {
     /// Segmented control. Items are (label, on, hit).
     Choice(Vec<(&'static str, bool, HitKind)>),
     Switch(Opt, bool),
-    /// Independent toggles, one ghost pill each; on is the white pill.
+    /// Independent toggles, one ghost pill each; on is the accent pill.
     Chips(Vec<(&'static str, bool, HitKind)>),
     Scale(f32),
     Reset(bool),
@@ -3330,13 +3330,7 @@ fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
                 let o = d.anim.toggle(key("chip-on", label), *on);
                 let rest = mix_rgba(NONE, theme::HOVER, h);
                 let line = mix_rgba(theme::GHOST_LINE, theme::ACCENT_LINE, h);
-                d.slab(
-                    r,
-                    r.h * 0.5,
-                    mix_rgba(rest, theme::ACCENT, o),
-                    mix_rgba(line, theme::ACCENT, o),
-                    1.0,
-                );
+                accent_pill(d, r, o, rest, line);
                 let ink = mix_rgba(mix_rgba(theme::INK_2, theme::INK, h), theme::ON_ACCENT, o);
                 d.text_c(label, r, if o > 0.5 { PILL_ON } else { PILL }, ink);
                 d.hit(r, *kind);
@@ -3436,28 +3430,11 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
 
     d.clip = Some(list_full);
     let mut cursor = list.y - scroll;
-    // Entrance cascade over what is on screen; rows above it count as zero.
-    let mut n = 0;
-    let mut next = |d: &DrawList, top: f32| {
-        let a = if top + SET_ROW_H < list.y {
-            1.0
-        } else {
-            n += 1;
-            stagger(d, n - 1)
-        };
-        (a, (1.0 - a) * ROW_RISE)
-    };
     for (title, rows) in &groups {
-        let (a, drop) = next(d, cursor);
-        d.faded(a, |d| {
-            eyebrow(d, list.x, cursor + 20.0 + drop, list.w, title, None)
-        });
+        eyebrow(d, list.x, cursor + 20.0, list.w, title, None);
         cursor += SET_GROUP_H;
         for row in rows {
-            let (a, drop) = next(d, cursor);
-            let saved_fade = d.fade;
-            d.fade *= a;
-            let y = cursor + drop;
+            let y = cursor;
             let h = row_h(&row.ctl);
             let rr = Rect::new(list.x, y, list.w, h);
             let cw = ctl_w(&row.ctl);
@@ -3490,7 +3467,6 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
             };
             draw_ctl(d, &row.ctl, cx, cy, mouse);
             d.hairline(Rect::new(list.x, y + h - 1.0, list.w, 1.0));
-            d.fade = saved_fade;
             cursor += h;
         }
     }
@@ -3510,13 +3486,7 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
 /// stretches mid-travel so the flip reads as a throw rather than a jump.
 fn switch(d: &mut DrawList, r: Rect, on: bool, id: Key) {
     let t = d.anim.toggle(id, on);
-    d.slab(
-        r,
-        r.h * 0.5,
-        mix_rgba(NONE, theme::ACCENT, t),
-        mix_rgba(theme::GHOST_LINE, theme::ACCENT, t),
-        1.0,
-    );
+    accent_pill(d, r, t, NONE, theme::GHOST_LINE);
     let kw = 12.0 + 6.0 * 4.0 * t * (1.0 - t);
     let kx = lerp(r.x + 3.0, r.right() - 3.0 - kw, t);
     d.fill(

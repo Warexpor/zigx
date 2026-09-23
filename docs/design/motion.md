@@ -229,7 +229,8 @@ time and settled at about three times.
 | `HOVER_IN` / `HOVER_OUT` | 0.035 / 0.08 | Hover fills and ink: quick to light, slower to let go |
 | `TOGGLE` | 0.065 | Switch knobs, pill widths, state color changes, the chevron and sort caret |
 | `GLIDE_LEAD` / `GLIDE_TRAIL` | 0.05 / 0.085 | Gliding highlights |
-| `ENTER` | 0.085 | Page and section entrances, launch intro, new rows |
+| `ENTER` | 0.085 | Launch intro, new rows |
+| `PAGE` | 0.05 | Page and section switches |
 | `SCROLL` | 0.055 | Wheel and keyboard scrolling |
 | `REORDER` | 0.075 | Process rows moving to a new slot, row height |
 | `MENU_IN` / `MENU_OUT` | 0.05 / 0.04 | Context menu |
@@ -240,16 +241,17 @@ time and settled at about three times.
 
 - **Launch.** The chrome fades in over the glass; the glass itself is there
   from the first frame.
-- **Pages.** A page fades up from 10 px below. List rows on it (processes,
-  startup entries, setting rows) follow in a cascade, about 25 ms apart,
-  each rising 8 px. On Performance a new section enters the same way inside
-  the detail pane only.
-- **Highlights.** The selected side item and the active segment's white pill
+- **Pages.** A page fades in where it sits, settled in about 150 ms. Nothing
+  travels and rows arrive together, so a switch never pulls the eye. On
+  Performance, sections cross-fade inside the detail pane: the new one fades
+  in while the one it replaces fades out at the same time, held at the scroll
+  it was left at. Switching back mid-fade picks up from where it was.
+- **Highlights.** The selected side item and the active segment's smoked pill
   glide to their new place. The edge in the direction of travel leads and the
   other trails (`Anim::glide`), so the highlight stretches toward its target
-  and gathers behind it. Segment labels invert as the pill covers them. The
-  context menu's hover highlight glides between items the same way, and
-  lights up in place when it first appears.
+  and gathers behind it. Segment labels brighten and gain weight as the pill
+  covers them. The context menu's hover highlight glides between items the
+  same way, and lights up in place when it first appears.
 - **Hover and state.** Every hover fill and ink change cross-fades, as do
   selected rows, focus on the search field, pill danger and disabled styles,
   chip on and off, the sorted column title, and the scrollbar thumb, which

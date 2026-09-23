@@ -596,10 +596,13 @@ pub mod theme {
     pub const HOVER: Rgba = ink(16);
     pub const SELECTED: Rgba = ink(30);
 
-    // The one filled element: white pill, black label.
-    pub const ACCENT: Rgba = [255, 255, 255, 255];
+    // The one filled element: a smoked pill. A faint ink wash over the glass,
+    // a near-white edge, and a soft halo just outside it; the label stays white.
+    pub const ACCENT: Rgba = ink(26);
+    pub const ACCENT_EDGE: Rgba = ink(195);
+    pub const ACCENT_HALO: Rgba = ink(14);
     pub const ACCENT_LINE: Rgba = ink(140);
-    pub const ON_ACCENT: Rgba = [0, 0, 0, 255];
+    pub const ON_ACCENT: Rgba = INK;
 
     // Status chroma, and only status.
     pub const WARN: Rgba = [245, 166, 35, 255];

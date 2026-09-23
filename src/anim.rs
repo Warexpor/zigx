@@ -32,8 +32,10 @@ pub const TOGGLE: f32 = 0.065;
 /// the highlight stretches toward its target and then gathers behind it.
 pub const GLIDE_LEAD: f32 = 0.05;
 pub const GLIDE_TRAIL: f32 = 0.085;
-/// Page and section entrances.
+/// Launch intro and new rows.
 pub const ENTER: f32 = 0.085;
+/// Page and section switches: a short fade in place, no travel.
+pub const PAGE: f32 = 0.05;
 /// Wheel and keyboard scrolling.
 pub const SCROLL: f32 = 0.055;
 /// Process rows moving to a new slot after a re-sort or filter.
@@ -233,16 +235,6 @@ impl Anim {
     }
 }
 
-/// Staggered entrance for the `i`th visible row of a list, from the page
-/// entrance progress `t`. Rows start about 25 ms apart.
-pub fn cascade(t: f32, i: usize) -> f32 {
-    if t >= 1.0 {
-        return 1.0;
-    }
-    let delay = (i as f32 * 0.045).min(0.55);
-    ((t - delay) / (1.0 - delay)).clamp(0.0, 1.0)
-}
-
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -327,13 +319,6 @@ mod tests {
         a.begin(true, (120.0, 100.0));
         assert_eq!(a.slide(key("p", 0), 50.0, GLIDE_LEAD), 50.0);
         assert!(a.mix(key("f", 0), 1.0, TOGGLE) < 1.0);
-    }
-
-    #[test]
-    fn cascade_staggers_and_finishes() {
-        assert_eq!(cascade(1.0, 40), 1.0);
-        assert!(cascade(0.3, 0) > cascade(0.3, 5));
-        assert_eq!(cascade(0.0, 0), 0.0);
     }
 
     #[test]

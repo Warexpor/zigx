@@ -19,7 +19,7 @@ alpha out of 255.
 
 | Token | Value | Use |
 | --- | --- | --- |
-| `CANVAS` | black at 200 (78%) | The window sheet. The desktop blur shows through it. The Glass setting swaps the alpha: 140 clear, 200 glass, 248 solid |
+| `CANVAS` | black at 200 (78%) | The window sheet. The desktop blur shows through it. The Glass setting swaps the alpha: 140 clear, 200 glass, 255 solid |
 | `CANVAS_LINE` | ink at 36 (14%) | Window edge |
 | `HAIRLINE` | ink at 30 (12%) | Dividers, graph baselines, disabled pill outline |
 | `GRID` | ink at 14 (5%) | Graph quarter grid, VRAM track |
@@ -34,8 +34,10 @@ alpha out of 255.
 
 | Token | Value | Use |
 | --- | --- | --- |
-| `ACCENT` | white, opaque | The one filled element: active segment, on switch |
-| `ON_ACCENT` | black, opaque | Text and knob on `ACCENT` |
+| `ACCENT` | ink at 26 (10%) | The one filled element: active segment, on chip, on switch |
+| `ACCENT_EDGE` | ink at 195 (76%) | Half-pixel edge of the `ACCENT` pill |
+| `ACCENT_HALO` | ink at 14 (5%) | Soft ring 1 px outside the `ACCENT` pill's edge |
+| `ON_ACCENT` | `INK` | Text and knob on `ACCENT` |
 | `ACCENT_LINE` | ink at 140 (55%) | Hovered pill and focused search outline |
 
 ### Status
@@ -91,8 +93,8 @@ monospace.
 Sizes are in design pixels (see [Layout](layout.md#scaling)). Tracking is in
 em.
 
-The only weight change is 500 on the wordmark and on text sitting on the white
-accent, where 400 would look thin against the fill.
+The only weight change is 500 on the wordmark and on text sitting on the
+accent pill, where it carries the active state along with the fill.
 
 ### Font stack
 

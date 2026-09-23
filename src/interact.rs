@@ -317,8 +317,7 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                         state.perf_scroll = 0.0;
                         return vec![Effect::Persist];
                     }
-                    _ if state.page == Page::Settings => return vec![],
-                    _ => state.search_focused = true,
+                    _ => return vec![],
                 }
             }
             if !c.is_control() {
@@ -803,6 +802,18 @@ mod tests {
         let kill = HitKind::MenuItem(MenuAction::ForceKill);
         let fx = on_press(&mut state, kill, false, false, [0.0, 0.0]);
         assert!(matches!(fx.as_slice(), [Effect::Signal(_, Sig::Kill)]));
+    }
+
+    #[test]
+    fn typing_does_not_focus_search_on_its_own() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.visible_pids = vec![10];
+        on_key(&mut state, KeyIn::Char('a'), false);
+        on_key(&mut state, KeyIn::Char(' '), false);
+        assert!(!state.search_focused);
+        assert!(state.query.is_empty());
+        assert!(state.held.is_some(), "space still freezes the list");
     }
 
     #[test]

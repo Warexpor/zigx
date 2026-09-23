@@ -29,9 +29,9 @@ a 1 px outline.
 with 16 side padding each, so short and long labels share one rhythm. The
 active segment is the `ACCENT` pill with a `PILL_ON` label in `ON_ACCENT`.
 Inactive labels are `INK_2`; hover gives a `HOVER` pill and `INK`. It is used
-for the process view and for every one-of-many setting. The white pill glides
-between segments, stretching toward the new one, and each label inverts as
-the pill covers it.
+for the process view and for every one-of-many setting. The smoked pill
+glides between segments, stretching toward the new one, and each label
+brightens and gains weight as the pill covers it.
 
 ## Chips
 
@@ -55,9 +55,9 @@ A pill-shaped field with a search glyph at 12 and text from 34.
 | Hover | `ACCENT_LINE` | None | Placeholder `INK_2` |
 | Focused | `ACCENT_LINE` | `GHOST` | Query in `NUM`, `INK`, with a caret |
 
-Typing anywhere on the Processes page starts a search. `Ctrl+F` focuses it,
-`Esc` clears it, and `Ctrl+Backspace` empties it. `Space` is the hold-to-freeze
-bind instead of a search character, until the field is already focused.
+Search takes keys only while the field is focused, by click or `Ctrl+F`.
+`Esc` clears it, and `Ctrl+Backspace` empties it. `Space` freezes the process
+list until the field is focused.
 
 ## End task
 
@@ -124,7 +124,7 @@ is a sort target with 4 px of extra hit area above and below.
 
 `switch()`. 32 x 18 with a 12 px knob.
 
-- On: a filled `ACCENT` track with an `ON_ACCENT` knob at the right.
+- On: a smoked `ACCENT` track with an `ON_ACCENT` knob at the right.
 - Off: a `GHOST_LINE` outline with an `INK_3` knob at the left.
 - The knob slides between the two while the track fills, stretching to 18 px
   wide mid-travel.

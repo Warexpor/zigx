@@ -24,8 +24,9 @@ Hierarchy is carried by alpha, size, and case, never by weight or hue.
 **Hairlines over boxes.** Structure is 1 px rules and ghost fills. Nothing is
 lifted, shadowed, or outlined heavier than it needs to be to read.
 
-**One filled element.** The active choice is a solid white pill with black
-text. It is the only opaque fill in the interface, so it always marks "this one".
+**One filled element.** The active choice is a smoked pill: a faint ink wash,
+a fine bright edge, and a barely-there halo, with white text. It is the
+only pill that is both filled and edged, so it always marks "this one".
 
 **Chroma is status.** Amber and red appear only when something is hot or
 destructive. Color never decorates.

@@ -8,15 +8,7 @@ pub fn percent(v: f32) -> String {
 }
 
 pub fn cpu_pct(v: f32) -> String {
-    if !v.is_finite() {
-        return "—".into();
-    }
-    let v = v.max(0.0);
-    if v < 10.0 {
-        format!("{v:.1}%")
-    } else {
-        format!("{v:.0}%")
-    }
+    percent(v)
 }
 
 static DECIMAL: AtomicBool = AtomicBool::new(false);
@@ -238,11 +230,13 @@ mod tests {
     }
 
     #[test]
-    fn cpu_pct_keeps_a_tenth_under_ten() {
-        assert_eq!(cpu_pct(0.4), "0.4%");
-        assert_eq!(cpu_pct(9.9), "9.9%");
+    fn cpu_pct_is_whole_numbers() {
+        assert_eq!(cpu_pct(0.4), "0%");
+        assert_eq!(cpu_pct(3.0), "3%");
+        assert_eq!(cpu_pct(9.9), "10%");
         assert_eq!(cpu_pct(10.0), "10%");
         assert_eq!(cpu_pct(42.2), "42%");
+        assert_eq!(percent(4.0), "4%");
     }
 
     #[test]

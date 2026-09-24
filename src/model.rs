@@ -133,6 +133,10 @@ pub struct Snap {
     pub swap_used: u64,
     pub mem_hist: Vec<f32>,
     pub swap_hist: Vec<f32>,
+    /// Bytes free across distinct mounted local filesystems (`f_bavail`).
+    pub disk_free: u64,
+    /// Bytes of capacity across those same filesystems (`f_blocks`).
+    pub disk_total: u64,
     pub disks: Vec<Disk>,
     pub nets: Vec<Net>,
     pub gpus: Vec<Gpu>,
@@ -167,6 +171,8 @@ impl Snap {
             swap_used: 0,
             mem_hist: Vec::new(),
             swap_hist: Vec::new(),
+            disk_free: 0,
+            disk_total: 0,
             disks: Vec::new(),
             nets: Vec::new(),
             gpus: Vec::new(),

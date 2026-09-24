@@ -225,6 +225,7 @@ impl Engine {
         let cpu_lines = self.read_cpu_lines();
         let mem = self.read_mem();
         let disks_raw = self.read_disks();
+        let (disk_free, disk_total) = read_disk_space();
         let nets_raw = self.read_nets();
         // Every reading, GPUs and the process table included, refreshes on the
         // same 1 s tick so the whole app changes in lockstep.
@@ -319,6 +320,8 @@ impl Engine {
             swap_used: mem.swap_used,
             mem_hist: dump(&self.mem_hist),
             swap_hist: dump(&self.swap_hist),
+            disk_free,
+            disk_total,
             disks,
             nets,
             gpus,
@@ -922,6 +925,93 @@ fn parse_disk_line(line: &str) -> Option<(String, u64, u64)> {
     Some((name.to_string(), nums[2], nums[6]))
 }
 
+/// Free and total bytes across distinct mounted local filesystems.
+///
+/// Walks `/proc/mounts`, keeps `/dev/*` sources (skipping loop/ram/zram), and
+/// dedupes by the canonical block device path. Btrfs subvolumes of one volume
+/// share a source (`/dev/mapper/root`) but get distinct `st_dev` values, so
+/// device identity — not `st_dev` — is what keeps capacity from being counted
+/// four times.
+fn read_disk_space() -> (u64, u64) {
+    let Ok(text) = fs::read_to_string("/proc/mounts") else {
+        return (0, 0);
+    };
+    let mut seen = HashSet::new();
+    let mut free = 0u64;
+    let mut total = 0u64;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(src) = parts.next() else { continue };
+        let Some(dst) = parts.next() else { continue };
+        if !is_local_block_source(src) {
+            continue;
+        }
+        let key = fs::canonicalize(src)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| src.to_string());
+        if !seen.insert(key) {
+            continue;
+        }
+        let mount = unescape_mount(dst);
+        let Some((avail, blocks)) = path_statvfs(&mount) else {
+            continue;
+        };
+        if blocks == 0 {
+            continue;
+        }
+        free = free.saturating_add(avail);
+        total = total.saturating_add(blocks);
+    }
+    (free, total)
+}
+
+fn is_local_block_source(src: &str) -> bool {
+    let Some(rest) = src.strip_prefix("/dev/") else {
+        return false;
+    };
+    let name = rest.rsplit('/').next().unwrap_or(rest);
+    !(name.starts_with("loop")
+        || name.starts_with("ram")
+        || name.starts_with("zram")
+        || name.starts_with("fd"))
+}
+
+fn unescape_mount(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_string();
+    }
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let oct = &raw[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(oct, 8) {
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn path_statvfs(path: &str) -> Option<(u64, u64)> {
+    let c = std::ffi::CString::new(path).ok()?;
+    let mut vfs = unsafe { std::mem::zeroed::<libc::statvfs>() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
+        return None;
+    }
+    let fr = vfs.f_frsize as u64;
+    if fr == 0 {
+        return None;
+    }
+    Some((vfs.f_bavail as u64 * fr, vfs.f_blocks as u64 * fr))
+}
+
 fn is_physical_disk(name: &str) -> bool {
     if name.starts_with("loop")
         || name.starts_with("ram")
@@ -1434,6 +1524,19 @@ mod tests {
         assert!(parse_disk_line("259 1 nvme0n1p1 1 0 10 0 1 0 20 0").is_none());
         assert!(!is_physical_disk("sda1"));
         assert!(is_physical_disk("sda"));
+        assert!(is_local_block_source("/dev/mapper/root"));
+        assert!(is_local_block_source("/dev/sda1"));
+        assert!(!is_local_block_source("/dev/loop0"));
+        assert!(!is_local_block_source("tmpfs"));
+        assert_eq!(unescape_mount("/mnt/foo\\040bar"), "/mnt/foo bar");
+        let (free, total) = read_disk_space();
+        assert!(total > 0, "expected a mounted local filesystem");
+        assert!(free <= total);
+        // One ~1 TB volume must not be counted once per btrfs subvolume.
+        assert!(
+            total < 2 * 1024 * 1024 * 1024 * 1024,
+            "disk total looks multi-counted: {total}"
+        );
         let stat = "12 (my proc) S 1 1 1 0 -1 4194560 1 0 0 0 10 20 0 0 20 0 3 0 1 2 99";
         let p = parse_proc_stat(stat).unwrap();
         assert_eq!(p.comm, "my proc");

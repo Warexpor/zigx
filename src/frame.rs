@@ -3074,6 +3074,18 @@ fn io_page(
         &devs.len().to_string(),
         if disk { "Devices" } else { "Interfaces" },
     );
+    if disk {
+        let space = if snap.disk_total > 0 {
+            format!(
+                "{} / {}",
+                bytes(snap.disk_free),
+                bytes(snap.disk_total)
+            )
+        } else {
+            "—".into()
+        };
+        stat(d, view.x + slot * 3.0, y, slot - 16.0, &space, "Free");
+    }
     y += 64.0;
 
     // Split the remaining sheet evenly between devices.
@@ -3149,7 +3161,7 @@ fn startup_page(
     let y = page_title(
         d,
         "Startup",
-        "Session autostart. Off writes Hidden=true to ~/.config/autostart and keeps a .bak.",
+        "XDG autostart entries. Off writes Hidden=true to ~/.config/autostart and keeps a .bak.",
         inner,
         inner.y,
     );

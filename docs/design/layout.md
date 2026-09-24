@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.5.3    |                                                      |
+| v0.5.4    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -105,7 +105,8 @@ window losing focus, sorts again. A key repeat does not recapture.
   a page has a secondary block (per-core bars, swap), the graph takes 62 to 68%
   of the spare height and the block takes the rest.
 - **I/O pages.** A totals stat row, then one block per device: name, then R/W
-  or RX/TX rates, then a two-series graph. The legend sits at the top left and
+  or RX/TX rates, then a two-series graph. Disk adds a Free slot (`free / total`
+  across distinct mounted local filesystems). The legend sits at the top left and
   the scale note at the top right. Spare height is split evenly between devices.
 - **GPU page.** One section per GPU. With several GPUs, each utilization graph
   is a fixed 120. VRAM is a 2 px meter: an `INK` fill on a `GRID` track.

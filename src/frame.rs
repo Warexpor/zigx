@@ -6,8 +6,8 @@ use crate::format::{
 };
 use crate::interact::selection_label;
 use crate::model::{
-    io_scale, theme, AppState, Col, ContextMenu, Density, Drag, MenuAction, Page, Proc, ProcView,
-    ScrollBar, Section, Snap, Sort, StartupEntry,
+    io_scale, scale_window, theme, AppState, Col, ContextMenu, Density, Drag, MenuAction, Page,
+    Proc, ProcView, ScrollBar, Section, Snap, Sort, StartupEntry,
 };
 use crate::settings::{Choice, Curve, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS};
 
@@ -95,7 +95,8 @@ pub enum HitKind {
     Sort(Col),
     Search,
     EndTask,
-    Group(bool),
+    /// Collapsible program group in Grouped view; value is `group_id(name)`.
+    Group(u64),
     Proc {
         pid: i32,
     },
@@ -1830,6 +1831,9 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         state.scroll = max_scroll;
     }
     let scroll = smooth_scroll(d, state, ScrollBar::Processes, (), state.scroll);
+    // List motion is its own switch; soft-disable Anim for the row block so
+    // search, pills and scroll still follow the global Animations setting.
+    let list_anim = d.anim.enable(d.anim.enabled() && state.settings.list_animations);
     let drawn_h = d.anim.slide(key("row-h", ()), row_h, anim::REORDER);
     // Under the rows: empty list space clears selection / unfreezes pins.
     d.hit(list, HitKind::Deselect);
@@ -1842,7 +1846,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         // rows short of it instead of streaking across the list, and a move
         // that starts and ends off screen just lands.
         let id = match row {
-            Row::Header { user, .. } => key("row-header", *user),
+            Row::Header { id, .. } => key("row-header", *id),
             Row::Proc(p) => key("row", p.pid),
         };
         let target = i as f32 * row_h;
@@ -1882,9 +1886,10 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                 title,
                 count,
                 open,
-                user,
+                id,
+                members,
             } => {
-                let turn = d.anim.toggle(key("chevron", *user), *open);
+                let turn = d.anim.toggle(key("chevron", *id), *open);
                 chevron(
                     d,
                     list.x + 2.0,
@@ -1892,15 +1897,8 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                     turn,
                     theme::INK_4,
                 );
-                eyebrow(
-                    d,
-                    list.x + 24.0,
-                    ry + (drawn_h - 14.0) * 0.5,
-                    200.0,
-                    title,
-                    Some(&count.to_string()),
-                );
-                d.hit(rr, HitKind::Group(*user));
+                draw_group(d, &cols, rr, title, *count, members, cpu_div);
+                d.hit(rr, HitKind::Group(*id));
             }
             Row::Proc(p) => {
                 let on = state.selected.contains(&p.pid);
@@ -1916,17 +1914,6 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         d.fade = saved_fade;
     }
     d.clip = None;
-    draw_header(d, &cols, header, state.sort, state.held.is_some());
-    d.hairline(Rect::new(inner.x, hair_y, inner.w, 1.0));
-    scrollbar(
-        d,
-        state,
-        list,
-        content_h,
-        scroll,
-        ScrollBar::Processes,
-        mouse,
-    );
     if rows.is_empty() {
         let a = d.anim.mix_from(key("empty", ()), 0.0, 1.0, anim::ENTER);
         d.faded(a, |d| {
@@ -1938,6 +1925,18 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
             )
         });
     }
+    d.anim.enable(list_anim);
+    draw_header(d, &cols, header, state.sort, state.held.is_some());
+    d.hairline(Rect::new(inner.x, hair_y, inner.w, 1.0));
+    scrollbar(
+        d,
+        state,
+        list,
+        content_h,
+        scroll,
+        ScrollBar::Processes,
+        mouse,
+    );
 }
 
 /// Group disclosure chevron: points right when `open` is 0 and turns a
@@ -1971,14 +1970,25 @@ fn smooth_scroll(
     }
 }
 
+#[derive(Debug)]
 enum Row<'a> {
     Header {
-        title: &'static str,
+        title: &'a str,
         count: usize,
         open: bool,
-        user: bool,
+        id: u64,
+        /// Full group, kept even when collapsed so the header can show totals.
+        members: Vec<&'a Proc>,
     },
     Proc(&'a Proc),
+}
+
+/// Stable id for a program group; case-insensitive so `Chrome` and `chrome` merge.
+fn group_id(name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    name.to_ascii_lowercase().hash(&mut h);
+    h.finish()
 }
 
 fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
@@ -2026,46 +2036,87 @@ fn arrange_rows<'a>(state: &AppState, procs: Vec<&'a Proc>, pin: bool) -> Vec<Ro
         };
         return procs.into_iter().map(Row::Proc).collect();
     }
-    let mut user: Vec<&Proc> = Vec::new();
-    let mut system: Vec<&Proc> = Vec::new();
+
+    // Bucket by program name in first-seen order from the sorted list.
+    let mut buckets: Vec<(&str, u64, Vec<&Proc>)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for p in procs {
-        if p.is_user {
-            user.push(p);
+        let key = p.name.to_ascii_lowercase();
+        if let Some(&i) = index.get(&key) {
+            buckets[i].2.push(p);
         } else {
-            system.push(p);
+            index.insert(key, buckets.len());
+            buckets.push((&p.name, group_id(&p.name), vec![p]));
         }
     }
-    let mut rows = Vec::new();
-    rows.push(Row::Header {
-        title: "User",
-        count: user.len(),
-        open: state.user_open,
-        user: true,
-    });
-    let mut pin_base = 0usize;
-    if state.user_open {
-        let n = user.len();
-        let user = if pin {
-            pin_procs(user, &state.pinned, pin_base)
-        } else {
-            user
-        };
-        pin_base += n;
-        rows.extend(user.into_iter().map(Row::Proc));
+    // Name sort: multi-instance programs float above one-offs, keeping the
+    // alphabetical order already established within each band. Metric sorts
+    // use the same aggregate the group header shows, not the hottest member.
+    match state.sort.col {
+        Col::Name => {
+            let mut multi = Vec::new();
+            let mut single = Vec::new();
+            for b in buckets {
+                if b.2.len() >= 2 {
+                    multi.push(b);
+                } else {
+                    single.push(b);
+                }
+            }
+            multi.append(&mut single);
+            buckets = multi;
+        }
+        Col::Cpu | Col::Gpu | Col::Memory | Col::Disk | Col::Threads => {
+            let col = state.sort.col;
+            let desc = state.sort.desc;
+            buckets.sort_by(|a, b| {
+                let ord = group_metric(&a.2, col)
+                    .partial_cmp(&group_metric(&b.2, col))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+                if desc {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            });
+        }
+        Col::Pid | Col::User => {}
     }
-    rows.push(Row::Header {
-        title: "System",
-        count: system.len(),
-        open: state.system_open,
-        user: false,
-    });
-    if state.system_open {
-        let system = if pin {
-            pin_procs(system, &state.pinned, pin_base)
-        } else {
-            system
-        };
-        rows.extend(system.into_iter().map(Row::Proc));
+
+    let mut rows = Vec::new();
+    let mut pin_base = 0usize;
+    for (title, id, members) in buckets {
+        let n = members.len();
+        // One-off processes stay as ordinary rows; only multi-instance
+        // programs get a collapsible header.
+        if n < 2 {
+            let members = if pin {
+                pin_procs(members, &state.pinned, pin_base)
+            } else {
+                members
+            };
+            pin_base += n;
+            rows.extend(members.into_iter().map(Row::Proc));
+            continue;
+        }
+        let open = state.open_groups.contains(&id);
+        rows.push(Row::Header {
+            title,
+            count: n,
+            open,
+            id,
+            members: members.clone(),
+        });
+        if open {
+            let members = if pin {
+                pin_procs(members, &state.pinned, pin_base)
+            } else {
+                members
+            };
+            pin_base += n;
+            rows.extend(members.into_iter().map(Row::Proc));
+        }
     }
     rows
 }
@@ -2141,6 +2192,18 @@ fn sort_procs(procs: &mut [&Proc], col: Col, desc: bool) {
 
 fn disk_sum(p: &Proc) -> f64 {
     p.read_bps.unwrap_or(0.0) + p.write_bps.unwrap_or(0.0)
+}
+
+/// Aggregate used for grouped-view sort order — same numbers the header shows.
+fn group_metric(members: &[&Proc], col: Col) -> f64 {
+    match col {
+        Col::Cpu => members.iter().map(|p| p.cpu as f64).sum(),
+        Col::Gpu => members.iter().map(|p| p.gpu as f64).sum(),
+        Col::Memory => members.iter().map(|p| p.rss as f64).sum(),
+        Col::Disk => members.iter().map(|p| disk_sum(p)).sum(),
+        Col::Threads => members.iter().map(|p| p.threads as f64).sum(),
+        _ => 0.0,
+    }
 }
 
 struct ColSpec {
@@ -2320,6 +2383,92 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f
             }
         }
     }
+}
+
+/// Program group header: same columns as a process row, values summed across
+/// members. Name sits past the chevron; the process count tags it like a badge.
+fn draw_group(
+    d: &mut DrawList,
+    cols: &[ColSpec],
+    row: Rect,
+    title: &str,
+    count: usize,
+    members: &[&Proc],
+    cpu_div: f32,
+) {
+    let cpu = members.iter().map(|p| p.cpu).sum::<f32>() / cpu_div;
+    let gpu = members.iter().map(|p| p.gpu).sum::<f32>();
+    let rss = members.iter().map(|p| p.rss).sum::<u64>();
+    let threads = members.iter().map(|p| p.threads).sum::<u32>();
+    let read = sum_opt(members.iter().map(|p| p.read_bps));
+    let write = sum_opt(members.iter().map(|p| p.write_bps));
+    let user = members.first().and_then(|first| {
+        members
+            .iter()
+            .all(|p| p.user == first.user)
+            .then_some(first.user.as_str())
+    });
+    let disk = read.unwrap_or(0.0) + write.unwrap_or(0.0);
+
+    for c in cols {
+        // Clear the chevron: name starts at least 24 from the row edge.
+        let x = if c.col == Col::Name {
+            c.x.max(24.0)
+        } else {
+            c.x
+        };
+        let r = Rect::new(row.x + x, row.y, c.w - 10.0 - (x - c.x), row.h);
+        let text = match c.col {
+            Col::Name => title.to_string(),
+            Col::Cpu => cpu_pct(cpu),
+            Col::Gpu => cpu_pct(gpu),
+            Col::Memory => bytes(rss),
+            Col::Disk => disk_cell(read, write),
+            Col::Pid => "—".into(),
+            Col::User => user.unwrap_or("—").to_string(),
+            Col::Threads => threads.to_string(),
+        };
+        let idle = match c.col {
+            Col::Cpu => cpu < 0.05,
+            Col::Gpu => gpu < 0.05,
+            Col::Disk => disk < 1.0,
+            _ => false,
+        };
+        let color = match c.col {
+            Col::Name => theme::INK,
+            Col::Cpu if idle => theme::INK_4,
+            Col::Cpu => heat(d, cpu, theme::INK),
+            Col::Gpu if idle => theme::INK_4,
+            Col::Gpu => heat(d, gpu, theme::INK),
+            Col::Pid => theme::INK_4,
+            _ if idle => theme::INK_4,
+            _ => theme::INK_2,
+        };
+        let t = if c.mono { NUM } else { BODY };
+        if c.right {
+            d.text_r(&text, r, t, color);
+        } else {
+            d.text(&text, r, t, color);
+        }
+        if c.col == Col::Name {
+            let nw = measure(&text, BODY);
+            let tag = format!("{count}");
+            let tr = Rect::new(r.x + nw + 10.0, r.y, (r.w - nw - 10.0).max(0.0), r.h);
+            if tr.w >= measure(&tag, MICRO_NUM) {
+                d.text(&tag, tr, MICRO_NUM, theme::INK_4);
+            }
+        }
+    }
+}
+
+fn sum_opt(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut any = false;
+    for v in values.flatten() {
+        total += v;
+        any = true;
+    }
+    any.then_some(total)
 }
 
 /// Room kept free at the right of a scrolling list so its thumb never sits
@@ -2615,16 +2764,6 @@ fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) ->
     if n == 0 {
         return y;
     }
-    let peak = snap.cpu_per.iter().copied().fold(0.0_f32, f32::max);
-    eyebrow(
-        d,
-        view.x,
-        y,
-        view.w,
-        "Cores",
-        Some(&format!("{n} logical   peak {}", percent(peak))),
-    );
-    y += 24.0;
     // Bars read the per-core rings at the graph's playback head, so they glide
     // on the same clock and curve as the utilization trace above.
     let cores: Vec<f32> = snap
@@ -2639,6 +2778,16 @@ fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) ->
             }
         })
         .collect();
+    let peak = cores.iter().copied().fold(0.0_f32, f32::max);
+    eyebrow(
+        d,
+        view.x,
+        y,
+        view.w,
+        "Cores",
+        Some(&format!("{n} logical   peak {}", percent(peak))),
+    );
+    y += 24.0;
     equalizer(d, Rect::new(view.x, y, view.w, cores_h), &cores);
     y + cores_h + 16.0
 }
@@ -2946,7 +3095,12 @@ fn io_page(
             theme::INK_3,
         );
         y += 26.0;
-        let goal = io_scale(a_hist, b_hist, head, state.settings.window());
+        let goal = io_scale(
+            a_hist,
+            b_hist,
+            head,
+            scale_window(state.settings.window()),
+        );
         let key = format!("{}:{name}", if disk { "disk" } else { "net" });
         let max = state.perf_smooth.io_max(&key).unwrap_or(goal);
         let gr = Rect::new(view.x, y, view.w, graph_h);
@@ -3259,6 +3413,11 @@ fn settings_groups(state: &AppState) -> Vec<(&'static str, Vec<SetRow>)> {
                     ),
                 ),
                 row(
+                    "List animations",
+                    "Rows glide and fade when the list reorders",
+                    Ctl::Switch(Opt::ListAnimations, s.list_animations),
+                ),
+                row(
                     "Confirm ending",
                     "End task and Force kill ask for a second click",
                     Ctl::Switch(Opt::Confirm, s.confirm),
@@ -3516,6 +3675,73 @@ mod tests {
             threads: 1,
             is_user: pid % 2 == 0,
             stopped: false,
+        }
+    }
+
+    fn named(pid: i32, name: &str, cpu: f32) -> Proc {
+        let mut p = proc(pid, cpu);
+        p.name = name.into();
+        p
+    }
+
+    #[test]
+    fn grouped_view_clusters_by_program_name() {
+        use super::{arrange_rows, group_id, Row};
+        use crate::model::{Col, ProcView, Sort};
+
+        let chrome_a = named(1, "chrome", 40.0);
+        let chrome_b = named(2, "Chrome", 10.0); // case-insensitive merge
+        let zigx = named(3, "zigx", 5.0);
+        let procs = vec![&chrome_a, &chrome_b, &zigx];
+
+        let mut state = AppState::new(800.0, 600.0);
+        state.view = ProcView::Grouped;
+        // Default: groups start collapsed.
+        let rows = arrange_rows(&state, procs.clone(), false);
+        match &rows[..] {
+            [Row::Header {
+                title,
+                count: 2,
+                open: false,
+                id,
+                members: _,
+            }, Row::Proc(solo)] => {
+                assert_eq!(*title, "chrome");
+                assert_eq!(*id, group_id("chrome"));
+                assert_eq!(solo.pid, 3);
+            }
+            other => panic!("unexpected collapsed rows: {other:?}"),
+        }
+
+        state.open_groups.insert(group_id("chrome"));
+        let rows = arrange_rows(&state, procs, false);
+        match &rows[..] {
+            [Row::Header {
+                open: true,
+                ..
+            }, Row::Proc(a), Row::Proc(b), Row::Proc(solo)] => {
+                assert_eq!(a.pid, 1);
+                assert_eq!(b.pid, 2);
+                assert_eq!(solo.pid, 3);
+            }
+            other => panic!("unexpected open rows: {other:?}"),
+        }
+
+        // Name sort floats multi-instance groups above one-offs.
+        let aaa = named(10, "aaa", 1.0);
+        let zzz_a = named(11, "zzz", 1.0);
+        let zzz_b = named(12, "zzz", 1.0);
+        state.sort = Sort {
+            col: Col::Name,
+            desc: false,
+        };
+        state.open_groups.clear();
+        let rows = arrange_rows(&state, vec![&aaa, &zzz_a, &zzz_b], false);
+        match &rows[..] {
+            [Row::Header { title: "zzz", .. }, Row::Proc(solo)] => {
+                assert_eq!(solo.name, "aaa");
+            }
+            other => panic!("groups should precede singletons by name: {other:?}"),
         }
     }
 

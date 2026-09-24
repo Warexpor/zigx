@@ -11,8 +11,11 @@ use std::time::{Duration, Instant};
 use crate::model::{Disk, Gpu, Net, Proc, Snap, HIST_CAP};
 
 const PF_KTHREAD: u64 = 0x00200000;
-/// Gap between the priming read and the first real sample.
-const PRIME_MS: u64 = 250;
+/// Delay before the priming read so the window can open first.
+const PRIME_MS: u64 = 50;
+/// Gap after priming before the first real sample. Must exceed
+/// [`MIN_DT_SECS`] so rates and history advance on that tick.
+const FIRST_SAMPLE_MS: u64 = 220;
 /// Shortest delta a rate is computed over; guards against divide-by-tiny.
 const MIN_DT_SECS: f64 = 0.2;
 
@@ -89,7 +92,7 @@ pub fn spawn(period_ms: u64, wake: impl Fn() + Send + 'static) -> Hub {
                 let now = Instant::now();
                 let period = Duration::from_millis(ms);
                 if priming {
-                    next = now + Duration::from_millis(PRIME_MS);
+                    next = now + Duration::from_millis(FIRST_SAMPLE_MS);
                 } else {
                     next += period;
                     if next <= now {
@@ -141,6 +144,9 @@ pub struct Engine {
     kthreads: u32,
     last_cpu_total: f32,
     last_cpu_per: Vec<f32>,
+    /// Last published snapshot. Republished unchanged when a tick arrives too
+    /// soon to form an honest rate, so counters are not eaten.
+    last_snap: Option<Snap>,
     cached_proc_gpu: HashMap<i32, f32>,
     sample_avg: f32,
     hist_at: Instant,
@@ -181,6 +187,7 @@ impl Engine {
             kthreads: 0,
             last_cpu_total: 0.0,
             last_cpu_per: Vec::new(),
+            last_snap: None,
             cached_proc_gpu: HashMap::new(),
             sample_avg: 0.0,
             hist_at: Instant::now(),
@@ -204,6 +211,17 @@ impl Engine {
         let started = Instant::now();
         let now = Instant::now();
         let dt = now.duration_since(self.prev_at).as_secs_f64();
+        let min_dt = MIN_DT_SECS;
+        // A tick sooner than MIN_DT cannot form an honest rate. Republish the
+        // last snap and leave counters alone so the next full period still
+        // spans every byte and CPU tick since the previous good sample.
+        if self.primed && dt <= min_dt {
+            if let Some(snap) = &self.last_snap {
+                return snap.clone();
+            }
+        }
+        let priming = !self.primed;
+        let advance = self.primed && dt > min_dt;
         let cpu_lines = self.read_cpu_lines();
         let mem = self.read_mem();
         let disks_raw = self.read_disks();
@@ -214,12 +232,10 @@ impl Engine {
         self.cached_proc_gpu = self.read_proc_gpus();
         // cpu_lines[0] is the aggregate; the rest are one entry per core.
         let cores = cpu_lines.len().saturating_sub(1).max(1) as u32;
-        let procs = self.read_procs(cores);
+        let procs = self.read_procs(cores, advance, priming);
 
         let mut cpu_total = 0.0;
         let mut cpu_per = Vec::new();
-        let min_dt = MIN_DT_SECS;
-        let advance = self.primed && dt > min_dt;
         if advance {
             if let Some((idle0, total0)) = cpu_lines.first() {
                 if let Some((pi, pt)) = self.prev_cpu.first() {
@@ -256,8 +272,8 @@ impl Engine {
             }
         }
 
-        let disks = self.finish_disks(disks_raw, dt, min_dt);
-        let nets = self.finish_nets(nets_raw, dt, min_dt);
+        let disks = self.finish_disks(disks_raw, dt, advance, priming);
+        let nets = self.finish_nets(nets_raw, dt, advance, priming);
         let gpus = self.finish_gpus(gpu_raw, advance);
         if advance {
             self.hist_at = now;
@@ -267,8 +283,13 @@ impl Engine {
             }
         }
 
-        self.prev_cpu = cpu_lines.iter().map(|(i, t)| (*i, *t)).collect();
-        self.prev_at = now;
+        // Only move the rate baselines when this tick produced rates (or is
+        // the priming read). A short fall-through after a speed change must
+        // not eat the counters the next full period will need.
+        if advance || priming {
+            self.prev_cpu = cpu_lines.iter().map(|(i, t)| (*i, *t)).collect();
+            self.prev_at = now;
+        }
         self.primed = true;
 
         let freq = read_freqs(cpu_per.len());
@@ -282,7 +303,7 @@ impl Engine {
             self.sample_avg * 0.8 + ms * 0.2
         };
 
-        Snap {
+        let snap = Snap {
             cpu_model: self.cpu_model.clone(),
             cpu_total,
             cpu_per,
@@ -310,7 +331,9 @@ impl Engine {
             sample_ms: self.sample_avg,
             hist_at: self.hist_at,
             hist_seq: self.hist_seq,
-        }
+        };
+        self.last_snap = Some(snap.clone());
+        snap
     }
 
     fn read_cpu_lines(&mut self) -> Vec<(u64, u64)> {
@@ -401,7 +424,7 @@ impl Engine {
         HashMap::new()
     }
 
-    fn read_procs(&mut self, cores: u32) -> Vec<Proc> {
+    fn read_procs(&mut self, cores: u32, advance: bool, priming: bool) -> Vec<Proc> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut kthreads = 0u32;
@@ -445,16 +468,20 @@ impl Engine {
                     ),
                     _ => (None, None, None, None, false),
                 };
-            let (read_bps, write_bps, read_bytes, write_bytes, io_denied) = if prev_denied {
-                (None, None, None, None, true)
-            } else {
-                self.proc_io(pid, prev_read, prev_write, prev_at)
-            };
+            let (read_bps, write_bps, read_bytes, write_bytes, io_denied) =
+                if !advance && !priming {
+                    // Short fall-through: leave baselines alone.
+                    (None, None, prev_read, prev_write, prev_denied)
+                } else if prev_denied {
+                    (None, None, None, None, true)
+                } else {
+                    self.proc_io(pid, prev_read, prev_write, prev_at)
+                };
             let at = Instant::now();
             let dt = prev_at
                 .map(|t| at.saturating_duration_since(t).as_secs_f64())
                 .unwrap_or(0.0);
-            let cpu = if self.primed {
+            let cpu = if advance {
                 match prev_ticks {
                     Some(was) if ticks >= was => proc_cpu_pct(ticks - was, self.clk_tck, dt, cores),
                     _ => 0.0,
@@ -462,17 +489,19 @@ impl Engine {
             } else {
                 0.0
             };
-            self.prev_proc.insert(
-                pid,
-                ProcPrev {
-                    ticks,
-                    start: stat.start,
-                    at,
-                    read_bytes,
-                    write_bytes,
-                    io_denied,
-                },
-            );
+            if advance || priming {
+                self.prev_proc.insert(
+                    pid,
+                    ProcPrev {
+                        ticks,
+                        start: stat.start,
+                        at,
+                        read_bytes,
+                        write_bytes,
+                        io_denied,
+                    },
+                );
+            }
             let name = self.proc_name(pid, &stat.comm, stat.start);
             out.push(Proc {
                 pid,
@@ -489,8 +518,10 @@ impl Engine {
                 stopped: stat.stopped,
             });
         }
-        self.prev_proc.retain(|pid, _| seen.contains(pid));
-        self.names.retain(|pid, _| seen.contains(pid));
+        if advance || priming {
+            self.prev_proc.retain(|pid, _| seen.contains(pid));
+            self.names.retain(|pid, _| seen.contains(pid));
+        }
         self.kthreads = kthreads;
         out
     }
@@ -558,6 +589,7 @@ impl Engine {
         self.gpu_hist.clear();
         self.hist_seq = 0;
         self.hist_period = period_ms;
+        self.last_snap = None;
     }
 
     fn read_proc_name(&mut self, pid: i32, comm: &str) -> String {
@@ -614,32 +646,51 @@ impl Engine {
         name
     }
 
-    fn finish_disks(&mut self, raw: Vec<(String, u64, u64)>, dt: f64, min_dt: f64) -> Vec<Disk> {
+    fn finish_disks(
+        &mut self,
+        raw: Vec<(String, u64, u64)>,
+        dt: f64,
+        advance: bool,
+        priming: bool,
+    ) -> Vec<Disk> {
         let mut out = Vec::new();
         let mut keep = HashSet::new();
         for (name, sectors_r, sectors_w) in raw {
             keep.insert(name.clone());
-            let (read_bps, write_bps) = if self.primed && dt > min_dt {
-                if let Some((pr, pw)) = self.prev_disk.get(&name) {
+            let (read_bps, write_bps) = if advance {
+                let rates = if let Some((pr, pw)) = self.prev_disk.get(&name) {
                     (
                         (sectors_r.saturating_sub(*pr) as f64) * 512.0 / dt,
                         (sectors_w.saturating_sub(*pw) as f64) * 512.0 / dt,
                     )
                 } else {
                     (0.0, 0.0)
-                }
-            } else {
+                };
+                self.prev_disk.insert(name.clone(), (sectors_r, sectors_w));
+                let hist = self
+                    .disk_hist
+                    .entry(name.clone())
+                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
+                push_hist(&mut hist.0, rates.0 as f32);
+                push_hist(&mut hist.1, rates.1 as f32);
+                rates
+            } else if priming {
+                self.prev_disk.insert(name.clone(), (sectors_r, sectors_w));
+                self.disk_hist
+                    .entry(name.clone())
+                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
                 (0.0, 0.0)
+            } else {
+                let hist = self
+                    .disk_hist
+                    .entry(name.clone())
+                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
+                (
+                    hist.0.back().copied().unwrap_or(0.0) as f64,
+                    hist.1.back().copied().unwrap_or(0.0) as f64,
+                )
             };
-            self.prev_disk.insert(name.clone(), (sectors_r, sectors_w));
-            let hist = self
-                .disk_hist
-                .entry(name.clone())
-                .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
-            if self.primed && dt > min_dt {
-                push_hist(&mut hist.0, read_bps as f32);
-                push_hist(&mut hist.1, write_bps as f32);
-            }
+            let hist = self.disk_hist.get(&name).unwrap();
             out.push(Disk {
                 name,
                 read_bps,
@@ -648,37 +699,58 @@ impl Engine {
                 write_hist: dump(&hist.1),
             });
         }
-        self.prev_disk.retain(|k, _| keep.contains(k));
-        self.disk_hist.retain(|k, _| keep.contains(k));
+        if advance || priming {
+            self.prev_disk.retain(|k, _| keep.contains(k));
+            self.disk_hist.retain(|k, _| keep.contains(k));
+        }
         out
     }
 
-    fn finish_nets(&mut self, raw: Vec<(String, u64, u64)>, dt: f64, min_dt: f64) -> Vec<Net> {
+    fn finish_nets(
+        &mut self,
+        raw: Vec<(String, u64, u64)>,
+        dt: f64,
+        advance: bool,
+        priming: bool,
+    ) -> Vec<Net> {
         let mut out = Vec::new();
         let mut keep = HashSet::new();
         for (name, rx, tx) in raw {
             keep.insert(name.clone());
-            let (rx_bps, tx_bps) = if self.primed && dt > min_dt {
-                if let Some((pr, pt)) = self.prev_net.get(&name) {
+            let (rx_bps, tx_bps) = if advance {
+                let rates = if let Some((pr, pt)) = self.prev_net.get(&name) {
                     (
                         rx.saturating_sub(*pr) as f64 / dt,
                         tx.saturating_sub(*pt) as f64 / dt,
                     )
                 } else {
                     (0.0, 0.0)
-                }
-            } else {
+                };
+                self.prev_net.insert(name.clone(), (rx, tx));
+                let hist = self
+                    .net_hist
+                    .entry(name.clone())
+                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
+                push_hist(&mut hist.0, rates.0 as f32);
+                push_hist(&mut hist.1, rates.1 as f32);
+                rates
+            } else if priming {
+                self.prev_net.insert(name.clone(), (rx, tx));
+                self.net_hist
+                    .entry(name.clone())
+                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
                 (0.0, 0.0)
+            } else {
+                let hist = self
+                    .net_hist
+                    .entry(name.clone())
+                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
+                (
+                    hist.0.back().copied().unwrap_or(0.0) as f64,
+                    hist.1.back().copied().unwrap_or(0.0) as f64,
+                )
             };
-            self.prev_net.insert(name.clone(), (rx, tx));
-            let hist = self
-                .net_hist
-                .entry(name.clone())
-                .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
-            if self.primed && dt > min_dt {
-                push_hist(&mut hist.0, rx_bps as f32);
-                push_hist(&mut hist.1, tx_bps as f32);
-            }
+            let hist = self.net_hist.get(&name).unwrap();
             out.push(Net {
                 name,
                 rx_bps,
@@ -687,8 +759,10 @@ impl Engine {
                 tx_hist: dump(&hist.1),
             });
         }
-        self.prev_net.retain(|k, _| keep.contains(k));
-        self.net_hist.retain(|k, _| keep.contains(k));
+        if advance || priming {
+            self.prev_net.retain(|k, _| keep.contains(k));
+            self.net_hist.retain(|k, _| keep.contains(k));
+        }
         out
     }
 
@@ -700,9 +774,12 @@ impl Engine {
             .enumerate()
             .map(|(i, g)| {
                 if advance {
-                    if let Some(u) = g.util {
-                        push_hist(&mut self.gpu_hist[i], u);
-                    }
+                    // Always push so util_hist stays aligned with hist_seq even
+                    // when a single NVML/sysfs read misses.
+                    let u = g.util.unwrap_or_else(|| {
+                        self.gpu_hist[i].back().copied().unwrap_or(0.0)
+                    });
+                    push_hist(&mut self.gpu_hist[i], u);
                 }
                 Gpu {
                     name: g.name,
@@ -1452,7 +1529,7 @@ mod tests {
     fn live_sample_sees_this_machine() {
         let mut eng = Engine::new();
         let _ = eng.tick(0);
-        thread::sleep(Duration::from_millis(PRIME_MS));
+        thread::sleep(Duration::from_millis(FIRST_SAMPLE_MS));
         let snap = eng.tick(0);
         assert!(snap.mem_total > 0, "meminfo");
         assert!(!snap.cpu_per.is_empty(), "cores");

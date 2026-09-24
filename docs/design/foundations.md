@@ -109,9 +109,7 @@ Sans Mono, Liberation Mono, DejaVu Sans Mono.
 
 Helpers are in `src/format.rs`.
 
-- System percentages (`percent`): whole numbers, "37%".
-- Per-process CPU and GPU (`cpu_pct`): one decimal under 10%, whole above, so
-  the many near-idle rows still sort visibly.
+- Percentages (`percent`, `cpu_pct`): whole numbers, "37%".
 - Bytes: binary steps shown as KB, MB, GB, TB. The Byte units setting switches
   to decimal steps of 1000 with the same labels.
 - Temperature: "62 °C", or whole degrees Fahrenheit when set.

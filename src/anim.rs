@@ -150,6 +150,15 @@ impl Anim {
         self.on
     }
 
+    /// Temporarily override whether motion runs. Returns the previous value
+    /// so a caller can restore it after a scoped block (e.g. the process list
+    /// when List animations is off).
+    pub fn enable(&mut self, on: bool) -> bool {
+        let prev = self.on;
+        self.on = on;
+        prev
+    }
+
     fn run(&mut self, k: Key, from: f32, target: f32, time: f32, eps: f32, snap: bool) -> f32 {
         let frame = self.frame;
         let (on, dt) = (self.on && !snap, self.dt);

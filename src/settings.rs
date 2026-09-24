@@ -147,6 +147,8 @@ pub enum Opt {
     Units,
     Temp,
     Column(Col),
+    /// Process-list row glides, fades, and hover fills.
+    ListAnimations,
     Confirm,
     OpenOn,
 }
@@ -176,6 +178,9 @@ pub struct Settings {
     pub show_pid: bool,
     pub show_user: bool,
     pub show_threads: bool,
+    /// Process-list row glides, fades and hover fills. Interface animation
+    /// still covers everything else.
+    pub list_animations: bool,
     /// End task and Force kill ask for a second click.
     pub confirm: bool,
     pub open_on: OpenOn,
@@ -202,6 +207,7 @@ impl Default for Settings {
             show_pid: true,
             show_user: true,
             show_threads: true,
+            list_animations: true,
             confirm: true,
             open_on: OpenOn::Last,
         }
@@ -285,6 +291,7 @@ impl Settings {
                         }
                     }
                 }
+                "list_animations" => s.list_animations = on(v),
                 "confirm" => s.confirm = on(v),
                 "open_on" => set(&mut s.open_on, v),
                 _ => {}
@@ -305,7 +312,7 @@ impl Settings {
              glass={}\nanimations={}\nmotion={}\nheat={}\nreadout={}\n\
              history={}\ncurve={}\nfill={}\ngrid={}\n\
              speed={}\nprocess_cpu={}\nunits={}\ntemperature={}\n\
-             columns={}\nconfirm={}\nopen_on={}\n",
+             columns={}\nlist_animations={}\nconfirm={}\nopen_on={}\n",
             self.glass.key(),
             flag(self.animations),
             self.motion.key(),
@@ -320,6 +327,7 @@ impl Settings {
             self.units.key(),
             self.temp.key(),
             cols.join(","),
+            flag(self.list_animations),
             flag(self.confirm),
             self.open_on.key(),
         )
@@ -379,6 +387,7 @@ mod tests {
             show_pid: false,
             show_user: true,
             show_threads: false,
+            list_animations: false,
             confirm: false,
             open_on: OpenOn::Performance,
         };

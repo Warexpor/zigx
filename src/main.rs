@@ -324,7 +324,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.page == Page::Performance || animating(&self.state) || self.zooming() {
+        // Smooth Performance playback needs display-rate frames. Paused holds
+        // the playhead, and Reduced steps once per sample, so those modes only
+        // need frames while UI motion is still settling.
+        let perf_live = self.state.page == Page::Performance
+            && !self.state.paused
+            && (!self.state.settings.reduced() || animating(&self.state));
+        if perf_live || animating(&self.state) || self.zooming() {
             // Keep graph playback and transitions advancing at display rate.
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(

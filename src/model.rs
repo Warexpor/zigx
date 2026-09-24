@@ -309,8 +309,9 @@ pub struct AppState {
     pub menu_ghost: Option<ContextMenu>,
     /// Last search keystroke or focus; the caret blinks from here.
     pub typed_at: Instant,
-    pub user_open: bool,
-    pub system_open: bool,
+    /// Program groups the user has expanded in Grouped view (hashed names).
+    /// Empty means every group starts collapsed.
+    pub open_groups: BTreeSet<u64>,
     pub width: f32,
     pub height: f32,
     /// Interface zoom. Layout stays in design pixels; this scales them onto the window.
@@ -364,9 +365,9 @@ impl Default for PerfSmooth {
 const CLOCK_TAU: f32 = 0.6;
 const BAR_TAU: f32 = 0.14;
 /// I/O scale smooth times. Growing is quicker so the scale is ready before a
-/// burst is drawn; shrinking is slow so the graph relaxes after it leaves.
+/// burst is drawn; shrinking follows so quiet traffic zooms back in.
 const SCALE_GROW: f32 = 0.35;
-const SCALE_SHRINK: f32 = 0.9;
+const SCALE_SHRINK: f32 = 0.5;
 
 impl PerfSmooth {
     pub fn tick(&mut self, snap: &Snap, settings: &Settings, paused: bool) {
@@ -379,7 +380,11 @@ impl PerfSmooth {
         self.window = settings.window();
         // Capped so a resume after a pause glides back instead of jumping ahead.
         let lag = (snap.hist_at.elapsed().as_secs_f64() / period).min(1.5);
-        let target = snap.hist_seq as f64 - GRAPH_DELAY + lag;
+        // During grow-in the ring is shorter than the steady delay: stay closer
+        // to the tip so the first ink appears promptly instead of waiting out
+        // a full GRAPH_DELAY with an empty plot.
+        let delay = GRAPH_DELAY.min(snap.hist_seq as f64);
+        let target = snap.hist_seq as f64 - delay + lag;
 
         // Advance at exactly one sample per period, then bleed off drift and
         // jitter slowly so the scroll speed never visibly changes. Paused
@@ -423,8 +428,9 @@ impl PerfSmooth {
                     .iter()
                     .map(|n| (format!("net:{}", n.name), &n.rx_hist, &n.tx_hist)),
             );
+        let span = scale_window(self.window);
         for (key, a, b) in devs {
-            let goal = io_scale(a, b, head, self.window).ln();
+            let goal = io_scale(a, b, head, span).ln();
             let m = self.io_max.entry(key.clone()).or_insert(Spring::new(goal));
             if fresh || reduced {
                 *m = Spring::new(goal);
@@ -462,9 +468,15 @@ impl PerfSmooth {
     }
 }
 
-/// Target scale for a pair of rate histories: the nice ceiling of what the
-/// graph shows at `head`, plus the samples the curve is heading into, so the
-/// scale grows before a burst is drawn and relaxes once it scrolls out.
+/// How many recent samples set the I/O Y-scale. Shorter than the drawn window
+/// so quiet traffic zooms back in while older spikes are still scrolling off.
+pub fn scale_window(drawn_window: usize) -> usize {
+    (drawn_window / 4).clamp(6, 16)
+}
+
+/// Target scale for a pair of rate histories: the nice ceiling of recent
+/// traffic at `head`, plus the samples the curve is heading into, so the
+/// scale grows before a burst and shrinks again when focus is quieter.
 pub fn io_scale(a: &[f32], b: &[f32], head: f32, window: usize) -> f32 {
     crate::format::nice_ceil(window_peak(a, head, window).max(window_peak(b, head, window)))
 }
@@ -530,8 +542,7 @@ impl AppState {
             menu: None,
             menu_ghost: None,
             typed_at: Instant::now(),
-            user_open: true,
-            system_open: true,
+            open_groups: BTreeSet::new(),
             width,
             height,
             ui_scale: 1.0,
@@ -622,7 +633,7 @@ pub mod theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{snap_ui_scale, step_ui_scale};
+    use super::{io_scale, scale_window, snap_ui_scale, step_ui_scale};
 
     #[test]
     fn zoom_steps_and_clamps() {
@@ -631,5 +642,27 @@ mod tests {
         assert!((step_ui_scale(0.8, -1) - 0.8).abs() < 0.001);
         assert!((step_ui_scale(1.8, 1) - 1.8).abs() < 0.001);
         assert!((snap_ui_scale(1.12) - 1.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn scale_window_is_shorter_than_history() {
+        assert_eq!(scale_window(30), 7);
+        assert_eq!(scale_window(60), 15);
+        assert_eq!(scale_window(120), 16);
+        assert_eq!(scale_window(4), 6);
+    }
+
+    #[test]
+    fn io_scale_follows_recent_traffic_not_old_spikes() {
+        // Old spike on the left, quiet recent samples near head=0.
+        let mut hist = vec![0.0; 30];
+        hist[0] = 100_000_000.0;
+        for v in &mut hist[20..] {
+            *v = 1_000_000.0;
+        }
+        let full = io_scale(&hist, &hist, 0.0, 30);
+        let recent = io_scale(&hist, &hist, 0.0, scale_window(30));
+        assert!(full > recent * 10.0, "full={full} recent={recent}");
+        assert!((recent - 1_000_000.0).abs() < 1.0, "recent={recent}");
     }
 }

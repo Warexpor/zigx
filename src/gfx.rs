@@ -144,22 +144,34 @@ fn vs_main(v: Vin) -> Vout {
 
 @fragment
 fn fs_main(v: Vout) -> @location(0) vec4<f32> {
+    // Derivatives must be taken in uniform control flow, before the branch.
+    let slope = dpdx(v.axis.x);
     if v.edge.y < 0.0 {
         // Wash under a trace. axis = (trace y at this column, baseline y); both
         // are linear across each slice, so the fade is exact per pixel and has
         // no seam along the triangle split, however steep the slice.
         let span = max(v.axis.y - v.axis.x, 1.0);
         let t = clamp((v.axis.y - v.clip.y) / span, 0.0, 1.0);
+        // Box-filtered top edge. A hard edge stair-steps on moderate slopes.
+        let below = (v.clip.y - v.axis.x) * inverseSqrt(1.0 + slope * slope);
+        let edge = clamp(below + 0.5, 0.0, 1.0);
         // Static screen-space dither: a gradient this faint bands in 8 bits.
         let n = fract(sin(dot(floor(v.clip.xy), vec2<f32>(12.9898, 78.233))) * 43758.5453) - 0.5;
-        return max(v.color * t + vec4<f32>(n / 255.0), vec4<f32>(0.0));
+        return max(v.color * (t * edge) + vec4<f32>(n * edge / 255.0), vec4<f32>(0.0));
     }
     // Capsule distance: perpendicular inside the run, radial past a capped end.
     let over = max(max(v.axis.x, v.axis.y), 0.0);
     let dist = length(vec2<f32>(over, abs(v.edge.x)));
-    // Soft 1px fringe past the solid half-width. Matches the SDF slab AA.
-    let cover = 1.0 - smoothstep(v.edge.y - 0.55, v.edge.y + 0.55, dist);
-    return v.color * cover;
+    // Exact overlap of a 1px box filter with the slab [-hw, hw]. Linear ramps
+    // sum to the same ink per column wherever the line crosses the pixel
+    // grid; a smoothstep fringe does not, and beads along gentle slopes.
+    let hw = v.edge.y;
+    let cover = max(min(dist + hw, 0.5) - max(dist - hw, -0.5), 0.0);
+    // The target blends gamma-encoded values, so a pixel at half coverage
+    // emits far less than half the light. On a slope that alternates columns
+    // between one lit pixel and two dim ones, which reads as bright/dark
+    // speckle along the trace. Encode coverage so light stays linear in it.
+    return v.color * pow(cover, 1.0 / 2.2);
 }
 "#;
 
@@ -956,12 +968,14 @@ fn fill_under(pts: &[[f32; 2]], baseline: f32, color: [f32; 4], out: &mut Vec<Ve
             axis: [trace_y, baseline],
         });
     };
+    // Raise the top a pixel past the trace so the shader's edge AA has room.
+    let lift = |p: [f32; 2]| [p[0], p[1] - 1.0];
     for w in pts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        wash(out, a, a[1]);
-        wash(out, b, b[1]);
+        wash(out, lift(a), a[1]);
+        wash(out, lift(b), b[1]);
         wash(out, [a[0], baseline], a[1]);
-        wash(out, b, b[1]);
+        wash(out, lift(b), b[1]);
         wash(out, [b[0], baseline], b[1]);
         wash(out, [a[0], baseline], a[1]);
     }

@@ -136,11 +136,9 @@ pub fn on_press(
         HitKind::Setting(opt, v) => set_option(state, opt, v),
         HitKind::Zoom(delta) => zoom(state, delta as i32),
         HitKind::ResetSettings => reset_settings(state),
-        HitKind::Group(user_group) => {
-            if user_group {
-                state.user_open = !state.user_open;
-            } else {
-                state.system_open = !state.system_open;
+        HitKind::Group(id) => {
+            if !state.open_groups.insert(id) {
+                state.open_groups.remove(&id);
             }
             // Visible indices shift; drop pins and re-capture after the next layout.
             state.pinned.clear();
@@ -505,6 +503,7 @@ fn set_option(state: &mut AppState, opt: Opt, v: u8) -> Vec<Effect> {
                 *slot = on;
             }
         }
+        Opt::ListAnimations => s.list_animations = on,
         Opt::Confirm => {
             s.confirm = on;
             state.armed = None;

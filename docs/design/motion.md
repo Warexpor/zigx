@@ -12,7 +12,8 @@ deadline clock.
 | Constant or setting | Value | Meaning |
 | --- | --- | --- |
 | Update speed | 0.5, 1 or 2 s | Sample period for every metric in the app |
-| `PRIME_MS` | 250 | Gap between the priming read and the first real sample |
+| `PRIME_MS` | 50 | Delay before the priming read |
+| `FIRST_SAMPLE_MS` | 220 | Gap after priming before the first real sample |
 | History | 30 s, 1 min, 2 min | Time across a graph; the window in samples is history / period |
 | `MAX_WINDOW` | 240 | Longest window: 2 min at 0.5 s |
 | `HIST_CAP` | 246 | Ring size: the longest window plus playback delay and curve taps |
@@ -24,8 +25,9 @@ deadline clock.
 - **Pause** sets the period to 0: no reads, no new snapshot, and the graph
   playhead holds still. Resuming re-primes the engine, so no rate is averaged
   across the gap and the first sample after it is an honest one-period read.
-- Changing speed keeps the samples already in the ring; they are spaced as
-  they were taken.
+- Changing speed drops the rings and starts a fresh window: old samples are not
+  one current period apart, so leaving them would compress or stretch the time
+  axis.
 
 - Deadlines advance by exactly one period, so ticks do not drift by the cost
   of each sample. After a stall or suspend the clock re-anchors instead of
@@ -35,7 +37,9 @@ deadline clock.
 - Rates (CPU %, disk, network, per-process CPU) are averages over the last
   second, which is also what makes them calm.
 - History begins at launch. Graphs start empty and the trace grows in from the
-  right edge.
+  right edge. While the ring is shorter than `GRAPH_DELAY`, playback stays
+  closer to the tip so the first ink appears promptly instead of waiting out
+  a full delay on an empty plot.
 
 ## Text
 
@@ -76,7 +80,8 @@ samples, for two reasons:
 Graphs and per-core bars both read from it, so they move on one clock.
 
 The trade-off: a change appears in the numbers immediately and in the graph
-about two seconds later, when the trace draws up to it.
+about two samples later, when the trace draws up to it. At launch the effective
+delay is capped by how many samples exist, so the grow-in is not held back.
 
 ## Curves
 
@@ -133,14 +138,15 @@ frame-rate independent exponential, `1 - exp(-dt / tau)`.
 
 ### I/O graph scale
 
-Disk and network graphs autoscale to the nice ceiling (1, 2, 5 x 10^n) of what
-they show.
+Disk and network graphs autoscale to the nice ceiling (1, 2, 5 x 10^n) of recent
+traffic.
 
-- **Target.** The target covers the visible window plus the two samples the
-  curve is heading into. The scale therefore grows before a burst is drawn,
-  and relaxes only after the burst scrolls out on the left.
+- **Target.** The target covers roughly a quarter of the drawn window (clamped
+  to 6–16 samples) plus the two samples the curve is heading into. The scale
+  grows before a burst is drawn, and shrinks again when recent traffic is
+  quieter — even while an older spike is still scrolling off on the left.
 - **Easing.** The scale follows its target in log space with a critically
-  damped smooth-damp, 0.35 s when growing and 0.9 s when shrinking. Log space
+  damped smooth-damp, 0.35 s when growing and 0.5 s when shrinking. Log space
   makes a 100x rescale read as an even zoom instead of an instant squash, and
   critical damping never overshoots.
 - **No clipping.** If a trace would still exceed the eased scale, the graph
@@ -188,7 +194,10 @@ Everything in the interface that changes state moves there instead of
 jumping: hovers, selections, toggles, pages, lists, overlays, zoom. The
 Animations setting (on by default, `animations=` in `settings.txt`) turns all
 of it off; every value then lands on its target in the same frame. It is
-separate from Graph motion, which only concerns graph playback.
+separate from Graph motion, which only concerns graph playback. List
+animations (`list_animations=`, on by default) is a narrower switch under
+Processes: when it is off, process rows land at once while the rest of the
+interface still follows Animations.
 
 ### Engine
 
@@ -266,6 +275,8 @@ time and settled at about three times.
   density change. The group chevron turns a quarter; the sort caret
   flattens and flips when the direction changes. Pills re-fit their labels
   ("End task" to "Confirm 2") smoothly and the search field takes the slack.
+  List animations turns the row, height, chevron, hover and empty-state
+  motion off without touching that chrome.
 - **Scrolling.** Wheel and page keys glide to the new offset; a dragged thumb
   is followed exactly. Switching Performance sections does not scroll
   between them.
@@ -282,6 +293,8 @@ time and settled at about three times.
 - Base motion on time, not frame count. Use `dt` and a time constant.
 - Interface motion goes through `Anim`, so the Animations switch covers it.
   Anything that can move must return its target at once when that is off.
+  Process-list row motion also honors List animations via a scoped
+  `Anim::enable` around the row block.
 - Every animation must settle, and a settled screen must stop requesting
   frames. Something that must change on a timer with nothing moving goes in
   `wake_at()`, not a frame loop.

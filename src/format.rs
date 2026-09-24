@@ -238,6 +238,14 @@ mod tests {
     }
 
     #[test]
+    fn cpu_pct_keeps_a_tenth_under_ten() {
+        assert_eq!(cpu_pct(0.4), "0.4%");
+        assert_eq!(cpu_pct(9.9), "9.9%");
+        assert_eq!(cpu_pct(10.0), "10%");
+        assert_eq!(cpu_pct(42.2), "42%");
+    }
+
+    #[test]
     fn nice_ceil_steps() {
         assert_eq!(nice_ceil(0.0), 1.0);
         assert_eq!(nice_ceil(120.0), 200.0);

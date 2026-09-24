@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.5.2    |                                                      |
+| v0.5.3    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -53,8 +53,11 @@ Content is inset 24 horizontally, 18 at the top, and 24 at the bottom.
 2. **Column header** 20 below the toolbar: `MICRO` titles with a hairline 24
    under their top. The sorted column is `INK` with a small chevron. The header
    paints after the rows so scrolled content never covers it.
-3. **List.** Rows are 32 comfortable or 26 compact. Grouped view adds
-   collapsible "User" and "System" header rows with a chevron and a count.
+3. **List.** Rows are 32 comfortable or 26 compact. Grouped view clusters
+   processes that share a program name under a collapsible header with a
+   chevron and a count; groups start collapsed, and single-instance programs
+   stay as ordinary rows. Sorting by Name floats those group headers above
+   one-offs. User and System views filter by ownership without headers.
 
 Columns are right-aligned mono numbers, filled from the right edge. Name takes
 the rest. GPU, Disk, PID, User and Threads can be hidden in Settings; hidden
@@ -128,7 +131,7 @@ gutter on the right (`SCROLL_GUTTER`) keeps the scrollbar clear of the controls.
 | Appearance | Interface scale, Glass, Animations, Graph motion, Row density, Status color, Title bar readout |
 | Graphs | History, Curves, Fill, Grid |
 | Data | Update speed (with Pause), Process CPU, Byte units, Temperature |
-| Processes | Columns, Confirm ending |
+| Processes | Columns, List animations, Confirm ending |
 | General | Open on, Reset |
 
 Every change applies on the next frame and is saved at once. Typing on this

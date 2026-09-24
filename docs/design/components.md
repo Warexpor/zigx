@@ -108,9 +108,13 @@ new processes fade in; see [Interface animation](motion.md#what-moves).
 - CPU and GPU cells are colored by `heat()`.
 - Idle cells step down to `INK_4`.
 
-Group header rows show a chevron (`INK_4`), then an eyebrow with the group name
-and count. Clicking a header toggles the group, and the chevron turns a
-quarter between right and down.
+Group header rows show a chevron (`INK_4`), the program name with a process
+count, and the same metric columns as a process row with values summed across
+members (CPU, GPU, memory, disk, threads). Groups start collapsed; clicking a
+header expands it, and the chevron turns a quarter between right and down.
+Only names with two or more processes get a header; one-offs stay as ordinary
+process rows. PID is an em dash on the header; User shows when every member
+shares one.
 
 ## Column header
 

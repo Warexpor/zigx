@@ -193,11 +193,13 @@ impl Snap {
 pub struct StartupEntry {
     pub name: String,
     pub exec: String,
-    /// User-level file in `~/.config/autostart`. May not exist yet when the
-    /// entry comes from a system directory; toggling creates it.
+    /// File edited when the switch flips: a user `.desktop`, or Hypr `autostart.lua`.
     pub path: PathBuf,
     /// System-level definition in `/etc/xdg/autostart` (or `$XDG_CONFIG_DIRS`).
     pub system_path: Option<PathBuf>,
+    /// When set, this row is an `o.launch_on_start` in Hypr `autostart.lua`
+    /// (Omarchy extras), not an XDG `.desktop`.
+    pub hypr_index: Option<usize>,
     pub enabled: bool,
 }
 
@@ -371,9 +373,10 @@ impl Default for PerfSmooth {
 const CLOCK_TAU: f32 = 0.6;
 const BAR_TAU: f32 = 0.14;
 /// I/O scale smooth times. Growing is quicker so the scale is ready before a
-/// burst is drawn; shrinking follows so quiet traffic zooms back in.
-const SCALE_GROW: f32 = 0.35;
-const SCALE_SHRINK: f32 = 0.5;
+/// burst is drawn; shrinking is slower and uses an exponential ease (no spring
+/// snap) so zooming back into quiet traffic stays continuous.
+const SCALE_GROW: f32 = 0.28;
+const SCALE_SHRINK: f32 = 1.1;
 
 impl PerfSmooth {
     pub fn tick(&mut self, snap: &Snap, settings: &Settings, paused: bool) {
@@ -436,17 +439,23 @@ impl PerfSmooth {
             );
         let span = scale_window(self.window);
         for (key, a, b) in devs {
-            let goal = io_scale(a, b, head, span).ln();
+            // Follow the raw peak in log space. nice_ceil is only for labels —
+            // stepping the spring between 1/2/5 ceilings made shrink hitch.
+            let peak = window_peak(a, head, span)
+                .max(window_peak(b, head, span))
+                .max(1.0);
+            let goal = peak.ln();
             let m = self.io_max.entry(key.clone()).or_insert(Spring::new(goal));
             if fresh || reduced {
                 *m = Spring::new(goal);
+            } else if goal > m.value {
+                m.step(goal, SCALE_GROW, dt, 0.002);
             } else {
-                let t = if goal > m.value {
-                    SCALE_GROW
-                } else {
-                    SCALE_SHRINK
-                };
-                m.step(goal, t, dt, 0.0);
+                // Exponential approach: no overshoot snap when the target jumps
+                // down as a spike scrolls out of the scale window.
+                let a = rate(dt, SCALE_SHRINK);
+                m.value += (goal - m.value) * a;
+                m.vel = 0.0;
             }
             keep.insert(key);
         }

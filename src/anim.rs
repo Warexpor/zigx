@@ -35,7 +35,7 @@ pub const GLIDE_TRAIL: f32 = 0.085;
 /// Launch intro and new rows.
 pub const ENTER: f32 = 0.085;
 /// Page and section switches: a short fade in place, no travel.
-pub const PAGE: f32 = 0.05;
+pub const PAGE: f32 = 0.035;
 /// Wheel and keyboard scrolling.
 pub const SCROLL: f32 = 0.055;
 /// Process rows moving to a new slot after a re-sort or filter.

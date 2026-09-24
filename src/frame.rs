@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use crate::anim::{self, key, lerp, mix_rgba, Anim, Key};
 use crate::format::{
-    bytes, cpu_pct, disk_cell, duration, fit_t, freq_ghz, percent, rate, text_width_t,
+    bytes, cpu_pct, disk_pct, duration, fit_t, freq_ghz, percent, rate, text_width_t,
 };
 use crate::interact::selection_label;
 use crate::model::{
@@ -397,9 +397,11 @@ impl DrawList {
         let max = max.max(0.001);
         let head = head.min(0.0);
         let curve = self.prefs.curve;
-        // Stroke width + miter + AA fringe need room above a 100% sample.
-        let top_pad = 6.0;
+        // Room for in-graph legends (Disk/Net) plus stroke AA. Peaks land on
+        // this line; text sits in the pad so hills never cover labels.
+        let top_pad = 22.0;
         let usable = (r.h - top_pad).max(1.0);
+        let y_min = r.y + top_pad;
         if r.h >= 80.0 && self.prefs.grid {
             for k in 1..4 {
                 let gy = r.y + r.h * (k as f32) / 4.0;
@@ -412,8 +414,11 @@ impl DrawList {
         // Vertices sit at fixed fractions of each sample slot, so the polyline
         // is rigid in data space and only translates as it scrolls. Resampling
         // at fixed screen x instead makes sharp peaks shimmer frame to frame.
-        let sub = ((slot_w / 1.5).ceil() as usize).clamp(4, 24);
-        let y_of = |v: f32| r.bottom() - (v / max).clamp(0.0, 1.0) * usable;
+        let sub = ((slot_w / 1.5).ceil() as usize).clamp(4, 16);
+        let y_of = |v: f32| {
+            let y = r.bottom() - (v / max).clamp(0.0, 1.0) * usable;
+            y.max(y_min)
+        };
         for (values, color) in series.iter() {
             if values.len() < 2 {
                 continue;
@@ -426,19 +431,13 @@ impl DrawList {
             let hi = ((right * sub as f32).ceil() as i64 + 1).clamp(0, last as i64);
             // History starts at launch: before the first sample the plot stays
             // empty, and the trace grows in from the right edge.
-            let vals: Vec<(f32, f32)> = (lo..=hi)
+            // Y follows the eased camera (`max`) only. Remapping each frame to
+            // the visible peak made zoom-out hitch when a spike left the window.
+            let raw: Vec<[f32; 2]> = (lo..=hi)
                 .map(|j| {
                     let idx = j as f32 / sub as f32;
-                    (x_of(idx), curve_at(values, idx, curve))
+                    [x_of(idx), y_of(curve_at(values, idx, curve))]
                 })
-                .collect();
-            // Never clip a trace flat against the top while an eased scale
-            // is still catching up with it.
-            let peak = vals.iter().map(|v| v.1).fold(0.0_f32, f32::max);
-            let top = max.max(peak);
-            let raw: Vec<[f32; 2]> = vals
-                .iter()
-                .map(|&(x, v)| [x, y_of(v * max / top)])
                 .collect();
             let pts = clip_polyline_x(&raw, r.x, r.right());
             if pts.len() < 2 {
@@ -1047,10 +1046,11 @@ pub fn build(
     );
 
     // A page fades in where it sits. Nothing travels, so switching pages
-    // never pulls the eye.
+    // never pulls the eye. Start partway in so the first painted frame
+    // already shows the new page (a 0→1 spring reads as click delay).
     d.fade = d
         .anim
-        .mix_from(key("page", state.page), 0.0, 1.0, anim::PAGE);
+        .mix_from(key("page", state.page), 0.45, 1.0, anim::PAGE);
     match (state.page, perf) {
         (Page::Performance, Some((sub, detail))) => {
             d.hit(
@@ -1791,6 +1791,13 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     let list = Rect::new(inner.x, y, inner.w, (inner.bottom() - y).max(20.0));
     d.list_rect = Some(list);
 
+    // View switches (Grouped/Flat/User/System) use the same in-place fade as
+    // page changes — not the row-glide used for sort/filter.
+    let view_fade = d
+        .anim
+        .mix_from(key("proc-view", state.view), 0.45, 1.0, anim::PAGE);
+    let view_landing = view_fade < 0.995;
+
     // Drop selections whose process has exited so End task cannot hit a recycled PID.
     if !state.selected.is_empty() {
         state
@@ -1850,7 +1857,10 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
             Row::Proc(p) => key("row", p.pid),
         };
         let target = i as f32 * row_h;
-        if let Some(cur) = d.anim.peek(id) {
+        if view_landing {
+            // New view: land every row where it belongs; the fade carries the change.
+            d.anim.set(id, target);
+        } else if let Some(cur) = d.anim.peek(id) {
             if !near(cur) && !near(target) {
                 d.anim.set(id, target);
             } else if (cur - target).abs() > row_h * MAX_ROW_TRAVEL {
@@ -1867,20 +1877,25 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         }
         let a = match row {
             Row::Proc(p) => {
-                let from = if fresh_ok && !known.contains(&p.pid) {
-                    0.0
-                } else {
+                // View switches fade the whole list; don't also rise each row in.
+                if view_landing {
                     1.0
-                };
-                d.anim
-                    .mix_from(key("row-in", p.pid), from, 1.0, anim::ENTER)
+                } else {
+                    let from = if fresh_ok && !known.contains(&p.pid) {
+                        0.0
+                    } else {
+                        1.0
+                    };
+                    d.anim
+                        .mix_from(key("row-in", p.pid), from, 1.0, anim::ENTER)
+                }
             }
             Row::Header { .. } => 1.0,
         };
         let ry = ry + (1.0 - a) * ROW_RISE;
         let rr = Rect::new(list.x, ry, list.w, drawn_h);
         let saved_fade = d.fade;
-        d.fade *= a;
+        d.fade *= a * view_fade;
         match row {
             Row::Header {
                 title,
@@ -1897,7 +1912,16 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                     turn,
                     theme::INK_4,
                 );
-                draw_group(d, &cols, rr, title, *count, members, cpu_div);
+                draw_group(
+                    d,
+                    &cols,
+                    rr,
+                    title,
+                    *count,
+                    members,
+                    cpu_div,
+                    disk_total_bps(snap),
+                );
                 d.hit(rr, HitKind::Group(*id));
             }
             Row::Proc(p) => {
@@ -1907,7 +1931,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                 let sel = d.anim.toggle(key("row-selected", p.pid), on);
                 let hover = mix_rgba(NONE, theme::HOVER, h);
                 d.fill(rr, 6.0, mix_rgba(hover, theme::SELECTED, sel));
-                draw_proc(d, &cols, rr, p, cpu_div);
+                draw_proc(d, &cols, rr, p, cpu_div, disk_total_bps(snap));
                 d.hit(rr, HitKind::Proc { pid: p.pid });
             }
         }
@@ -1926,8 +1950,11 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         });
     }
     d.anim.enable(list_anim);
+    let saved_fade = d.fade;
+    d.fade *= view_fade;
     draw_header(d, &cols, header, state.sort, state.held.is_some());
     d.hairline(Rect::new(inner.x, hair_y, inner.w, 1.0));
+    d.fade = saved_fade;
     scrollbar(
         d,
         state,
@@ -2194,6 +2221,15 @@ fn disk_sum(p: &Proc) -> f64 {
     p.read_bps.unwrap_or(0.0) + p.write_bps.unwrap_or(0.0)
 }
 
+/// Current device throughput across all disks; denominator for Disk %.
+fn disk_total_bps(snap: &Snap) -> f64 {
+    snap.disks
+        .iter()
+        .map(|d| d.read_bps + d.write_bps)
+        .sum::<f64>()
+        .max(0.0)
+}
+
 /// Aggregate used for grouped-view sort order — same numbers the header shows.
 fn group_metric(members: &[&Proc], col: Col) -> f64 {
     match col {
@@ -2225,6 +2261,7 @@ fn columns(density: Density, prefs: &Settings, width: f32) -> Vec<ColSpec> {
     } else {
         &[
             (Col::Threads, 76.0, true, true),
+            // Username is a label, not a metric: left edge under the header.
             (Col::User, 96.0, false, false),
             (Col::Pid, 72.0, true, true),
             (Col::Disk, 96.0, true, true),
@@ -2296,7 +2333,10 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort, held: 
         let on = d.anim.toggle(key("sort-on", c.col), active);
         let color = mix_rgba(theme::INK_3, theme::INK, on);
         let title = col_title(c.col);
-        if c.right {
+        // User is proportional text; never right-align even if a future
+        // ColSpec flag flips.
+        let right = c.right && c.col != Col::User;
+        if right {
             d.text_r(title, r, MICRO, color);
         } else {
             d.text(title, r, MICRO, color);
@@ -2312,7 +2352,7 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort, held: 
         }
         if on > 0.0 {
             let tw = measure(&title.to_uppercase(), MICRO);
-            let cx = if c.right {
+            let cx = if right {
                 r.right() - tw - 12.0
             } else {
                 r.x + tw + 6.0
@@ -2338,7 +2378,7 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort, held: 
 
 /// `cpu_div` rescales per-process CPU: 1 for share of one core, the core
 /// count for share of the whole machine.
-fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f32) {
+fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f32, disk_den: f64) {
     let cpu = p.cpu / cpu_div;
     for c in cols {
         let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
@@ -2347,7 +2387,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f
             Col::Cpu => cpu_pct(cpu),
             Col::Gpu => cpu_pct(p.gpu),
             Col::Memory => bytes(p.rss),
-            Col::Disk => disk_cell(p.read_bps, p.write_bps),
+            Col::Disk => disk_pct(p.read_bps, p.write_bps, disk_den),
             Col::Pid => p.pid.to_string(),
             Col::User => p.user.clone(),
             Col::Threads => p.threads.to_string(),
@@ -2370,7 +2410,8 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f
             _ => theme::INK_2,
         };
         let t = if c.mono { NUM } else { BODY };
-        if c.right {
+        let right = c.right && c.col != Col::User;
+        if right {
             d.text_r(&text, r, t, color);
         } else {
             d.text(&text, r, t, color);
@@ -2395,9 +2436,12 @@ fn draw_group(
     count: usize,
     members: &[&Proc],
     cpu_div: f32,
+    disk_den: f64,
 ) {
-    let cpu = members.iter().map(|p| p.cpu).sum::<f32>() / cpu_div;
-    let gpu = members.iter().map(|p| p.gpu).sum::<f32>();
+    // Group CPU/GPU are shares of capacity, not a sum of per-core percents —
+    // uncapped sums read as "400%" for a busy browser group.
+    let cpu = (members.iter().map(|p| p.cpu).sum::<f32>() / cpu_div).min(100.0);
+    let gpu = members.iter().map(|p| p.gpu).sum::<f32>().min(100.0);
     let rss = members.iter().map(|p| p.rss).sum::<u64>();
     let threads = members.iter().map(|p| p.threads).sum::<u32>();
     let read = sum_opt(members.iter().map(|p| p.read_bps));
@@ -2423,7 +2467,7 @@ fn draw_group(
             Col::Cpu => cpu_pct(cpu),
             Col::Gpu => cpu_pct(gpu),
             Col::Memory => bytes(rss),
-            Col::Disk => disk_cell(read, write),
+            Col::Disk => disk_pct(read, write, disk_den),
             Col::Pid => "—".into(),
             Col::User => user.unwrap_or("—").to_string(),
             Col::Threads => threads.to_string(),
@@ -2445,7 +2489,8 @@ fn draw_group(
             _ => theme::INK_2,
         };
         let t = if c.mono { NUM } else { BODY };
-        if c.right {
+        let right = c.right && c.col != Col::User;
+        if right {
             d.text_r(&text, r, t, color);
         } else {
             d.text(&text, r, t, color);
@@ -2571,7 +2616,7 @@ fn performance(
     // one it replaces, which fades out where it was scrolled to.
     let enter = d
         .anim
-        .mix_from(key("section", state.section), 0.0, 1.0, anim::PAGE);
+        .mix_from(key("section", state.section), 0.45, 1.0, anim::PAGE);
     let leaving: Vec<(Section, f32)> = sections
         .iter()
         .filter(|&&s| s != state.section)
@@ -2599,7 +2644,16 @@ fn performance(
     let head = state.perf_smooth.head();
     d.clip = Some(view);
     let saved_fade = d.fade;
+    // Draw the entering section first so its labels stay at stable buffer
+    // indices for the whole fade. Leaving used to paint first; when it
+    // dropped out, every enter label shifted slots and reshaped in one hitch.
+    d.fade = saved_fade * enter;
+    let content_bottom = section_page(d, state, snap, state.section, view, y0, head);
     for (s, a) in leaving {
+        // Skip near-invisible leave pages — each one rebuilds full graphs.
+        if a < 0.02 {
+            continue;
+        }
         // Hold the old scroll so the outgoing section fades without moving.
         let k = key("scroll", (ScrollBar::Performance, s));
         let held = d.anim.peek(k).unwrap_or(0.0);
@@ -2607,8 +2661,6 @@ fn performance(
         d.fade = saved_fade * a;
         section_page(d, state, snap, s, view, view.y - held, head);
     }
-    d.fade = saved_fade * enter;
-    let content_bottom = section_page(d, state, snap, state.section, view, y0, head);
     d.fade = saved_fade;
     d.clip = None;
     let content_h = (content_bottom - y0).max(0.0);
@@ -3122,8 +3174,9 @@ fn io_page(
             max,
             head,
         );
-        // Legend, top left; scale, top right.
-        let ly = gr.y + 6.0;
+        // Legend and scale sit in the graph's top pad (above the plottable
+        // area) so peaks cannot cover them.
+        let ly = gr.y + 4.0;
         let mut lx = gr.x;
         d.line(&[[lx, ly + 6.0], [lx + 12.0, ly + 6.0]], 1.25, theme::TRACE);
         lx += 17.0;
@@ -3137,7 +3190,7 @@ fn io_page(
         lx += 17.0;
         d.text(b_legend, Rect::new(lx, ly, 90.0, 12.0), MICRO, theme::INK_3);
         d.text_r(
-            &rate(goal as f64),
+            &rate(crate::format::nice_ceil(max) as f64),
             Rect::new(gr.x, ly, gr.w, 12.0),
             MICRO_NUM,
             theme::INK_4,
@@ -3161,7 +3214,7 @@ fn startup_page(
     let y = page_title(
         d,
         "Startup",
-        "XDG autostart entries. Off writes Hidden=true to ~/.config/autostart and keeps a .bak.",
+        "XDG autostart and Hypr o.launch_on_start. Off hides the desktop file or comments the Lua line.",
         inner,
         inner.y,
     );
@@ -3221,7 +3274,14 @@ fn startup_page(
             BODY,
             name_ink,
         );
-        if entry.system_path.is_some() {
+        if entry.hypr_index.is_some() {
+            d.text(
+                "hypr",
+                Rect::new(list.x + name_w + 10.0, ry + 10.0, 60.0, 16.0),
+                MICRO,
+                theme::INK_4,
+            );
+        } else if entry.system_path.is_some() {
             d.text(
                 "system",
                 Rect::new(list.x + name_w + 10.0, ry + 10.0, 60.0, 16.0),
@@ -3248,7 +3308,7 @@ fn startup_page(
             d,
             Rect::new(list.right() - 32.0, ry + 17.0, 32.0, 18.0),
             entry.enabled,
-            key("startup-switch", &entry.path),
+            key("startup-switch", (entry.path.as_os_str(), entry.hypr_index)),
         );
         d.hit(rr, HitKind::Startup(i));
     }

@@ -26,6 +26,9 @@ fn system_autostart_dirs() -> Vec<PathBuf> {
         .collect();
     if out.is_empty() {
         out.push(PathBuf::from("/etc/xdg/autostart"));
+    } else if !out.iter().any(|p| p == Path::new("/etc/xdg/autostart")) {
+        // Keep the distro defaults even when XDG_CONFIG_DIRS is customized.
+        out.insert(0, PathBuf::from("/etc/xdg/autostart"));
     }
     out.reverse();
     out
@@ -106,9 +109,11 @@ pub fn load_startup() -> Vec<StartupEntry> {
             exec,
             path: user_dir.join(&file),
             system_path: sys.map(|l| l.path),
+            hypr_index: None,
             enabled,
         });
     }
+    out.extend(load_hypr_launches());
     out.sort_by_key(|e| e.name.to_lowercase());
     out
 }
@@ -157,6 +162,215 @@ pub fn write_enabled(path: &Path, system_path: Option<&Path>, enable: bool) -> i
         next = set_key(&next, "X-GNOME-Autostart-enabled", "true");
     }
     atomic_write(&target, &next)
+}
+
+/// Toggle the `index`-th `o.launch_on_start` in a Hypr/Omarchy `autostart.lua`.
+pub fn write_hypr_enabled(path: &Path, index: usize, enable: bool) -> io::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let Some(next) = set_hypr_launch_enabled(&text, index, enable) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "launch_on_start entry not found",
+        ));
+    };
+    let mut bak = path.as_os_str().to_os_string();
+    bak.push(".bak");
+    let bak = PathBuf::from(bak);
+    if !bak.exists() {
+        fs::copy(path, &bak)?;
+    }
+    atomic_write(path, &next)
+}
+
+fn hypr_autostart_path() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("hypr").join("autostart.lua");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join(".config")
+        .join("hypr")
+        .join("autostart.lua")
+}
+
+fn load_hypr_launches() -> Vec<StartupEntry> {
+    let path = hypr_autostart_path();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    parse_hypr_launches(&text, &path)
+}
+
+fn parse_hypr_launches(text: &str, path: &Path) -> Vec<StartupEntry> {
+    let mut out = Vec::new();
+    for (index, call) in find_hypr_launches(text).into_iter().enumerate() {
+        out.push(StartupEntry {
+            name: hypr_launch_name(&call.command),
+            exec: call.command,
+            path: path.to_path_buf(),
+            system_path: None,
+            hypr_index: Some(index),
+            enabled: call.enabled,
+        });
+    }
+    out
+}
+
+struct HyprLaunch {
+    command: String,
+    enabled: bool,
+    /// Inclusive line range in the source file (0-based).
+    start_line: usize,
+    end_line: usize,
+}
+
+fn find_hypr_launches(text: &str) -> Vec<HyprLaunch> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        let commented = trimmed.starts_with("--");
+        let code = if commented {
+            trimmed
+                .strip_prefix("--")
+                .map(|s| s.trim_start())
+                .unwrap_or(trimmed)
+        } else {
+            trimmed
+        };
+        if !code.starts_with("o.launch_on_start") {
+            i += 1;
+            continue;
+        }
+        let start_line = i;
+        let mut block = String::new();
+        let mut depth = 0i32;
+        let mut saw_paren = false;
+        while i < lines.len() {
+            let raw = lines[i];
+            let t = raw.trim_start();
+            let body = if let Some(rest) = t.strip_prefix("--") {
+                rest.trim_start()
+            } else {
+                t
+            };
+            block.push_str(body);
+            block.push('\n');
+            for ch in body.chars() {
+                match ch {
+                    '(' => {
+                        depth += 1;
+                        saw_paren = true;
+                    }
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            if saw_paren && depth <= 0 {
+                break;
+            }
+            i += 1;
+        }
+        if let Some(cmd) = extract_lua_string(&block) {
+            out.push(HyprLaunch {
+                command: cmd,
+                enabled: !commented,
+                start_line,
+                end_line: i.min(lines.len().saturating_sub(1)),
+            });
+        }
+        i += 1;
+    }
+    out
+}
+
+fn extract_lua_string(block: &str) -> Option<String> {
+    let bytes = block.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            i += 1;
+            let mut out = String::new();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => {
+                        out.push(bytes[i + 1] as char);
+                        i += 2;
+                    }
+                    b'"' => return Some(out),
+                    b => {
+                        out.push(b as char);
+                        i += 1;
+                    }
+                }
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn hypr_launch_name(cmd: &str) -> String {
+    let first = cmd.split_whitespace().next().unwrap_or(cmd);
+    if first.contains('/') {
+        return Path::new(first)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(first)
+            .to_string();
+    }
+    if cmd.len() > 42 {
+        format!("{}...", &cmd[..39])
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn set_hypr_launch_enabled(text: &str, index: usize, enable: bool) -> Option<String> {
+    let launches = find_hypr_launches(text);
+    let call = launches.get(index)?;
+    if call.enabled == enable {
+        return Some(text.to_string());
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if i < call.start_line || i > call.end_line {
+            out.push((*line).to_string());
+            continue;
+        }
+        if enable {
+            let t = line.trim_start();
+            if let Some(rest) = t.strip_prefix("--") {
+                let indent_len = line.len() - t.len();
+                let mut s = line[..indent_len].to_string();
+                s.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                out.push(s);
+            } else {
+                out.push((*line).to_string());
+            }
+        } else {
+            let t = line.trim_start();
+            if t.starts_with("--") || t.is_empty() {
+                out.push((*line).to_string());
+            } else {
+                let indent_len = line.len() - t.len();
+                let mut s = line[..indent_len].to_string();
+                s.push_str("-- ");
+                s.push_str(t);
+                out.push(s);
+            }
+        }
+    }
+    let mut next = out.join("\n");
+    if text.ends_with('\n') {
+        next.push('\n');
+    }
+    Some(next)
 }
 
 struct DesktopFields {
@@ -367,5 +581,36 @@ mod tests {
             "TryExec must not hide management entries: {list:?}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parses_hypr_launch_on_start_including_comments() {
+        let src = r#"-- Extra
+-- o.launch_on_start("my-service")
+o.launch_on_start("/opt/v2rayn-bin/v2rayN")
+
+o.launch_on_start(
+  "gsettings set org.gnome.desktop.interface gtk-enable-primary-paste false"
+)
+"#;
+        let path = PathBuf::from("/tmp/fake-autostart.lua");
+        let list = parse_hypr_launches(src, &path);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].name, "my-service");
+        assert!(!list[0].enabled);
+        assert_eq!(list[1].name, "v2rayN");
+        assert!(list[1].enabled);
+        assert_eq!(list[1].exec, "/opt/v2rayn-bin/v2rayN");
+        assert!(list[2].enabled);
+        assert!(list[2].exec.contains("gtk-enable-primary-paste"));
+
+        let off = set_hypr_launch_enabled(src, 1, false).unwrap();
+        let again = parse_hypr_launches(&off, &path);
+        assert!(!again[1].enabled);
+        assert!(again[1].enabled == false);
+        let on = set_hypr_launch_enabled(&off, 1, true).unwrap();
+        let restored = parse_hypr_launches(&on, &path);
+        assert!(restored[1].enabled);
+        assert!(restored[1].exec.contains("v2rayN"));
     }
 }

@@ -33,6 +33,46 @@ pub fn save_ui(state: &AppState) -> io::Result<()> {
     crate::settings::save_settings(&state.settings)
 }
 
+/// Serialize on the UI thread, fsync on a worker so page/section clicks are
+/// not stalled by disk (atomic_write syncs before rename).
+pub fn save_ui_bg(state: &AppState) {
+    let layout = layout_body(state);
+    let settings = state.settings.render();
+    let _ = std::thread::Builder::new()
+        .name("zigx-save".into())
+        .spawn(move || {
+            if let Err(err) = commit_save(&layout, &settings) {
+                eprintln!("zigx: could not save settings: {err}");
+            }
+        });
+}
+
+fn layout_body(state: &AppState) -> String {
+    let sort_dir = if state.sort.desc { "desc" } else { "asc" };
+    format!(
+        "nav_w={}\nsub_w={}\npage={}\nsection={}\nview={}\ndensity={}\nsort={},{sort_dir}\nui={}\n",
+        state.nav_w.round() as i32,
+        state.sub_w.round() as i32,
+        page_name(state.page),
+        section_name(state.section),
+        view_name(state.view),
+        if state.density == Density::Compact {
+            "compact"
+        } else {
+            "comfortable"
+        },
+        col_name(state.sort.col),
+        (state.ui_scale * 100.0).round() as i32,
+    )
+}
+
+fn commit_save(layout: &str, settings: &str) -> io::Result<()> {
+    let dir = config_dir();
+    fs::create_dir_all(&dir)?;
+    atomic_write(&dir.join("ui.txt"), layout)?;
+    atomic_write(&dir.join("settings.txt"), settings)
+}
+
 fn load_layout(state: &mut AppState) {
     let path = config_dir().join("ui.txt");
     let Ok(text) = fs::read_to_string(path) else {
@@ -106,24 +146,7 @@ fn load_layout(state: &mut AppState) {
 fn save_layout(state: &AppState) -> io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
-    let path = dir.join("ui.txt");
-    let sort_dir = if state.sort.desc { "desc" } else { "asc" };
-    let body = format!(
-        "nav_w={}\nsub_w={}\npage={}\nsection={}\nview={}\ndensity={}\nsort={},{sort_dir}\nui={}\n",
-        state.nav_w.round() as i32,
-        state.sub_w.round() as i32,
-        page_name(state.page),
-        section_name(state.section),
-        view_name(state.view),
-        if state.density == Density::Compact {
-            "compact"
-        } else {
-            "comfortable"
-        },
-        col_name(state.sort.col),
-        (state.ui_scale * 100.0).round() as i32,
-    );
-    atomic_write(&path, &body)
+    atomic_write(&dir.join("ui.txt"), &layout_body(state))
 }
 
 pub fn atomic_write(path: &Path, data: &str) -> io::Result<()> {

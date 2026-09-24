@@ -199,7 +199,7 @@ impl Default for Settings {
             fill: true,
             grid: true,
             speed: Speed::Normal,
-            proc_cpu: ProcCpu::Core,
+            proc_cpu: ProcCpu::Machine,
             units: Units::Binary,
             temp: Temp::Celsius,
             show_gpu: true,
@@ -300,7 +300,7 @@ impl Settings {
         s
     }
 
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let flag = |b: bool| if b { "on" } else { "off" };
         let cols: Vec<&str> = OPTIONAL_COLS
             .iter()

@@ -101,8 +101,8 @@ impl App {
         self.sync_size();
         expire(&mut self.state);
         let snap = self.hub.load();
-        let draw = build(&mut self.state, &snap, &self.startup, self.mouse);
-        self.hits = draw.hits.clone();
+        let mut draw = build(&mut self.state, &snap, &self.startup, self.mouse);
+        self.hits = std::mem::take(&mut draw.hits);
         self.list_rect = draw.list_rect;
         self.detail_rect = draw.detail_rect;
         self.startup_rect = draw.startup_rect;
@@ -155,9 +155,9 @@ impl App {
                     } else {
                         self.state.settings.speed.ms()
                     });
-                    if let Err(err) = save_ui(&self.state) {
-                        self.notify(format!("Could not save settings: {err}"), 6);
-                    }
+                    // fsync lives on a worker; blocking here made every page
+                    // and section click feel like a delayed open.
+                    save_ui_bg(&self.state);
                 }
                 Effect::Notify(label) => self.notify(label, 3),
             }
@@ -259,7 +259,13 @@ impl App {
         let name = entry.name.clone();
         let path = entry.path.clone();
         let system_path = entry.system_path.clone();
-        if let Err(err) = write_enabled(&path, system_path.as_deref(), enable) {
+        let hypr = entry.hypr_index;
+        let result = if let Some(i) = hypr {
+            write_hypr_enabled(&path, i, enable)
+        } else {
+            write_enabled(&path, system_path.as_deref(), enable)
+        };
+        if let Err(err) = result {
             self.notify(format!("Could not update {name}: {err}"), 6);
         }
         self.startup = load_startup();

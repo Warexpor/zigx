@@ -54,7 +54,7 @@ Pause lasts for the session only; ZIGX always launches live.
 
 `Ctrl++` / `Ctrl+=` zooms in and `Ctrl+-` zooms out. Stops run from 80% to 180% (80, 90, 100, 110, 125, 140, 160, 180). `Ctrl+0` resets to 100%. Settings has the same control. The scale is saved in `~/.config/zigx/ui.txt` with the other remembered layout state.
 
-Startup lists every `.desktop` in `/etc/xdg/autostart` (and `$XDG_CONFIG_DIRS`) merged with `~/.config/autostart`, where a user file overrides the system one of the same name. `OnlyShowIn` / `NotShowIn` / `TryExec` do not hide entries from the list. Turning an entry off writes `Hidden=true` into the user file, creating it from the system entry when needed, and keeps a one-time `.bak`.
+Startup lists every `.desktop` in `/etc/xdg/autostart` (and `$XDG_CONFIG_DIRS`) merged with `~/.config/autostart`, where a user file overrides the system one of the same name, plus Omarchy/Hypr `o.launch_on_start(...)` lines from `~/.config/hypr/autostart.lua`. `OnlyShowIn` / `NotShowIn` / `TryExec` do not hide desktop entries from the list. Turning a desktop entry off writes `Hidden=true` into the user file (creating it from the system entry when needed) and keeps a one-time `.bak`. Turning a Hypr launch off comments that `o.launch_on_start` block in the Lua file.
 
 ## Fonts
 

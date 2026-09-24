@@ -10,6 +10,11 @@ use winit::window::Window;
 
 use zigx::{DrawList, Label};
 
+/// Soft cap on cosmic-text Swash CPU maps. Atlas trim drops GPU glyphs but
+/// leaves these HashMaps forever; clear when they grow past this so long
+/// Performance sessions do not make page fades heavier over time.
+const SWASH_CACHE_CAP: usize = 16_384;
+
 const SHAPE: &str = r#"
 struct Globals {
     resolution: vec2<f32>,
@@ -538,6 +543,14 @@ impl Gfx {
         window.pre_present_notify();
         self.queue.present(frame);
         self.atlas.trim();
+        // Atlas trim drops GPU glyphs; SwashHashMaps stay forever. Cap them
+        // without thrashing: only clear when well over the soft cap.
+        let swash_n = self.swash_cache.image_cache.len()
+            + self.swash_cache.outline_command_cache.len();
+        if swash_n > SWASH_CACHE_CAP {
+            self.swash_cache.image_cache.clear();
+            self.swash_cache.outline_command_cache.clear();
+        }
         if configure_after {
             self.surface.configure(&self.device, &self.config);
         }
@@ -732,6 +745,8 @@ impl Gfx {
                 ),
             });
         }
+        // Always prepare: atlas.trim() clears glyphs_in_use each frame, so
+        // skipped prepares let later allocates evict live glyphs.
         let empty: &[glyphon::CustomGlyph] = &[];
         let areas: Vec<TextArea> = prepared
             .iter()

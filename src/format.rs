@@ -48,10 +48,20 @@ pub fn rate(bps: f64) -> String {
     format!("{}/s", bytes(bps.round() as u64))
 }
 
-pub fn disk_cell(read: Option<f64>, write: Option<f64>) -> String {
+/// Process disk share of current device throughput, 0..100.
+pub fn disk_pct(read: Option<f64>, write: Option<f64>, total_bps: f64) -> String {
     match (read, write) {
         (None, None) => "—".into(),
-        (a, b) => rate(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        (a, b) => {
+            let proc = a.unwrap_or(0.0) + b.unwrap_or(0.0);
+            if !proc.is_finite() || proc < 0.0 {
+                return "—".into();
+            }
+            if total_bps < 1.0 {
+                return percent(0.0);
+            }
+            percent(((proc / total_bps) * 100.0).clamp(0.0, 100.0) as f32)
+        }
     }
 }
 

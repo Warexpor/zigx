@@ -506,6 +506,12 @@ impl Engine {
                 );
             }
             let name = self.proc_name(pid, &stat.comm, stat.start);
+            let mem_pages = if self.read_proc_file(pid, "statm") {
+                parse_statm_private(&String::from_utf8_lossy(&self.bytes))
+            } else {
+                None
+            }
+            .unwrap_or(stat.rss_pages);
             out.push(Proc {
                 pid,
                 uid,
@@ -513,7 +519,7 @@ impl Engine {
                 name,
                 cpu,
                 gpu: self.cached_proc_gpu.get(&pid).copied().unwrap_or(0.0),
-                rss: stat.rss_pages * self.page_size,
+                mem: mem_pages * self.page_size,
                 read_bps,
                 write_bps,
                 threads: stat.threads.max(1),
@@ -1071,6 +1077,16 @@ fn parse_proc_stat(s: &str) -> Option<ParsedStat> {
     })
 }
 
+/// Resident pages minus file-backed and shmem pages (`RssAnon`). Plain RSS
+/// counts every shared library and shared buffer once per process, so summing
+/// it over a multi-process program (browsers, Electron) overstates RAM badly.
+fn parse_statm_private(s: &str) -> Option<u64> {
+    let mut it = s.split_whitespace().skip(1);
+    let resident: u64 = it.next()?.parse().ok()?;
+    let shared: u64 = it.next()?.parse().ok()?;
+    Some(resident.saturating_sub(shared))
+}
+
 fn read_cpu_model() -> String {
     let Ok(text) = fs::read_to_string("/proc/cpuinfo") else {
         return "CPU".into();
@@ -1545,6 +1561,9 @@ mod tests {
         assert_eq!(p.threads, 3);
         assert_eq!(p.start, 1);
         assert_eq!(p.rss_pages, 99);
+        assert_eq!(parse_statm_private("5000 1200 300 10 0 900 0\n"), Some(900));
+        assert_eq!(parse_statm_private("5000 100 300 10 0 900 0"), Some(0));
+        assert_eq!(parse_statm_private("5000"), None);
         assert_eq!(
             display_name("/opt/google/chrome/chrome --type=zygote --no-sandbox"),
             "chrome"

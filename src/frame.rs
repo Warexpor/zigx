@@ -2259,7 +2259,7 @@ fn sort_procs(procs: &mut [&Proc], col: Col, desc: bool) {
                 .gpu
                 .partial_cmp(&b.gpu)
                 .unwrap_or(std::cmp::Ordering::Equal),
-            Col::Memory => a.rss.cmp(&b.rss),
+            Col::Memory => a.mem.cmp(&b.mem),
             Col::Disk => disk_sum(a)
                 .partial_cmp(&disk_sum(b))
                 .unwrap_or(std::cmp::Ordering::Equal),
@@ -2293,7 +2293,7 @@ fn group_metric(members: &[&Proc], col: Col) -> f64 {
     match col {
         Col::Cpu => members.iter().map(|p| p.cpu as f64).sum(),
         Col::Gpu => members.iter().map(|p| p.gpu as f64).sum(),
-        Col::Memory => members.iter().map(|p| p.rss as f64).sum(),
+        Col::Memory => members.iter().map(|p| p.mem as f64).sum(),
         Col::Disk => members.iter().map(|p| disk_sum(p)).sum(),
         Col::Threads => members.iter().map(|p| p.threads as f64).sum(),
         _ => 0.0,
@@ -2440,7 +2440,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f
             Col::Name => p.name.clone(),
             Col::Cpu => cpu_pct(cpu),
             Col::Gpu => cpu_pct(p.gpu),
-            Col::Memory => bytes(p.rss),
+            Col::Memory => bytes(p.mem),
             Col::Disk => disk_pct(p.read_bps, p.write_bps, disk_den),
             Col::Pid => p.pid.to_string(),
             Col::User => p.user.clone(),
@@ -2495,7 +2495,7 @@ fn draw_group(
     // uncapped sums read as "400%" for a busy browser group.
     let cpu = (members.iter().map(|p| p.cpu).sum::<f32>() / cpu_div).min(100.0);
     let gpu = members.iter().map(|p| p.gpu).sum::<f32>().min(100.0);
-    let rss = members.iter().map(|p| p.rss).sum::<u64>();
+    let mem = members.iter().map(|p| p.mem).sum::<u64>();
     let threads = members.iter().map(|p| p.threads).sum::<u32>();
     let read = sum_opt(members.iter().map(|p| p.read_bps));
     let write = sum_opt(members.iter().map(|p| p.write_bps));
@@ -2521,7 +2521,7 @@ fn draw_group(
             Col::Name => title.to_string(),
             Col::Cpu => cpu_pct(cpu),
             Col::Gpu => cpu_pct(gpu),
-            Col::Memory => bytes(rss),
+            Col::Memory => bytes(mem),
             Col::Disk => disk_pct(read, write, disk_den),
             Col::Pid => "-".into(),
             Col::User => user.unwrap_or("-").to_string(),
@@ -3795,7 +3795,7 @@ mod tests {
             name: format!("p{pid}"),
             cpu,
             gpu: 0.0,
-            rss: 1 << 20,
+            mem: 1 << 20,
             read_bps: None,
             write_bps: None,
             threads: 1,

@@ -73,7 +73,9 @@ pub struct Proc {
     pub name: String,
     pub cpu: f32,
     pub gpu: f32,
-    pub rss: u64,
+    /// Private resident bytes; excludes shared file-backed and shmem pages so
+    /// group sums do not count shared libraries once per process.
+    pub mem: u64,
     pub read_bps: Option<f64>,
     pub write_bps: Option<f64>,
     pub threads: u32,

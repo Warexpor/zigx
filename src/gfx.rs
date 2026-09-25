@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use glyphon::{
-    Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea,
-    TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
+    cosmic_text::Align as TextAlign, Attrs, Buffer, Cache, Family, FontSystem, Metrics, Resolution,
+    Shaping, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap,
 };
 use wgpu::util::DeviceExt;
 use wgpu::*;
@@ -207,7 +207,8 @@ struct Vert {
 struct TextLayer {
     renderer: TextRenderer,
     buffers: Vec<Buffer>,
-    keys: Vec<(String, u32, bool, u16, i32)>,
+    /// text, size_key, mono, weight, track_key, width_key, align
+    keys: Vec<(String, u32, bool, u16, i32, u32, u8)>,
 }
 
 impl TextLayer {
@@ -666,7 +667,7 @@ impl Gfx {
             let mut buf = Buffer::new(font_system, Metrics::new(14.0, 18.0));
             buf.set_wrap(Wrap::None);
             tl.buffers.push(buf);
-            tl.keys.push((String::new(), 0, false, 400, 0));
+            tl.keys.push((String::new(), 0, false, 400, 0, 0, 0));
         }
         tl.buffers.truncate(n);
         tl.keys.truncate(n);
@@ -675,11 +676,14 @@ impl Gfx {
             let size_px = (label.size * scale).max(1.0);
             let size_key = (size_px * 10.0).round() as u32;
             let track_key = (label.tracking * 1000.0).round() as i32;
+            let width_key = (label.w * scale * 10.0).round() as u32;
             let changed = tl.keys[i].0 != label.text
                 || tl.keys[i].1 != size_key
                 || tl.keys[i].2 != label.mono
                 || tl.keys[i].3 != label.weight
-                || tl.keys[i].4 != track_key;
+                || tl.keys[i].4 != track_key
+                || tl.keys[i].5 != width_key
+                || tl.keys[i].6 != label.align;
             if changed {
                 let weight = if label.mono {
                     fonts.mono.snap(label.weight)
@@ -695,13 +699,18 @@ impl Gfx {
                 if label.tracking != 0.0 {
                     attrs = attrs.letter_spacing(label.tracking);
                 }
+                let align = match label.align {
+                    1 => Some(TextAlign::Right),
+                    2 => Some(TextAlign::Center),
+                    _ => Some(TextAlign::Left),
+                };
                 let buf = &mut tl.buffers[i];
                 buf.set_metrics(Metrics::new(size_px, (label.h * scale).max(size_px)));
                 buf.set_size(
                     Some((label.w * scale).max(1.0)),
                     Some((label.h * scale).max(1.0)),
                 );
-                buf.set_text(&label.text, &attrs, Shaping::Advanced, None);
+                buf.set_text(&label.text, &attrs, Shaping::Advanced, align);
                 buf.shape_until_scroll(font_system, false);
                 tl.keys[i] = (
                     label.text.clone(),
@@ -709,6 +718,8 @@ impl Gfx {
                     label.mono,
                     label.weight,
                     track_key,
+                    width_key,
+                    label.align,
                 );
             }
             let x = (label.x * scale).round();

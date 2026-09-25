@@ -79,6 +79,9 @@ pub struct Label {
     pub weight: u16,
     /// Letter spacing in em.
     pub tracking: f32,
+    /// 0 = left, 1 = right, 2 = center. Applied inside the text buffer so
+    /// real font metrics — not the heuristic advance table — own the edge.
+    pub align: u8,
     /// Optional scissor in design pixels (e.g. process list viewport).
     pub clip: Option<Rect>,
 }
@@ -355,21 +358,18 @@ impl DrawList {
         if fitted.is_empty() {
             return;
         }
-        let tw = measure(&fitted, t);
         // Center on the em box. A tall 1.3 line box left unused descender
         // room that lifted labels; glyphon still paints ink a hair low in the
         // em, so nudge up to land on the geometric mid of the pill.
         let em = t.size;
         let lh = em * 1.2;
-        let x = match align {
-            Align::Left => r.x,
-            Align::Right => r.right() - tw,
-            Align::Center => r.x + (r.w - tw) * 0.5,
-        };
+        // Always pin the buffer to the cell's left edge. Horizontal alignment
+        // is done by cosmic-text inside `w`, so a wrong heuristic advance
+        // cannot slide the ink into a neighboring column.
         let y = r.y + (r.h - em) * 0.5 - em * 0.08;
         self.layers[self.layer].labels.push(Label {
             text: fitted,
-            x,
+            x: r.x,
             y,
             w: r.w,
             h: lh,
@@ -378,6 +378,11 @@ impl DrawList {
             mono: t.mono,
             weight: t.weight,
             tracking: t.tracking,
+            align: match align {
+                Align::Left => 0,
+                Align::Right => 1,
+                Align::Center => 2,
+            },
             clip: self.clip,
         });
     }
@@ -2261,8 +2266,7 @@ fn columns(density: Density, prefs: &Settings, width: f32) -> Vec<ColSpec> {
     } else {
         &[
             (Col::Threads, 76.0, true, true),
-            // Username is a label, not a metric: left edge under the header.
-            (Col::User, 96.0, false, false),
+            (Col::User, 96.0, true, false),
             (Col::Pid, 72.0, true, true),
             (Col::Disk, 96.0, true, true),
             (Col::Memory, 88.0, true, true),
@@ -2333,10 +2337,7 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort, held: 
         let on = d.anim.toggle(key("sort-on", c.col), active);
         let color = mix_rgba(theme::INK_3, theme::INK, on);
         let title = col_title(c.col);
-        // User is proportional text; never right-align even if a future
-        // ColSpec flag flips.
-        let right = c.right && c.col != Col::User;
-        if right {
+        if c.right {
             d.text_r(title, r, MICRO, color);
         } else {
             d.text(title, r, MICRO, color);
@@ -2352,7 +2353,7 @@ fn draw_header(d: &mut DrawList, cols: &[ColSpec], row: Rect, sort: Sort, held: 
         }
         if on > 0.0 {
             let tw = measure(&title.to_uppercase(), MICRO);
-            let cx = if right {
+            let cx = if c.right {
                 r.right() - tw - 12.0
             } else {
                 r.x + tw + 6.0
@@ -2410,8 +2411,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f
             _ => theme::INK_2,
         };
         let t = if c.mono { NUM } else { BODY };
-        let right = c.right && c.col != Col::User;
-        if right {
+        if c.right {
             d.text_r(&text, r, t, color);
         } else {
             d.text(&text, r, t, color);
@@ -2455,21 +2455,23 @@ fn draw_group(
     let disk = read.unwrap_or(0.0) + write.unwrap_or(0.0);
 
     for c in cols {
-        // Clear the chevron: name starts at least 24 from the row edge.
-        let x = if c.col == Col::Name {
-            c.x.max(24.0)
+        let r = Rect::new(row.x + c.x, row.y, c.w - 10.0, row.h);
+        // Name clears the chevron; other columns keep their shared geometry so
+        // USER/PID line up with process rows.
+        let r = if c.col == Col::Name {
+            let x = c.x.max(24.0);
+            Rect::new(row.x + x, row.y, (c.w - 10.0 - (x - c.x)).max(0.0), row.h)
         } else {
-            c.x
+            r
         };
-        let r = Rect::new(row.x + x, row.y, c.w - 10.0 - (x - c.x), row.h);
         let text = match c.col {
             Col::Name => title.to_string(),
             Col::Cpu => cpu_pct(cpu),
             Col::Gpu => cpu_pct(gpu),
             Col::Memory => bytes(rss),
             Col::Disk => disk_pct(read, write, disk_den),
-            Col::Pid => "—".into(),
-            Col::User => user.unwrap_or("—").to_string(),
+            Col::Pid => "-".into(),
+            Col::User => user.unwrap_or("-").to_string(),
             Col::Threads => threads.to_string(),
         };
         let idle = match c.col {
@@ -2489,8 +2491,7 @@ fn draw_group(
             _ => theme::INK_2,
         };
         let t = if c.mono { NUM } else { BODY };
-        let right = c.right && c.col != Col::User;
-        if right {
+        if c.right {
             d.text_r(&text, r, t, color);
         } else {
             d.text(&text, r, t, color);
@@ -3884,6 +3885,55 @@ mod tests {
         assert!(
             narrow.iter().all(|c| c.x >= 0.0),
             "columns stay inside the list"
+        );
+    }
+
+    #[test]
+    fn user_column_x_matches_for_group_and_proc() {
+        use crate::model::ProcView;
+        let mut snap = Snap::placeholder();
+        snap.cpu_per = vec![0.0; 4];
+        snap.procs = vec![
+            named(1, "chrome", 10.0),
+            named(2, "chrome", 20.0),
+            named(3, "solo", 5.0),
+        ];
+        for p in &mut snap.procs {
+            p.user = "warexpor".into();
+            p.is_user = true;
+        }
+        let mut state = AppState::new(1100.0, 780.0);
+        state.page = Page::Processes;
+        state.view = ProcView::Grouped;
+        for _ in 0..120 {
+            let _ = build(&mut state, &snap, &[], [0.0, 0.0]);
+        }
+        let d = build(&mut state, &snap, &[], [0.0, 0.0]);
+        let users: Vec<_> = d.layers[0]
+            .labels
+            .iter()
+            .filter(|l| l.text == "warexpor")
+            .collect();
+        assert!(
+            users.len() >= 2,
+            "expected group+proc user labels, got {}",
+            users.len()
+        );
+        assert!(
+            users.iter().all(|l| l.align == 1),
+            "USER cells must be right-aligned in the buffer"
+        );
+        let xs: Vec<f32> = users.iter().map(|l| l.x).collect();
+        let min = xs.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (max - min).abs() < 0.5,
+            "USER cell origin diverges across rows: {xs:?}"
+        );
+        let w0 = users[0].w;
+        assert!(
+            users.iter().all(|l| (l.w - w0).abs() < 0.5),
+            "USER cell width diverges across rows"
         );
     }
 

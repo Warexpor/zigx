@@ -16,8 +16,8 @@ deadline clock.
 | `FIRST_SAMPLE_MS` | 220 | Gap after priming before the first real sample |
 | History | 30 s, 1 min, 2 min | Time across a graph; the window in samples is history / period |
 | `MAX_WINDOW` | 240 | Longest window: 2 min at 0.5 s |
-| `HIST_CAP` | 246 | Ring size: the longest window plus playback delay and curve taps |
-| `GRAPH_DELAY` | 2.15 | How many samples behind the newest the graphs play back |
+| `HIST_CAP` | 248 | Ring size: the longest window plus playback delay and curve taps |
+| `GRAPH_DELAY` | 3.15 | How many samples behind the newest the graphs play back |
 
 - The period lives in an atomic on the `Hub`. The sampler re-reads it at least
   every 50 ms while it waits, so a new speed or a pause applies at once instead
@@ -56,9 +56,9 @@ samples, for two reasons:
 
 - The right edge always sits between real samples, so it can move
   continuously.
-- Every drawn segment is final. A curve segment depends on the sample after
-  its end, so the right edge has to stay two samples back. With only one
-  sample of delay, the end of the line reshaped whenever the next sample
+- Every drawn segment is final. A curve segment depends on the two samples
+  after its end, so the right edge has to stay three samples back. With only
+  one sample of delay, the end of the line reshaped whenever the next sample
   arrived, and snapped visibly at every peak where the direction reversed.
 
 `PerfSmooth::tick` in `src/model.rs` keeps a playback position in sample units:
@@ -80,22 +80,24 @@ samples, for two reasons:
 Graphs and per-core bars both read from it, so they move on one clock.
 
 The trade-off: a change appears in the numbers immediately and in the graph
-about two samples later, when the trace draws up to it. At launch the effective
+about three samples later, when the trace draws up to it. At launch the effective
 delay is capped by how many samples exist, so the grow-in is not held back.
 
 ## Curves
 
-`sample_hist` in `src/frame.rs` evaluates a uniform cubic B-spline over the
-samples:
+`sample_hist` in `src/frame.rs` blends each sample 1:2:1 with its neighbours,
+then evaluates a uniform cubic B-spline over the result:
 
-- It is C2 smooth, so a climb bends over about a sample on each side instead of
-  kinking at its foot and crest. A curve forced through every sample has to
+- It is C2 smooth, so a climb bends over about two samples on each side
+  instead of kinking at its foot and crest. A curve forced through every sample has to
   turn within a pixel or two when a large change lands in one second, and that
   reads as a hard edge.
-- It never leaves the range of the four samples around it, so it cannot
+- It never leaves the range of the six samples around it, so it cannot
   overshoot or dip below the data.
-- Held plateaus read exactly. An isolated one-sample spike peaks at two thirds
-  of its measured height. The readouts always show the exact value.
+- Held plateaus read exactly. An isolated one-sample spike draws as a rounded
+  hill about four samples wide, peaking at about two fifths of its measured
+  height. At 60 samples across a graph, anything that passes through the
+  peak is a needle. The readouts always show the exact value.
 
 Unit tests guard these properties: `curve_stays_inside_its_samples`, and
 `drawn_segments_ignore_samples_that_have_not_played` for the playback delay.
@@ -142,7 +144,7 @@ Disk and network graphs autoscale to the nice ceiling (1, 2, 5 x 10^n) of recent
 traffic.
 
 - **Target.** The target covers roughly a quarter of the drawn window (clamped
-  to 6–16 samples) plus the two samples the curve is heading into. The scale
+  to 6–16 samples) plus the three samples the curve is heading into. The scale
   grows before a burst is drawn, and shrinks again when recent traffic is
   quieter — even while an older spike is still scrolling off on the left.
 - **Easing.** The scale follows its target in log space with a critically
@@ -164,8 +166,11 @@ app redraws every display frame; on other pages it waits for input or a new
 sample.
 
 - **Strokes** (`stroke_line` in `src/gfx.rs`) are one mitered ribbon per
-  polyline, so semi-transparent ink never doubles up at joins. Joins sharper
-  than about 88 degrees fall back to a bevel so spikes do not throw long miters.
+  polyline, so semi-transparent ink never doubles up at joins. Miters stretch
+  at most 2x; turns sharper than 120 degrees, such as the tip of a steep
+  spike, split the ribbon and close the outside with a round fan. Sharing one
+  vertex there collapsed the ribbon beside the tip, so spikes drew as two
+  unjoined hairlines with a stray pixel above them.
   Coverage is a signed distance with a 1.1 px soft fringe. A polyline whose
   last point equals its first is closed: the seam is mitered like any other
   join and gets no caps (the cog glyph relies on this).

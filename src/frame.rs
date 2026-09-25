@@ -393,8 +393,8 @@ impl DrawList {
     /// not stretch as the ring fills. `head` places the right edge relative to
     /// the newest sample (<= 0) and moves continuously, so the trace scrolls at
     /// a constant speed and new data is drawn in rather than popped in. Smooth
-    /// curves are uniform cubic B-splines: C2-smooth, and never outside the
-    /// samples around them.
+    /// curves are softened cubic B-splines: C2-smooth, rounded at every crest,
+    /// and never outside the samples around them.
     fn graph(&mut self, r: Rect, series: &[(&[f32], theme::Rgba)], max: f32, head: f32) {
         if r.w < 4.0 || r.h < 4.0 || !self.visible(r) {
             return;
@@ -480,11 +480,13 @@ fn sample_linear(values: &[f32], idx: f32) -> f32 {
     values[i] + (b - values[i]) * t
 }
 
-/// Uniform cubic B-spline sample. C2-smooth, so climbs bend over a whole
-/// sample instead of kinking, and always inside the range of the four samples
-/// around it, so it never overshoots. It does not pass through the samples:
-/// an isolated one-sample spike peaks at two thirds of its height. Segment
-/// `i` reads samples `i - 1 ..= i + 2`; the ends repeat their edge sample.
+/// Softened uniform cubic B-spline sample. Each control point is its sample
+/// blended 1:2:1 with its neighbours, so a one-sample burst draws as a rounded
+/// hill about four samples wide instead of a needle. C2-smooth, always inside
+/// the range of the samples around it, so it never overshoots. It does not
+/// pass through the samples: an isolated spike peaks at about two fifths of
+/// its height. Segment `i` reads samples `i - 2 ..= i + 3`; the ends repeat
+/// their edge sample.
 fn sample_hist(values: &[f32], idx: f32) -> f32 {
     let n = values.len();
     if n == 0 {
@@ -496,7 +498,8 @@ fn sample_hist(values: &[f32], idx: f32) -> f32 {
     let idx = idx.clamp(0.0, (n - 1) as f32);
     let i = (idx.floor() as usize).min(n - 2);
     let t = idx - i as f32;
-    let at = |k: isize| values[k.clamp(0, n as isize - 1) as usize];
+    let raw = |k: isize| values[k.clamp(0, n as isize - 1) as usize];
+    let at = |k: isize| (raw(k - 1) + 2.0 * raw(k) + raw(k + 1)) * 0.25;
     let i = i as isize;
     let (p0, p1, p2, p3) = (at(i - 1), at(i), at(i + 1), at(i + 2));
     let t2 = t * t;
@@ -3976,23 +3979,29 @@ mod tests {
 
     #[test]
     fn curve_stays_inside_its_samples() {
-        let v = [0.0, 100.0, 0.0, 40.0, 45.0, 90.0, 90.0, 90.0, 10.0];
-        for s in 0..=800 {
+        let v = [0.0, 100.0, 0.0, 40.0, 45.0, 90.0, 90.0, 90.0, 90.0, 90.0, 10.0];
+        for s in 0..=1000 {
             let idx = s as f32 / 100.0;
             let i = (idx.floor() as usize).min(v.len() - 2);
-            let near = &v[i.saturating_sub(1)..(i + 3).min(v.len())];
+            let near = &v[i.saturating_sub(2)..(i + 4).min(v.len())];
             let lo = near.iter().copied().fold(f32::MAX, f32::min) - 1e-3;
             let hi = near.iter().copied().fold(f32::MIN, f32::max) + 1e-3;
             let y = sample_hist(&v, idx);
             assert!(y >= lo && y <= hi, "idx {idx}: {y} outside {lo}..{hi}");
         }
         // A held plateau reads exactly.
-        assert!((sample_hist(&v, 6.0) - 90.0).abs() < 1e-3);
+        assert!((sample_hist(&v, 7.0) - 90.0).abs() < 1e-3);
+        // A lone spike is a low rounded hill, not a needle.
+        let spike = [0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 0.0];
+        let peak = (0..=600)
+            .map(|s| sample_hist(&spike, s as f32 / 100.0))
+            .fold(0.0_f32, f32::max);
+        assert!((35.0..45.0).contains(&peak), "spike peak {peak}");
     }
 
     #[test]
     fn drawn_segments_ignore_samples_that_have_not_played() {
-        // With the right edge two samples back, a new sample must not reshape
+        // With the right edge three samples back, a new sample must not reshape
         // anything left of it.
         let old = [10.0, 80.0, 20.0, 60.0, 30.0];
         let new = [10.0, 80.0, 20.0, 60.0, 30.0, 95.0];

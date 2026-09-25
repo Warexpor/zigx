@@ -1030,8 +1030,9 @@ fn stroke_vert(
 
 /// Polyline as one joined ribbon. Consecutive segments meet at miter points
 /// instead of overlapping, so semi-transparent ink stays even through the
-/// corners, and `round` grows capsule ends in the fragment shader rather
-/// than stacking a second primitive on top.
+/// corners; turns sharper than 120 degrees get a round join instead. `round`
+/// grows capsule ends in the fragment shader rather than stacking a second
+/// primitive on top.
 fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: &mut Vec<Vert>) {
     let hw = (width * 0.5).max(0.5);
     // Grow the ribbon so the fragment soft-edge has pixels to fade across.
@@ -1068,33 +1069,37 @@ fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: 
         n >= 4 && (p[0][0] - p[n - 1][0]).abs() < 1e-3 && (p[0][1] - p[n - 1][1]).abs() < 1e-3;
     let round = round && !closed;
 
-    // Left-side offset at every point: plain normal at open ends, miter inside.
-    let offs: Vec<[f32; 2]> = (0..n)
+    // Incoming and outgoing direction at each join; open ends have none.
+    let join = |i: usize| -> Option<([f32; 2], [f32; 2])> {
+        if i == 0 || i == n - 1 {
+            closed.then(|| (dirs[n - 2], dirs[0]))
+        } else {
+            Some((dirs[i - 1], dirs[i]))
+        }
+    };
+    // Left-side offset at every point: plain normal at open ends, miter
+    // inside. `None` marks a sharp join: sharing one vertex there collapses
+    // the ribbon to nothing beside the tip (a steep graph spike drew as two
+    // unjoined hairlines), so each segment keeps its own normal and a round
+    // fan closes the outside of the turn.
+    let offs: Vec<Option<[f32; 2]>> = (0..n)
         .map(|i| {
-            let (d0, d1) = if i == 0 || i == n - 1 {
-                if !closed {
-                    let nn = normal(dirs[if i == 0 { 0 } else { n - 2 }]);
-                    return [nn[0] * outer, nn[1] * outer];
-                }
-                (dirs[n - 2], dirs[0])
-            } else {
-                (dirs[i - 1], dirs[i])
+            let Some((d0, d1)) = join(i) else {
+                let nn = normal(dirs[if i == 0 { 0 } else { n - 2 }]);
+                return Some([nn[0] * outer, nn[1] * outer]);
             };
             let n0 = normal(d0);
             let n1 = normal(d1);
             let mx = n0[0] + n1[0];
             let my = n0[1] + n1[1];
-            let ml = (mx * mx + my * my).sqrt();
-            if ml < 1e-3 {
-                // Full reversal: no meaningful miter, fall back to the normal.
-                return [n0[0] * outer, n0[1] * outer];
+            // |n0 + n1| / 2 is the half-angle cosine. Past 120 degrees of turn
+            // the miter would stretch beyond 2x, so split instead.
+            let cos = (mx * mx + my * my).sqrt() * 0.5;
+            if cos < 0.5 {
+                return None;
             }
-            let m = [mx / ml, my / ml];
-            // Half-angle cosine. Acute turns use a bevel (no /cos stretch) so
-            // graph spikes do not throw a long miter that flickers under AA.
-            let cos = (m[0] * n0[0] + m[1] * n0[1]).clamp(0.0, 1.0);
-            let len = if cos < 0.72 { outer } else { outer / cos };
-            [m[0] * len, m[1] * len]
+            let len = outer / (cos * cos);
+            Some([mx * 0.5 * len, my * 0.5 * len])
         })
         .collect();
 
@@ -1103,6 +1108,10 @@ fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: 
         let b = p[i + 1];
         let d = dirs[i];
         let len = (b[0] - a[0]) * d[0] + (b[1] - a[1]) * d[1];
+        let own = normal(d);
+        let own = [own[0] * outer, own[1] * outer];
+        let off_a = offs[i].unwrap_or(own);
+        let off_b = offs[i + 1].unwrap_or(own);
         let cap_a = round && i == 0;
         let cap_b = round && i == n - 2;
         let ext_a = if cap_a { outer } else { 0.0 };
@@ -1110,29 +1119,29 @@ fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: 
         let corners = [
             (
                 [
-                    a[0] + offs[i][0] - d[0] * ext_a,
-                    a[1] + offs[i][1] - d[1] * ext_a,
+                    a[0] + off_a[0] - d[0] * ext_a,
+                    a[1] + off_a[1] - d[1] * ext_a,
                 ],
                 outer,
             ),
             (
                 [
-                    a[0] - offs[i][0] - d[0] * ext_a,
-                    a[1] - offs[i][1] - d[1] * ext_a,
+                    a[0] - off_a[0] - d[0] * ext_a,
+                    a[1] - off_a[1] - d[1] * ext_a,
                 ],
                 -outer,
             ),
             (
                 [
-                    b[0] + offs[i + 1][0] + d[0] * ext_b,
-                    b[1] + offs[i + 1][1] + d[1] * ext_b,
+                    b[0] + off_b[0] + d[0] * ext_b,
+                    b[1] + off_b[1] + d[1] * ext_b,
                 ],
                 outer,
             ),
             (
                 [
-                    b[0] - offs[i + 1][0] + d[0] * ext_b,
-                    b[1] - offs[i + 1][1] + d[1] * ext_b,
+                    b[0] - off_b[0] + d[0] * ext_b,
+                    b[1] - off_b[1] + d[1] * ext_b,
                 ],
                 -outer,
             ),
@@ -1153,5 +1162,65 @@ fn stroke_line(pts: &[[f32; 2]], width: f32, round: bool, color: [f32; 4], out: 
         emit(out, 2);
         emit(out, 3);
         emit(out, 1);
+    }
+
+    // Round fans on the outside of sharp joins. A closed seam is vertex 0.
+    for i in 0..n - 1 {
+        if offs[i].is_some() {
+            continue;
+        }
+        let Some((d0, d1)) = join(i) else { continue };
+        let n0 = normal(d0);
+        let n1 = normal(d1);
+        // The outside is opposite the side the path turns toward.
+        let side = if n0[0] * d1[0] + n0[1] * d1[1] > 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        let a0 = (n0[1] * side).atan2(n0[0] * side);
+        let a1 = (n1[1] * side).atan2(n1[0] * side);
+        let tau = std::f32::consts::TAU;
+        let sweep = (a1 - a0 + std::f32::consts::PI).rem_euclid(tau) - std::f32::consts::PI;
+        let steps = ((sweep.abs() / (std::f32::consts::PI / 8.0)).ceil() as usize).max(2);
+        let c = p[i];
+        let rim = |k: usize| {
+            let t = a0 + sweep * k as f32 / steps as f32;
+            [c[0] + t.cos() * outer, c[1] + t.sin() * outer]
+        };
+        for k in 0..steps {
+            stroke_vert(out, c, 0.0, hw, NO_CAP, NO_CAP, color);
+            stroke_vert(out, rim(k), outer, hw, NO_CAP, NO_CAP, color);
+            stroke_vert(out, rim(k + 1), outer, hw, NO_CAP, NO_CAP, color);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stroke_line, Vert};
+
+    fn covered(verts: &[Vert], q: [f32; 2]) -> bool {
+        verts.chunks(3).any(|t| {
+            let [a, b, c] = [t[0].pos, t[1].pos, t[2].pos];
+            let edge = |p: [f32; 4], r: [f32; 4]| {
+                (r[0] - p[0]) * (q[1] - p[1]) - (r[1] - p[1]) * (q[0] - p[0])
+            };
+            let (e0, e1, e2) = (edge(a, b), edge(b, c), edge(c, a));
+            (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0)
+        })
+    }
+
+    #[test]
+    fn steep_spike_tip_stays_solid() {
+        // A graph spike: 2 px wide, 200 px tall.
+        let pts = [[0.0, 200.0], [1.0, 0.0], [2.0, 200.0]];
+        let mut verts = Vec::new();
+        stroke_line(&pts, 1.25, false, [1.0; 4], &mut verts);
+        for k in 0..16 {
+            let t = k as f32 / 16.0 * std::f32::consts::TAU;
+            let q = [1.0 + t.cos() * 0.5, t.sin() * 0.5];
+            assert!(covered(&verts, q), "hole at the tip near {q:?}");
+        }
     }
 }

@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.5.4    |                                                      |
+| v0.5.5    |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```

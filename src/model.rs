@@ -9,12 +9,12 @@ use crate::settings::Settings;
 /// window actually drawn comes from [`Settings::window`].
 pub const MAX_WINDOW: usize = 240;
 /// Ring capacity: the window plus the playback delay and interpolation taps.
-pub const HIST_CAP: usize = MAX_WINDOW + 6;
+pub const HIST_CAP: usize = MAX_WINDOW + 8;
 /// Graphs play back this many samples behind the newest one. A curve segment
-/// depends on the sample after its end, so the right edge must stay two
+/// depends on the two samples after its end, so the right edge must stay three
 /// samples back for every drawn segment to be final: nothing already on screen
-/// reshapes when a new sample lands. The fraction over 2.0 absorbs jitter.
-pub const GRAPH_DELAY: f64 = 2.15;
+/// reshapes when a new sample lands. The fraction over 3.0 absorbs jitter.
+pub const GRAPH_DELAY: f64 = 3.15;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Page {
@@ -502,7 +502,7 @@ fn window_peak(h: &[f32], head: f32, window: usize) -> f32 {
     }
     let right = (h.len() - 1) as f32 + head;
     let lo = ((right - window as f32).floor() - 1.0).max(0.0) as usize;
-    let hi = ((right.floor() + 2.0).max(0.0) as usize).min(h.len() - 1);
+    let hi = ((right.floor() + 3.0).max(0.0) as usize).min(h.len() - 1);
     if lo > hi {
         return 0.0;
     }

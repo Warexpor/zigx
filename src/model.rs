@@ -439,7 +439,7 @@ impl PerfSmooth {
                     .iter()
                     .map(|n| (format!("net:{}", n.name), &n.rx_hist, &n.tx_hist)),
             );
-        let span = scale_window(self.window);
+        let span = self.window;
         for (key, a, b) in devs {
             // Follow the raw peak in log space. nice_ceil is only for labels —
             // stepping the spring between 1/2/5 ceilings made shrink hitch.
@@ -485,15 +485,10 @@ impl PerfSmooth {
     }
 }
 
-/// How many recent samples set the I/O Y-scale. Shorter than the drawn window
-/// so quiet traffic zooms back in while older spikes are still scrolling off.
-pub fn scale_window(drawn_window: usize) -> usize {
-    (drawn_window / 4).clamp(6, 16)
-}
-
-/// Target scale for a pair of rate histories: the nice ceiling of recent
-/// traffic at `head`, plus the samples the curve is heading into, so the
-/// scale grows before a burst and shrinks again when focus is quieter.
+/// Target scale for a pair of rate histories: the nice ceiling of everything
+/// on screen at `head`, plus the samples the curve is heading into, so the
+/// scale grows before a burst and only shrinks once the burst has scrolled
+/// fully off the left edge.
 pub fn io_scale(a: &[f32], b: &[f32], head: f32, window: usize) -> f32 {
     crate::format::nice_ceil(window_peak(a, head, window).max(window_peak(b, head, window)))
 }
@@ -650,7 +645,7 @@ pub mod theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{io_scale, scale_window, snap_ui_scale, step_ui_scale};
+    use super::{io_scale, snap_ui_scale, step_ui_scale};
 
     #[test]
     fn zoom_steps_and_clamps() {
@@ -662,24 +657,17 @@ mod tests {
     }
 
     #[test]
-    fn scale_window_is_shorter_than_history() {
-        assert_eq!(scale_window(30), 7);
-        assert_eq!(scale_window(60), 15);
-        assert_eq!(scale_window(120), 16);
-        assert_eq!(scale_window(4), 6);
-    }
-
-    #[test]
-    fn io_scale_follows_recent_traffic_not_old_spikes() {
-        // Old spike on the left, quiet recent samples near head=0.
-        let mut hist = vec![0.0; 30];
-        hist[0] = 100_000_000.0;
-        for v in &mut hist[20..] {
-            *v = 1_000_000.0;
-        }
-        let full = io_scale(&hist, &hist, 0.0, 30);
-        let recent = io_scale(&hist, &hist, 0.0, scale_window(30));
-        assert!(full > recent * 10.0, "full={full} recent={recent}");
-        assert!((recent - 1_000_000.0).abs() < 1.0, "recent={recent}");
+    fn io_scale_holds_until_spike_leaves_screen() {
+        let mut hist = vec![1_000_000.0; 60];
+        hist[20] = 100_000_000.0;
+        // Spike near the left edge of a 30-sample window: still on screen.
+        let on_screen = io_scale(&hist, &hist, -10.0, 30);
+        assert!(
+            (on_screen - 100_000_000.0).abs() < 1.0,
+            "on_screen={on_screen}"
+        );
+        // Scrolled well past the left edge: zoom back to quiet traffic.
+        let gone = io_scale(&hist, &hist, 0.0, 30);
+        assert!((gone - 1_000_000.0).abs() < 1.0, "gone={gone}");
     }
 }

@@ -62,8 +62,8 @@ fn disk_snap() -> Snap {
     snap
 }
 
-/// A large burst early in the window, then quiet traffic: the I/O scale zooms
-/// back to the recent quarter while the burst is still on screen.
+/// A large burst early in the window, then quiet traffic: the I/O scale holds
+/// at the burst until it has scrolled off the left edge.
 fn disk_burst_snap() -> Snap {
     let mut snap = base_snap();
     let mut read = [3.0_f32; 60];

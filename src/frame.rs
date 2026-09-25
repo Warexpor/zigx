@@ -6,7 +6,7 @@ use crate::format::{
 };
 use crate::interact::selection_label;
 use crate::model::{
-    io_scale, scale_window, theme, AppState, Col, ContextMenu, Density, Drag, MenuAction, Page,
+    io_scale, theme, AppState, Col, ContextMenu, Density, Drag, MenuAction, Page,
     Proc, ProcView, ScrollBar, Section, Snap, Sort, StartupEntry,
 };
 use crate::settings::{Choice, Curve, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS};
@@ -3217,7 +3217,7 @@ fn io_page(
             a_hist,
             b_hist,
             head,
-            scale_window(state.settings.window()),
+            state.settings.window(),
         );
         let key = format!("{}:{name}", if disk { "disk" } else { "net" });
         let max = state.perf_smooth.io_max(&key).unwrap_or(goal);

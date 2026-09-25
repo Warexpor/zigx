@@ -24,3 +24,6 @@ winit = "0.30"
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+
+[dev-dependencies]
+png = "0.18.1"

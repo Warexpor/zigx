@@ -231,7 +231,8 @@ struct Prepared {
 
 pub struct Gfx {
     instance: Instance,
-    surface: Surface<'static>,
+    /// `None` when rendering offscreen (snapshots).
+    surface: Option<Surface<'static>>,
     device: Device,
     queue: Queue,
     config: SurfaceConfiguration,
@@ -318,7 +319,46 @@ impl Gfx {
             color_space: SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
+        Self::with_device(instance, Some(surface), device, queue, config)
+    }
 
+    /// Offscreen renderer with the same pipelines, for snapshots. `None` when
+    /// no GPU adapter is available.
+    #[cfg(test)]
+    pub fn headless(width: u32, height: u32) -> Option<Self> {
+        let instance = wgpu::Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            apply_limit_buckets: false,
+        }))
+        .ok()?;
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&DeviceDescriptor::default())).ok()?;
+        let config = SurfaceConfiguration {
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            // Non-sRGB like the window target, so alpha tokens blend the same.
+            format: TextureFormat::Rgba8Unorm,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: PresentMode::Fifo,
+            alpha_mode: CompositeAlphaMode::PreMultiplied,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+            color_space: SurfaceColorSpace::Auto,
+        };
+        Some(Self::with_device(instance, None, device, queue, config))
+    }
+
+    fn with_device(
+        instance: Instance,
+        surface: Option<Surface<'static>>,
+        device: Device,
+        queue: Queue,
+        config: SurfaceConfiguration,
+    ) -> Self {
+        let format = config.format;
         let globals = device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("globals"),
             contents: bytemuck::bytes_of(&Globals {
@@ -428,8 +468,125 @@ impl Gfx {
         if self.config.width != physical.width || self.config.height != physical.height {
             self.config.width = physical.width.max(1);
             self.config.height = physical.height.max(1);
-            self.surface.configure(&self.device, &self.config);
+            self.configure();
         }
+        self.prepare(draw, scale);
+
+        let status = match &self.surface {
+            Some(surface) => surface.get_current_texture(),
+            None => return false,
+        };
+        let mut configure_after = false;
+        let frame = match status {
+            CurrentSurfaceTexture::Success(frame) => frame,
+            // The texture is still presentable. Configure afterwards so the
+            // next frame matches the surface.
+            CurrentSurfaceTexture::Suboptimal(frame) => {
+                configure_after = true;
+                frame
+            }
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return false,
+            CurrentSurfaceTexture::Outdated => {
+                self.configure();
+                return true;
+            }
+            // Lost is not fixed by configure: the surface itself has to be
+            // created again or the window stays blank until a resize.
+            CurrentSurfaceTexture::Lost => {
+                if self.recreate_surface(window) {
+                    return true;
+                }
+                return false;
+            }
+            CurrentSurfaceTexture::Validation => return false,
+        };
+        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+        let encoder = self.encode(&view);
+        self.queue.submit(Some(encoder.finish()));
+        window.pre_present_notify();
+        self.queue.present(frame);
+        self.trim_caches();
+        if configure_after {
+            self.configure();
+        }
+        false
+    }
+
+    /// Render one frame offscreen and read it back as opaque RGBA8, composited
+    /// over black like the glass over a dark desktop.
+    #[cfg(test)]
+    pub fn capture(&mut self, draw: &DrawList, scale: f32) -> Vec<u8> {
+        let (w, h) = (self.config.width, self.config.height);
+        self.prepare(draw, scale);
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("capture"),
+            size: Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: self.config.format,
+            usage: self.config.usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        let mut encoder = self.encode(&view);
+        let row = (w * 4).div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT) * COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = self.device.create_buffer(&BufferDescriptor {
+            label: Some("capture"),
+            size: (row * h) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        readback.map_async(MapMode::Read, .., |r| r.expect("map capture"));
+        self.device
+            .poll(PollType::wait_indefinitely())
+            .expect("gpu poll");
+        let data = readback.get_mapped_range(..).expect("mapped capture");
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h as usize {
+            let line = &data[y * row as usize..][..w as usize * 4];
+            // Premultiplied over black is the color channels as stored.
+            for px in line.chunks_exact(4) {
+                out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+        }
+        out
+    }
+
+    fn configure(&self) {
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
+    }
+
+    /// Upload this frame's globals, geometry and text.
+    fn prepare(&mut self, draw: &DrawList, scale: f32) {
         self.queue.write_buffer(
             &self.globals,
             0,
@@ -456,32 +613,10 @@ impl Gfx {
         for (i, layer) in draw.layers.iter().enumerate() {
             self.prepare_text(i, &layer.labels, scale);
         }
+    }
 
-        let mut configure_after = false;
-        let frame = match self.surface.get_current_texture() {
-            CurrentSurfaceTexture::Success(frame) => frame,
-            // The texture is still presentable. Configure afterwards so the
-            // next frame matches the surface.
-            CurrentSurfaceTexture::Suboptimal(frame) => {
-                configure_after = true;
-                frame
-            }
-            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => return false,
-            CurrentSurfaceTexture::Outdated => {
-                self.surface.configure(&self.device, &self.config);
-                return true;
-            }
-            // Lost is not fixed by configure: the surface itself has to be
-            // created again or the window stays blank until a resize.
-            CurrentSurfaceTexture::Lost => {
-                if self.recreate_surface(window) {
-                    return true;
-                }
-                return false;
-            }
-            CurrentSurfaceTexture::Validation => return false,
-        };
-        let view = frame.texture.create_view(&TextureViewDescriptor::default());
+    /// Record the frame's render pass into `view`.
+    fn encode(&mut self, view: &TextureView) -> CommandEncoder {
         let device = &self.device;
         let shape_pipeline = &self.shape_pipeline;
         let stroke_pipeline = &self.stroke_pipeline;
@@ -500,7 +635,7 @@ impl Gfx {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("zigx"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
@@ -540,9 +675,10 @@ impl Gfx {
                 self.logged_text_error = true;
             }
         }
-        self.queue.submit(Some(encoder.finish()));
-        window.pre_present_notify();
-        self.queue.present(frame);
+        encoder
+    }
+
+    fn trim_caches(&mut self) {
         self.atlas.trim();
         // Atlas trim drops GPU glyphs; SwashHashMaps stay forever. Cap them
         // without thrashing: only clear when well over the soft cap.
@@ -552,10 +688,6 @@ impl Gfx {
             self.swash_cache.image_cache.clear();
             self.swash_cache.outline_command_cache.clear();
         }
-        if configure_after {
-            self.surface.configure(&self.device, &self.config);
-        }
-        false
     }
 
     fn recreate_surface(&mut self, window: &Arc<Window>) -> bool {
@@ -563,7 +695,7 @@ impl Gfx {
             return false;
         };
         surface.configure(&self.device, &self.config);
-        self.surface = surface;
+        self.surface = Some(surface);
         true
     }
 

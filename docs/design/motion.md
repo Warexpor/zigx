@@ -185,6 +185,15 @@ sample.
 - **Shapes** are rounded-box signed distance fields, antialiased over about 1.5
   px at any zoom.
 
+### Snapshots
+
+`cargo test --bin zigx snapshots -- --ignored` renders fixed Disk and CPU
+frames through the real pipelines offscreen (`Gfx::headless`, `Gfx::capture`)
+and writes them to `target/snapshots/`: each page at 1x, plus its detail pane
+at 4x, where single stroke pixels are visible. The fixtures in
+`src/snapshot.rs` include lone one-sample bursts, plateaus, and ramps. Look at
+a snapshot before and after any change to curves, strokes, or graph scale.
+
 ### Layers
 
 A frame has two paint layers: base and overlay. The renderer draws all of a

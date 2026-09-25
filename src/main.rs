@@ -1,4 +1,6 @@
 mod gfx;
+#[cfg(test)]
+mod snapshot;
 
 use std::io::Write;
 use std::process::{Command, Stdio};

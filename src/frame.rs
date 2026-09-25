@@ -64,6 +64,9 @@ pub struct Stroke {
     pub baseline: Option<f32>,
     /// Round capsule ends. Off for graph traces, which run edge to edge.
     pub round: bool,
+    /// Draw the line itself. Off for a wash-only stroke under a graph trace
+    /// whose line is cut into pieces where it leaves the plot.
+    pub line: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +330,7 @@ impl DrawList {
             color,
             baseline: None,
             round: true,
+            line: true,
         });
     }
 
@@ -420,10 +424,11 @@ impl DrawList {
         // is rigid in data space and only translates as it scrolls. Resampling
         // at fixed screen x instead makes sharp peaks shimmer frame to frame.
         let sub = ((slot_w / 1.5).ceil() as usize).clamp(4, 16);
-        let y_of = |v: f32| {
-            let y = r.bottom() - (v / max).clamp(0.0, 1.0) * usable;
-            y.max(y_min)
-        };
+        // Values above `max` run past the plot top rather than clamping to
+        // it: the I/O scale zooms back to recent traffic while an older burst
+        // is still on screen, and a flattened plateau would read as a held
+        // value at the scale.
+        let y_of = |v: f32| r.bottom() - (v / max).max(0.0) * usable;
         for (values, color) in series.iter() {
             if values.len() < 2 {
                 continue;
@@ -449,13 +454,29 @@ impl DrawList {
                 continue;
             }
             let color = self.ink(*color);
-            self.layers[self.layer].strokes.push(Stroke {
-                pts,
-                width: 1.25,
-                color,
-                baseline: self.prefs.fill.then_some(r.bottom()),
-                round: false,
-            });
+            let strokes = &mut self.layers[self.layer].strokes;
+            // The wash stays inside the plot; the line is cut where it leaves
+            // the top, so legends in the top pad stay clear either way.
+            if self.prefs.fill {
+                strokes.push(Stroke {
+                    pts: pts.iter().map(|p| [p[0], p[1].max(y_min)]).collect(),
+                    width: 1.25,
+                    color,
+                    baseline: Some(r.bottom()),
+                    round: false,
+                    line: false,
+                });
+            }
+            for piece in clip_polyline_top(&pts, y_min) {
+                strokes.push(Stroke {
+                    pts: piece,
+                    width: 1.25,
+                    color,
+                    baseline: None,
+                    round: false,
+                    line: true,
+                });
+            }
         }
     }
 }
@@ -510,6 +531,35 @@ fn sample_hist(values: &[f32], idx: f32) -> f32 {
         + (-3.0 * t3 + 3.0 * t2 + 3.0 * t + 1.0) * p2
         + t3 * p3)
         / 6.0
+}
+
+/// Split a polyline into the runs at or below `top` (screen y grows down),
+/// ending each run exactly on the cut.
+fn clip_polyline_top(pts: &[[f32; 2]], top: f32) -> Vec<Vec<[f32; 2]>> {
+    let mut runs = Vec::new();
+    let mut run: Vec<[f32; 2]> = Vec::new();
+    let cross = |a: [f32; 2], b: [f32; 2]| {
+        let t = (top - a[1]) / (b[1] - a[1]);
+        [a[0] + (b[0] - a[0]) * t, top]
+    };
+    for (i, &p) in pts.iter().enumerate() {
+        let inside = p[1] >= top;
+        if i > 0 {
+            let q = pts[i - 1];
+            if (q[1] >= top) != inside {
+                run.push(cross(q, p));
+                if !inside {
+                    runs.push(std::mem::take(&mut run));
+                }
+            }
+        }
+        if inside {
+            run.push(p);
+        }
+    }
+    runs.push(run);
+    runs.retain(|r| r.len() >= 2);
+    runs
 }
 
 /// Keep a scrolling series inside the chart: drop off-screen points and insert
@@ -3733,7 +3783,7 @@ fn switch(d: &mut DrawList, r: Rect, on: bool, id: Key) {
 
 #[cfg(test)]
 mod tests {
-    use super::{animating, build, columns, sample_hist};
+    use super::{animating, build, clip_polyline_top, columns, sample_hist};
     use crate::model::{AppState, Col, Density, Page, Proc, Snap};
     use crate::settings::Settings;
 
@@ -3997,6 +4047,18 @@ mod tests {
             .map(|s| sample_hist(&spike, s as f32 / 100.0))
             .fold(0.0_f32, f32::max);
         assert!((35.0..45.0).contains(&peak), "spike peak {peak}");
+    }
+
+    #[test]
+    fn overshoot_is_cut_at_the_plot_top_not_flattened() {
+        // A hill rising past y = 10 and back down.
+        let pts = [[0.0, 50.0], [1.0, 20.0], [2.0, 0.0], [3.0, 20.0], [4.0, 50.0]];
+        let runs = clip_polyline_top(&pts, 10.0);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0], vec![[0.0, 50.0], [1.0, 20.0], [1.5, 10.0]]);
+        assert_eq!(runs[1], vec![[2.5, 10.0], [3.0, 20.0], [4.0, 50.0]]);
+        // Nothing above the top: one untouched run.
+        assert_eq!(clip_polyline_top(&pts, -5.0), vec![pts.to_vec()]);
     }
 
     #[test]

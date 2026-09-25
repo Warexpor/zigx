@@ -62,6 +62,28 @@ fn disk_snap() -> Snap {
     snap
 }
 
+/// A large burst early in the window, then quiet traffic: the I/O scale zooms
+/// back to the recent quarter while the burst is still on screen.
+fn disk_burst_snap() -> Snap {
+    let mut snap = base_snap();
+    let mut read = [3.0_f32; 60];
+    let mut write = [1.0_f32; 60];
+    read[8..16].copy_from_slice(&[20.0, 60.0, 180.0, 240.0, 220.0, 90.0, 30.0, 8.0]);
+    write[9..15].copy_from_slice(&[15.0, 70.0, 110.0, 80.0, 25.0, 5.0]);
+    read[30] = 120.0;
+    read[44..50].copy_from_slice(&[12.0, 25.0, 18.0, 30.0, 14.0, 6.0]);
+    write[45..49].copy_from_slice(&[8.0, 12.0, 10.0, 4.0]);
+    let kb = |v: &[f32]| v.iter().map(|x| x * 1024.0).collect::<Vec<_>>();
+    snap.disks = vec![Disk {
+        name: "nvme0n1".into(),
+        read_bps: 6144.0,
+        write_bps: 1024.0,
+        read_hist: history(&kb(&read)),
+        write_hist: history(&kb(&write)),
+    }];
+    snap
+}
+
 fn cpu_snap() -> Snap {
     let mut snap = base_snap();
     let mut total: Vec<f32> = READ_KB.iter().map(|v| v.min(100.0)).collect();
@@ -131,6 +153,7 @@ fn snapshots() {
     };
     for (name, section, snap) in [
         ("disk", Section::Disk, disk_snap()),
+        ("disk-burst", Section::Disk, disk_burst_snap()),
         ("cpu", Section::Cpu, cpu_snap()),
     ] {
         let (draw, detail) = frame(section, &snap);

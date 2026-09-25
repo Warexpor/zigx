@@ -729,13 +729,15 @@ impl Gfx {
                 top[3] = ((stroke.color[3] as f32 * 0.07).min(18.0)) as u8;
                 fill_under(&pts, base * scale, premul(top), &mut self.vertex_cpu);
             }
-            stroke_line(
-                &pts,
-                (stroke.width * scale).max(1.0),
-                stroke.round,
-                color,
-                &mut self.vertex_cpu,
-            );
+            if stroke.line {
+                stroke_line(
+                    &pts,
+                    (stroke.width * scale).max(1.0),
+                    stroke.round,
+                    color,
+                    &mut self.vertex_cpu,
+                );
+            }
         }
     }
 

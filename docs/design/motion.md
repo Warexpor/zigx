@@ -151,9 +151,11 @@ traffic.
   damped smooth-damp, 0.35 s when growing and 0.5 s when shrinking. Log space
   makes a 100x rescale read as an even zoom instead of an instant squash, and
   critical damping never overshoots.
-- **No clipping.** If a trace would still exceed the eased scale, the graph
-  uses the trace's peak for that frame, so a line is never clipped flat against
-  the top.
+- **Overshoot.** Zooming back means an older burst can still be on screen
+  above the scale. Its line runs off the top of the plot and is cut there
+  (`clip_polyline_top`), so it reads as larger than the scale. It is never
+  flattened into a plateau, which would read as a value held at the scale. The
+  wash stays inside the plot, and nothing enters the top pad with the legend.
 - **Label.** The scale label shows the target.
 - The per-core bars do not ease. They sample each core's history at the
   playback head, so they glide on the same clock and curve as the utilization

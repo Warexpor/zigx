@@ -192,6 +192,7 @@ impl App {
             // Dead PIDs can be recycled; do not leave them armed.
             self.state.selected.clear();
             self.state.pinned.clear();
+            self.state.needs_repin = false;
             self.state.anchor = None;
         }
         self.notify(label, 4);
@@ -370,7 +371,15 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     (_, Some(HitKind::DragNav | HitKind::DragSub)) => CursorIcon::EwResize,
                     (_, Some(HitKind::Search)) => CursorIcon::Text,
-                    (_, Some(HitKind::DragWindow | HitKind::MenuPanel)) => CursorIcon::Default,
+                    (
+                        _,
+                        Some(
+                            HitKind::DragWindow
+                            | HitKind::MenuPanel
+                            | HitKind::KeysPanel
+                            | HitKind::KeysBackdrop,
+                        ),
+                    ) => CursorIcon::Default,
                     (_, Some(_)) => CursorIcon::Pointer,
                     (_, None) => CursorIcon::Default,
                 };
@@ -386,6 +395,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Right {
                     if state == ElementState::Pressed {
+                        if self.state.keys_open {
+                            return;
+                        }
                         match hit_at(&self.hits, self.mouse[0], self.mouse[1]) {
                             Some(HitKind::Proc { pid }) if self.state.page == Page::Processes => {
                                 open_menu(&mut self.state, pid, self.mouse);
@@ -450,7 +462,14 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let Some(key) = map_key(&event.logical_key) else {
+                let key = if matches!(event.logical_key, Key::Named(NamedKey::F10))
+                    && self.mods.shift_key()
+                {
+                    Some(KeyIn::Menu)
+                } else {
+                    map_key(&event.logical_key)
+                };
+                let Some(key) = key else {
                     return;
                 };
                 if event.state != ElementState::Pressed {
@@ -459,7 +478,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
-                let effects = on_key(&mut self.state, key, self.mods.control_key());
+                let effects = on_key(
+                    &mut self.state,
+                    key,
+                    self.mods.control_key(),
+                    self.mods.shift_key(),
+                    event.repeat,
+                );
                 self.apply(effects, event_loop);
                 self.redraw();
             }
@@ -476,8 +501,14 @@ fn map_key(key: &Key) -> Option<KeyIn> {
         Key::Named(NamedKey::Enter) => KeyIn::Enter,
         Key::Named(NamedKey::PageUp) => KeyIn::PageUp,
         Key::Named(NamedKey::PageDown) => KeyIn::PageDown,
+        Key::Named(NamedKey::Home) => KeyIn::Home,
+        Key::Named(NamedKey::End) => KeyIn::End,
         Key::Named(NamedKey::ArrowUp) => KeyIn::Up,
         Key::Named(NamedKey::ArrowDown) => KeyIn::Down,
+        Key::Named(NamedKey::ArrowLeft) => KeyIn::Left,
+        Key::Named(NamedKey::ArrowRight) => KeyIn::Right,
+        Key::Named(NamedKey::ContextMenu) => KeyIn::Menu,
+        Key::Named(NamedKey::F1) => KeyIn::Help,
         Key::Named(NamedKey::Space) => KeyIn::Char(' '),
         Key::Character(s) => KeyIn::Char(s.chars().next()?),
         _ => return None,

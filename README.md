@@ -27,15 +27,20 @@ The desktop entry expects `zigx` on `PATH`; `~/.cargo/bin` is the default instal
 
 Sampling runs off the UI thread and the window redraws when numbers change, not on a busy loop. The nav footer shows how long the last sample took.
 
+Press `?` or `F1` (or click Keys at the foot of the nav) for a sheet of every shortcut, with the page you are on listed first. `Esc` closes it.
+
 Keys, when the search box is not focused:
 
 - `1` `2` `3` `4` switch pages (Processes, Performance, Startup, Settings). `Ctrl+,` opens Settings.
-- On Performance, `c` `m` `g` `d` `n` select CPU, memory, GPU, disk, and network, and `Space` pauses or resumes sampling.
-- Hold `Space` on Processes to freeze the list in the order on screen. Counts keep updating in place; letting go sorts again. Space still types into search while that field is focused.
-- Search takes keys only while its field is focused. Click it, or press `Ctrl+F`. `Esc` clears it, `Ctrl+Backspace` empties it.
+- On Performance, `c` `m` `g` `d` `n` select CPU, memory, GPU, disk, and network; Left and Right cycle those sections; `Space` pauses or resumes sampling.
+- On Processes, Up and Down move focus through group headers and process rows (Shift extends the selection, Ctrl moves focus without changing it). Past the last row a fresh press wraps to the top, and past the first it wraps to the bottom; holding the key stops at the end. Startup and Settings wrap the same way. Home and End jump to the ends. Left and Right collapse or expand the focused group. `v` cycles the list view. `Ctrl+A` selects every visible process. `Ctrl+Space` toggles the focused process in the selection.
+- Hold `Space` on Processes to freeze the list in the order on screen (or toggle a focused group header). Counts keep updating in place; letting go sorts again. Space still types into search while that field is focused.
+- Search takes keys only while its field is focused. Click it, or press `Ctrl+F`. `Esc` clears it, `Ctrl+Backspace` empties it. Esc with an empty unfocused search clears the selection.
 - Click selects a process; `Ctrl` and `Shift` extend the selection.
-- Right-click a process for its menu: End task, Force kill (click twice), Suspend or Resume, Open file location, Copy command line, and Copy PID. It acts on the whole selection when the row is part of it. Arrow keys and `Enter` drive it, `Esc` closes it. Copying uses `wl-copy` (or `xclip` / `xsel`).
+- Right-click a process for its menu, or press Shift+F10 / the Menu key: End task, Force kill (click twice), Suspend or Resume, Open file location, Copy command line, and Copy PID. It acts on the whole selection when the row is part of it. Arrow keys and `Enter` drive it, `Esc` closes it. Copying uses `wl-copy` (or `xclip` / `xsel`).
 - `Delete` arms End task and a second press (or `Enter`) sends SIGTERM. Turn off Confirm ending in Settings to skip the second press.
+- On Startup, Up and Down focus an entry; Space or Enter toggles it.
+- On Settings, Up and Down focus a row; Left and Right cycle choices, chips, and zoom; Space or Enter toggles switches or activates Reset.
 - `PageUp` `PageDown` scroll the current page.
 
 ### Settings

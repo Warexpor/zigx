@@ -1,5 +1,5 @@
-//! Renders fixed Performance frames through the real GPU path into PNGs, for
-//! eyeballing graph and stroke changes without running the app:
+//! Renders fixed frames through the real GPU path into PNGs, for eyeballing
+//! graph, stroke and chrome changes without running the app:
 //!
 //! ```sh
 //! cargo test --bin zigx snapshots -- --ignored
@@ -171,4 +171,31 @@ fn snapshots() {
         write_png(&dir.join(format!("{name}@4x.png")), r[2], r[3], &part);
         println!("wrote {}", dir.join(format!("{name}.png")).display());
     }
+
+    // The nav foot at rest and with the pointer on the Keys pill, then the
+    // shortcut sheet it opens.
+    let snap = base_snap();
+    let foot_h = 60.0;
+    for (name, mouse) in [("nav-foot", [-1.0, -1.0]), ("nav-foot-hover", [150.0, H - 23.0])] {
+        let mut state = AppState::new(W, H);
+        state.settings.animations = false;
+        let draw = build(&mut state, &snap, &[], mouse);
+        let big = zoomed.capture(&draw, ZOOM);
+        let r = [
+            0,
+            ((H - foot_h) * ZOOM) as u32,
+            (state.nav_w * ZOOM) as u32,
+            (foot_h * ZOOM) as u32,
+        ];
+        let part = crop(&big, (W * ZOOM) as u32, r);
+        write_png(&dir.join(format!("{name}@4x.png")), r[2], r[3], &part);
+        println!("wrote {}", dir.join(format!("{name}@4x.png")).display());
+    }
+    let mut state = AppState::new(W, H);
+    state.settings.animations = false;
+    state.keys_open = true;
+    let draw = build(&mut state, &snap, &[], [-1.0, -1.0]);
+    let rgba = gfx.capture(&draw, 1.0);
+    write_png(&dir.join("keys.png"), W as u32, H as u32, &rgba);
+    println!("wrote {}", dir.join("keys.png").display());
 }

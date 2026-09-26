@@ -1,6 +1,9 @@
 use std::time::{Duration, Instant};
 
-use crate::model::{AppState, Col, ContextMenu, Density, Drag, MenuAction, Page, ScrollBar};
+use crate::model::{
+    AppState, Col, ContextMenu, Density, Drag, KbFocus, KbProcRow, KbSettingCtl, KbSettingRow,
+    MenuAction, Page, ProcView, ScrollBar, ScrollTarget, Section,
+};
 use crate::settings::{Choice, Opt, Settings, Speed};
 
 use super::frame::HitKind;
@@ -14,8 +17,16 @@ pub enum KeyIn {
     Enter,
     PageUp,
     PageDown,
+    Home,
+    End,
     Up,
     Down,
+    Left,
+    Right,
+    /// Context menu key, or Shift+F10.
+    Menu,
+    /// F1: toggles the shortcut sheet.
+    Help,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +86,12 @@ pub fn on_press(
     shift: bool,
     mouse: [f32; 2],
 ) -> Vec<Effect> {
+    if state.keys_open {
+        if !matches!(kind, HitKind::KeysPanel) {
+            state.keys_open = false;
+        }
+        return vec![];
+    }
     // An open menu owns the next click: its items act, anything else only
     // dismisses it.
     if state.menu.is_some() {
@@ -97,6 +114,7 @@ pub fn on_press(
         HitKind::Page(page) => {
             state.page = page;
             state.search_focused = false;
+            state.kb = KbFocus::None;
             vec![Effect::Persist]
         }
         HitKind::Section(section) => {
@@ -107,7 +125,8 @@ pub fn on_press(
         HitKind::View(view) => {
             state.view = view;
             state.scroll = 0.0;
-            state.pinned.clear();
+            clear_pins(state, true);
+            state.kb = KbFocus::None;
             vec![Effect::Persist]
         }
         HitKind::Density => {
@@ -133,19 +152,52 @@ pub fn on_press(
         }
         HitKind::EndTask => end_task(state),
         HitKind::MenuItem(_) | HitKind::MenuPanel => vec![],
-        HitKind::Setting(opt, v) => set_option(state, opt, v),
-        HitKind::Zoom(delta) => zoom(state, delta as i32),
-        HitKind::ResetSettings => reset_settings(state),
+        HitKind::Setting(opt, v) => {
+            if let Some((group, row, chip)) = find_setting_hit(state, opt, v) {
+                state.kb = KbFocus::Setting { group, row, chip };
+            }
+            set_option(state, opt, v)
+        }
+        HitKind::Zoom(delta) => {
+            if let Some(row) = state
+                .kb_settings
+                .iter()
+                .find(|r| matches!(r.ctl, KbSettingCtl::Scale))
+            {
+                state.kb = KbFocus::Setting {
+                    group: row.group,
+                    row: row.row,
+                    chip: 0,
+                };
+            }
+            zoom(state, delta as i32)
+        }
+        HitKind::ResetSettings => {
+            if let Some(row) = state
+                .kb_settings
+                .iter()
+                .find(|r| matches!(r.ctl, KbSettingCtl::Reset))
+            {
+                state.kb = KbFocus::Setting {
+                    group: row.group,
+                    row: row.row,
+                    chip: 0,
+                };
+            }
+            reset_settings(state)
+        }
         HitKind::Group(id) => {
             if !state.open_groups.insert(id) {
                 state.open_groups.remove(&id);
             }
+            state.kb = KbFocus::ProcGroup(id);
             // Visible indices shift; drop pins and re-capture after the next layout.
-            state.pinned.clear();
+            clear_pins(state, true);
             vec![]
         }
         HitKind::Proc { pid } => {
             select_proc(state, pid, ctrl, shift);
+            state.kb = KbFocus::Proc(pid);
             vec![]
         }
         HitKind::Deselect => {
@@ -156,7 +208,10 @@ pub fn on_press(
             begin_scroll_drag(state, which, mouse[1]);
             vec![]
         }
-        HitKind::Startup(index) => vec![Effect::FlipStartup(index)],
+        HitKind::Startup(index) => {
+            state.kb = KbFocus::Startup(index);
+            vec![Effect::FlipStartup(index)]
+        }
         HitKind::DragNav => {
             state.drag = Some(Drag::Nav {
                 x0: 0.0,
@@ -171,7 +226,35 @@ pub fn on_press(
             });
             vec![]
         }
+        HitKind::Keys => {
+            open_keys(state);
+            vec![]
+        }
+        HitKind::KeysPanel | HitKind::KeysBackdrop => vec![],
     }
+}
+
+fn open_keys(state: &mut AppState) {
+    close_menu(state);
+    state.search_focused = false;
+    state.keys_open = true;
+    state.keys_scroll = 0.0;
+}
+
+/// The sheet is modal: it scrolls and closes, and swallows everything else.
+fn keys_key(state: &mut AppState, key: KeyIn) -> Vec<Effect> {
+    match key {
+        KeyIn::Escape | KeyIn::Help | KeyIn::Char('?') => state.keys_open = false,
+        KeyIn::Up => state.keys_scroll -= 40.0,
+        KeyIn::Down => state.keys_scroll += 40.0,
+        KeyIn::PageUp => state.keys_scroll -= 240.0,
+        KeyIn::PageDown => state.keys_scroll += 240.0,
+        KeyIn::Home => state.keys_scroll = 0.0,
+        KeyIn::End => state.keys_scroll = f32::MAX,
+        _ => {}
+    }
+    state.keys_scroll = state.keys_scroll.max(0.0);
+    vec![]
 }
 
 /// Press positions are applied by [`note_drag_origin`] so splitters track the cursor.
@@ -222,6 +305,10 @@ pub fn on_move(state: &mut AppState, x: f32, y: f32) -> bool {
 
 /// Scroll whichever pane the pointer is over.
 pub fn on_wheel(state: &mut AppState, over: Option<ScrollBar>, dy: f32) {
+    if state.keys_open {
+        state.keys_scroll = (state.keys_scroll + dy).max(0.0);
+        return;
+    }
     if state.menu.is_some() {
         close_menu(state);
         return;
@@ -232,9 +319,25 @@ pub fn on_wheel(state: &mut AppState, over: Option<ScrollBar>, dy: f32) {
     }
 }
 
-pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
+/// `repeat` is true for auto-repeat while a key is held. List focus wraps
+/// around only on a fresh press, so holding an arrow stops at the end.
+pub fn on_key(
+    state: &mut AppState,
+    key: KeyIn,
+    ctrl: bool,
+    shift: bool,
+    repeat: bool,
+) -> Vec<Effect> {
+    if state.keys_open {
+        return keys_key(state, key);
+    }
     if state.menu.is_some() {
         return menu_key(state, key);
+    }
+    let wrap = !repeat && !shift;
+    if matches!(key, KeyIn::Help) || (matches!(key, KeyIn::Char('?')) && !state.search_focused) {
+        open_keys(state);
+        return vec![];
     }
     match key {
         KeyIn::Char(c) => {
@@ -250,70 +353,70 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
             if ctrl && (c == 'f' || c == 'F') {
                 state.page = Page::Processes;
                 state.search_focused = true;
+                state.kb = KbFocus::None;
                 return vec![Effect::Persist];
             }
             if ctrl && c == ',' {
                 state.page = Page::Settings;
                 state.search_focused = false;
+                state.kb = KbFocus::None;
                 return vec![Effect::Persist];
+            }
+            if ctrl && (c == 'a' || c == 'A') && !state.search_focused {
+                return select_all_visible(state);
+            }
+            if ctrl && c == ' ' && state.page == Page::Processes && !state.search_focused {
+                toggle_focused_proc(state);
+                return vec![];
             }
             if ctrl {
                 return vec![];
             }
             if !state.search_focused {
                 match c {
-                    '1' => {
-                        state.page = Page::Processes;
-                        return vec![Effect::Persist];
-                    }
-                    '2' => {
-                        state.page = Page::Performance;
-                        return vec![Effect::Persist];
-                    }
-                    '3' => {
-                        state.page = Page::Startup;
-                        return vec![Effect::Persist];
-                    }
-                    '4' => {
-                        state.page = Page::Settings;
-                        return vec![Effect::Persist];
-                    }
+                    '1' => return go_page(state, Page::Processes),
+                    '2' => return go_page(state, Page::Performance),
+                    '3' => return go_page(state, Page::Startup),
+                    '4' => return go_page(state, Page::Settings),
                     ' ' if state.page == Page::Performance => {
                         state.paused = !state.paused;
                         return vec![Effect::Persist];
                     }
-                    // Hold freezes the list. Repeats must not recapture, or a
-                    // process that exited mid-hold would lock in the gap.
+                    ' ' if state.page == Page::Startup => {
+                        return activate_startup(state);
+                    }
+                    ' ' if state.page == Page::Settings => {
+                        return activate_setting(state);
+                    }
                     ' ' if state.page == Page::Processes => {
+                        if matches!(state.kb, KbFocus::ProcGroup(_)) {
+                            toggle_focused_group(state);
+                            return vec![];
+                        }
+                        // Hold freezes the list. Repeats must not recapture, or a
+                        // process that exited mid-hold would lock in the gap.
                         if state.held.is_none() && !state.visible_pids.is_empty() {
                             state.held = Some(state.visible_pids.clone());
                         }
                         return vec![];
                     }
                     'c' | 'C' if state.page == Page::Performance => {
-                        state.section = crate::model::Section::Cpu;
-                        state.perf_scroll = 0.0;
-                        return vec![Effect::Persist];
+                        return go_section(state, Section::Cpu);
                     }
                     'm' | 'M' if state.page == Page::Performance => {
-                        state.section = crate::model::Section::Memory;
-                        state.perf_scroll = 0.0;
-                        return vec![Effect::Persist];
+                        return go_section(state, Section::Memory);
                     }
                     'g' | 'G' if state.page == Page::Performance => {
-                        state.section = crate::model::Section::Gpu;
-                        state.perf_scroll = 0.0;
-                        return vec![Effect::Persist];
+                        return go_section(state, Section::Gpu);
                     }
                     'd' | 'D' if state.page == Page::Performance => {
-                        state.section = crate::model::Section::Disk;
-                        state.perf_scroll = 0.0;
-                        return vec![Effect::Persist];
+                        return go_section(state, Section::Disk);
                     }
                     'n' | 'N' if state.page == Page::Performance => {
-                        state.section = crate::model::Section::Net;
-                        state.perf_scroll = 0.0;
-                        return vec![Effect::Persist];
+                        return go_section(state, Section::Net);
+                    }
+                    'v' | 'V' if state.page == Page::Processes => {
+                        return cycle_view(state);
                     }
                     _ => return vec![],
                 }
@@ -342,6 +445,8 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
                 state.query.clear();
                 state.search_focused = false;
                 state.scroll = 0.0;
+            } else if state.page == Page::Processes {
+                clear_selection(state);
             }
             state.armed = None;
             vec![]
@@ -355,10 +460,23 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
         }
         KeyIn::Enter => {
             if state.armed.is_some() && !state.search_focused {
-                end_task(state)
-            } else {
-                state.search_focused = false;
-                vec![]
+                return end_task(state);
+            }
+            match state.page {
+                Page::Processes if !state.search_focused => {
+                    if matches!(state.kb, KbFocus::ProcGroup(_)) {
+                        toggle_focused_group(state);
+                    }
+                    // Process rows: selection is already on the focused row.
+                    // Context menu is Shift+F10 / Menu — Enter does not open it.
+                    vec![]
+                }
+                Page::Startup => activate_startup(state),
+                Page::Settings => activate_setting(state),
+                _ => {
+                    state.search_focused = false;
+                    vec![]
+                }
             }
         }
         KeyIn::PageUp => {
@@ -369,8 +487,474 @@ pub fn on_key(state: &mut AppState, key: KeyIn, ctrl: bool) -> Vec<Effect> {
             nudge_scroll(state, 240.0);
             vec![]
         }
-        KeyIn::Up | KeyIn::Down => vec![],
+        KeyIn::Home | KeyIn::End | KeyIn::Up | KeyIn::Down => {
+            if state.search_focused {
+                state.search_focused = false;
+            }
+            let dir = match key {
+                KeyIn::Up => -1,
+                KeyIn::Down => 1,
+                KeyIn::Home => i32::MIN,
+                KeyIn::End => i32::MAX,
+                _ => 0,
+            };
+            match state.page {
+                Page::Processes => {
+                    move_proc_focus(state, dir, ctrl, shift, wrap);
+                    vec![]
+                }
+                Page::Startup => {
+                    move_startup_focus(state, dir, wrap);
+                    vec![]
+                }
+                Page::Settings => {
+                    move_setting_focus(state, dir, wrap);
+                    vec![]
+                }
+                Page::Performance if matches!(key, KeyIn::Home | KeyIn::End) => {
+                    if matches!(key, KeyIn::Home) {
+                        state.perf_scroll = 0.0;
+                    } else {
+                        nudge_scroll(state, 1.0e6);
+                    }
+                    vec![]
+                }
+                _ => vec![],
+            }
+        }
+        KeyIn::Left | KeyIn::Right => {
+            if state.search_focused {
+                return vec![];
+            }
+            let right = matches!(key, KeyIn::Right);
+            match state.page {
+                Page::Processes => {
+                    set_group_open(state, right);
+                    vec![]
+                }
+                Page::Performance => cycle_section(state, right),
+                Page::Settings => cycle_setting(state, right),
+                _ => vec![],
+            }
+        }
+        KeyIn::Menu => {
+            if state.page == Page::Processes && !state.search_focused {
+                open_menu_keyboard(state)
+            } else {
+                vec![]
+            }
+        }
+        KeyIn::Help => vec![],
     }
+}
+
+/// Next list index for a focus step. `dir` is -1 / +1, or `i32::MIN` /
+/// `i32::MAX` for Home / End. With `wrap`, stepping past either end lands on
+/// the other.
+fn step_index(cur: usize, last: usize, dir: i32, wrap: bool) -> usize {
+    match dir {
+        i32::MIN => 0,
+        i32::MAX => last,
+        d => {
+            let next = cur as i32 + d;
+            if next < 0 {
+                if wrap {
+                    last
+                } else {
+                    0
+                }
+            } else if next > last as i32 {
+                if wrap {
+                    0
+                } else {
+                    last
+                }
+            } else {
+                next as usize
+            }
+        }
+    }
+}
+
+fn go_page(state: &mut AppState, page: Page) -> Vec<Effect> {
+    state.page = page;
+    state.search_focused = false;
+    state.kb = KbFocus::None;
+    vec![Effect::Persist]
+}
+
+fn go_section(state: &mut AppState, section: Section) -> Vec<Effect> {
+    state.section = section;
+    state.perf_scroll = 0.0;
+    vec![Effect::Persist]
+}
+
+fn cycle_section(state: &mut AppState, right: bool) -> Vec<Effect> {
+    let i = Section::ALL
+        .iter()
+        .position(|s| *s == state.section)
+        .unwrap_or(0);
+    let n = Section::ALL.len();
+    let next = if right {
+        (i + 1) % n
+    } else {
+        (i + n - 1) % n
+    };
+    go_section(state, Section::ALL[next])
+}
+
+fn cycle_view(state: &mut AppState) -> Vec<Effect> {
+    let i = ProcView::ALL
+        .iter()
+        .position(|v| *v == state.view)
+        .unwrap_or(0);
+    let next = ProcView::ALL[(i + 1) % ProcView::ALL.len()];
+    state.view = next;
+    state.scroll = 0.0;
+    clear_pins(state, true);
+    state.kb = KbFocus::None;
+    vec![Effect::Persist]
+}
+
+fn select_all_visible(state: &mut AppState) -> Vec<Effect> {
+    if state.page != Page::Processes || state.visible_pids.is_empty() {
+        return vec![];
+    }
+    state.selected.clear();
+    state.selected.extend(state.visible_pids.iter().copied());
+    state.anchor = state.visible_pids.first().copied();
+    // Keep the sorted order stable under the keyboard selection.
+    clear_pins(state, false);
+    if let Some(&pid) = state.visible_pids.first() {
+        state.kb = KbFocus::Proc(pid);
+    }
+    vec![]
+}
+
+fn proc_focus_index(state: &AppState) -> Option<usize> {
+    match state.kb {
+        KbFocus::ProcGroup(id) => state
+            .kb_proc_rows
+            .iter()
+            .position(|r| matches!(r, KbProcRow::Group { id: gid } if *gid == id)),
+        KbFocus::Proc(pid) => state
+            .kb_proc_rows
+            .iter()
+            .position(|r| matches!(r, KbProcRow::Pid { pid: p, .. } if *p == pid)),
+        _ => None,
+    }
+}
+
+fn move_proc_focus(state: &mut AppState, dir: i32, ctrl: bool, shift: bool, wrap: bool) {
+    let n = state.kb_proc_rows.len();
+    if n == 0 {
+        return;
+    }
+    let next = match proc_focus_index(state) {
+        Some(i) => step_index(i, n - 1, dir, wrap),
+        None if dir == i32::MIN || dir == i32::MAX => step_index(0, n - 1, dir, false),
+        None => preferred_entry_index(&state.kb_proc_rows, dir),
+    };
+    apply_proc_focus(state, next, ctrl, shift);
+}
+
+/// First arrow from no focus prefers a process row so Grouped view does not
+/// land on a collapsed header with nothing selected.
+fn preferred_entry_index(rows: &[KbProcRow], dir: i32) -> usize {
+    if dir > 0 {
+        rows.iter()
+            .position(|r| matches!(r, KbProcRow::Pid { .. }))
+            .unwrap_or(0)
+    } else {
+        rows.iter()
+            .rposition(|r| matches!(r, KbProcRow::Pid { .. }))
+            .unwrap_or(rows.len().saturating_sub(1))
+    }
+}
+
+fn apply_proc_focus(state: &mut AppState, idx: usize, ctrl: bool, shift: bool) {
+    let Some(row) = state.kb_proc_rows.get(idx).copied() else {
+        return;
+    };
+    match row {
+        KbProcRow::Group { id } => {
+            state.kb = KbFocus::ProcGroup(id);
+            state.scroll_into_view = Some(ScrollTarget::ProcGroup(id));
+            if !ctrl && !shift {
+                state.selected.clear();
+                clear_pins(state, false);
+                state.anchor = None;
+                state.armed = None;
+            }
+        }
+        KbProcRow::Pid { pid, .. } => {
+            state.kb = KbFocus::Proc(pid);
+            state.scroll_into_view = Some(ScrollTarget::Proc(pid));
+            if !ctrl {
+                // Keyboard selection must not pin: pinning every arrow step
+                // makes the list leap under the cursor as the old row unpins.
+                select_proc_keyboard(state, pid, shift);
+            }
+        }
+    }
+}
+
+fn toggle_focused_proc(state: &mut AppState) {
+    let KbFocus::Proc(pid) = state.kb else {
+        return;
+    };
+    select_proc(state, pid, true, false);
+    clear_pins(state, false);
+}
+
+fn focused_group_id(state: &AppState) -> Option<u64> {
+    match state.kb {
+        KbFocus::ProcGroup(id) => Some(id),
+        KbFocus::Proc(pid) => state.kb_proc_rows.iter().find_map(|r| match r {
+            KbProcRow::Pid {
+                pid: p,
+                group: Some(g),
+            } if *p == pid => Some(*g),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn toggle_focused_group(state: &mut AppState) {
+    let Some(id) = focused_group_id(state) else {
+        return;
+    };
+    if !state.open_groups.insert(id) {
+        state.open_groups.remove(&id);
+    }
+    state.kb = KbFocus::ProcGroup(id);
+    clear_pins(state, true);
+    state.scroll_into_view = Some(ScrollTarget::ProcGroup(id));
+}
+
+fn set_group_open(state: &mut AppState, open: bool) {
+    let Some(id) = focused_group_id(state) else {
+        return;
+    };
+    if open {
+        state.open_groups.insert(id);
+    } else {
+        state.open_groups.remove(&id);
+        state.kb = KbFocus::ProcGroup(id);
+    }
+    clear_pins(state, true);
+    state.scroll_into_view = Some(ScrollTarget::ProcGroup(id));
+}
+
+fn open_menu_keyboard(state: &mut AppState) -> Vec<Effect> {
+    let pid = match state.kb {
+        KbFocus::Proc(pid) => pid,
+        _ => match state.selected.iter().next().copied() {
+            Some(pid) => pid,
+            None => return vec![],
+        },
+    };
+    let pos = state
+        .menu_anchor
+        .unwrap_or([state.nav_w + 80.0, state.height * 0.4]);
+    open_menu(state, pid, pos);
+    vec![]
+}
+
+fn move_startup_focus(state: &mut AppState, dir: i32, wrap: bool) {
+    let n = state.kb_startup_len;
+    if n == 0 {
+        return;
+    }
+    let last = n - 1;
+    let next = match state.kb {
+        KbFocus::Startup(i) => step_index(i.min(last), last, dir, wrap),
+        _ if dir > 0 && dir != i32::MAX => 0,
+        _ if dir == i32::MIN => 0,
+        _ => last,
+    };
+    state.kb = KbFocus::Startup(next);
+    state.scroll_into_view = Some(ScrollTarget::Startup(next));
+}
+
+fn activate_startup(state: &mut AppState) -> Vec<Effect> {
+    let idx = match state.kb {
+        KbFocus::Startup(i) => i,
+        _ => {
+            if state.kb_startup_len == 0 {
+                return vec![];
+            }
+            state.kb = KbFocus::Startup(0);
+            state.scroll_into_view = Some(ScrollTarget::Startup(0));
+            0
+        }
+    };
+    if idx >= state.kb_startup_len {
+        return vec![];
+    }
+    vec![Effect::FlipStartup(idx)]
+}
+
+fn setting_flat_index(state: &AppState, group: usize, row: usize) -> Option<usize> {
+    state
+        .kb_settings
+        .iter()
+        .position(|r| r.group == group && r.row == row)
+}
+
+fn move_setting_focus(state: &mut AppState, dir: i32, wrap: bool) {
+    let n = state.kb_settings.len();
+    if n == 0 {
+        return;
+    }
+    let last = n - 1;
+    let cur = match state.kb {
+        KbFocus::Setting { group, row, .. } => setting_flat_index(state, group, row),
+        _ => None,
+    };
+    let next = match cur {
+        Some(i) => step_index(i, last, dir, wrap),
+        None if dir > 0 && dir != i32::MAX => 0,
+        None if dir == i32::MIN => 0,
+        None => last,
+    };
+    let row = &state.kb_settings[next];
+    state.kb = KbFocus::Setting {
+        group: row.group,
+        row: row.row,
+        chip: 0,
+    };
+    state.scroll_into_view = Some(ScrollTarget::Setting {
+        group: row.group,
+        row: row.row,
+    });
+}
+
+fn focused_setting(state: &AppState) -> Option<&KbSettingRow> {
+    match state.kb {
+        KbFocus::Setting { group, row, .. } => state
+            .kb_settings
+            .iter()
+            .find(|r| r.group == group && r.row == row),
+        _ => None,
+    }
+}
+
+fn cycle_setting(state: &mut AppState, right: bool) -> Vec<Effect> {
+    if focused_setting(state).is_none() {
+        move_setting_focus(state, 1, false);
+    }
+    let Some(focus) = focused_setting(state).cloned() else {
+        return vec![];
+    };
+    match focus.ctl {
+        KbSettingCtl::Choice {
+            opt,
+            count,
+            current,
+        } => {
+            if count == 0 {
+                return vec![];
+            }
+            let next = if right {
+                (current + 1) % count
+            } else {
+                (current + count - 1) % count
+            };
+            set_option(state, opt, next)
+        }
+        KbSettingCtl::Switch { opt, on } => set_option(state, opt, (!on) as u8),
+        KbSettingCtl::Chips(chips) => {
+            if chips.is_empty() {
+                return vec![];
+            }
+            let KbFocus::Setting {
+                group,
+                row,
+                chip,
+            } = state.kb
+            else {
+                return vec![];
+            };
+            let n = chips.len();
+            let next = if right {
+                (chip + 1) % n
+            } else {
+                (chip + n - 1) % n
+            };
+            state.kb = KbFocus::Setting {
+                group,
+                row,
+                chip: next,
+            };
+            vec![]
+        }
+        KbSettingCtl::Scale => zoom(state, if right { 1 } else { -1 }),
+        KbSettingCtl::Reset => vec![],
+    }
+}
+
+fn activate_setting(state: &mut AppState) -> Vec<Effect> {
+    if focused_setting(state).is_none() {
+        move_setting_focus(state, 1, false);
+    }
+    let Some(focus) = focused_setting(state).cloned() else {
+        return vec![];
+    };
+    match focus.ctl {
+        KbSettingCtl::Choice {
+            opt,
+            count,
+            current,
+        } => {
+            if count == 0 {
+                return vec![];
+            }
+            set_option(state, opt, (current + 1) % count)
+        }
+        KbSettingCtl::Switch { opt, on } => set_option(state, opt, (!on) as u8),
+        KbSettingCtl::Chips(chips) => {
+            let chip = match state.kb {
+                KbFocus::Setting { chip, .. } => chip,
+                _ => 0,
+            };
+            let Some((opt, on)) = chips.get(chip).copied() else {
+                return vec![];
+            };
+            set_option(state, opt, (!on) as u8)
+        }
+        KbSettingCtl::Scale => vec![],
+        KbSettingCtl::Reset => reset_settings(state),
+    }
+}
+
+fn find_setting_hit(state: &AppState, opt: Opt, v: u8) -> Option<(usize, usize, usize)> {
+    for row in &state.kb_settings {
+        match &row.ctl {
+            KbSettingCtl::Choice {
+                opt: o,
+                current,
+                ..
+            } if *o == opt && *current == v => {
+                return Some((row.group, row.row, 0));
+            }
+            KbSettingCtl::Choice { opt: o, .. } if *o == opt => {
+                return Some((row.group, row.row, 0));
+            }
+            KbSettingCtl::Switch { opt: o, .. } if *o == opt => {
+                return Some((row.group, row.row, 0));
+            }
+            KbSettingCtl::Chips(chips) => {
+                if let Some(i) = chips.iter().position(|(o, _)| *o == opt) {
+                    return Some((row.group, row.row, i));
+                }
+            }
+            _ => {}
+        }
+    }
+    let _ = v;
+    None
 }
 
 /// Space went up, or the window lost focus. The list sorts again.
@@ -594,11 +1178,47 @@ fn select_proc(state: &mut AppState, pid: i32, ctrl: bool, shift: bool) {
     sync_pins(state);
 }
 
+/// Keyboard selection: same as [`select_proc`] but never pins rows, so arrowing
+/// through the list does not make each previous row leap back to sort order.
+fn select_proc_keyboard(state: &mut AppState, pid: i32, shift: bool) {
+    if shift {
+        if let Some(anchor) = state.anchor {
+            if let (Some(a), Some(b)) = (
+                state.visible_pids.iter().position(|p| *p == anchor),
+                state.visible_pids.iter().position(|p| *p == pid),
+            ) {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                state.selected.clear();
+                for p in &state.visible_pids[lo..=hi] {
+                    state.selected.insert(*p);
+                }
+                clear_pins(state, false);
+                return;
+            }
+        }
+    }
+    state.selected.clear();
+    state.selected.insert(pid);
+    state.anchor = Some(pid);
+    clear_pins(state, false);
+}
+
 pub fn clear_selection(state: &mut AppState) {
     state.selected.clear();
-    state.pinned.clear();
+    clear_pins(state, false);
     state.anchor = None;
     state.armed = None;
+    if matches!(state.kb, KbFocus::Proc(_) | KbFocus::ProcGroup(_)) {
+        state.kb = KbFocus::None;
+    }
+}
+
+/// Drop row pins. When `repin`, the next frame freezes the current selection
+/// at its new indices (after a view or group change). Keyboard navigation
+/// clears pins without repinning so the list does not jump under the cursor.
+fn clear_pins(state: &mut AppState, repin: bool) {
+    state.pinned.clear();
+    state.needs_repin = repin && !state.selected.is_empty();
 }
 
 fn begin_scroll_drag(state: &mut AppState, which: ScrollBar, y: f32) {
@@ -808,8 +1428,8 @@ mod tests {
         let mut state = menu_state();
         state.page = Page::Processes;
         state.visible_pids = vec![10];
-        on_key(&mut state, KeyIn::Char('a'), false);
-        on_key(&mut state, KeyIn::Char(' '), false);
+        on_key(&mut state, KeyIn::Char('a'), false, false, false);
+        on_key(&mut state, KeyIn::Char(' '), false, false, false);
         assert!(!state.search_focused);
         assert!(state.query.is_empty());
         assert!(state.held.is_some(), "space still freezes the list");
@@ -821,7 +1441,7 @@ mod tests {
         state.page = Page::Processes;
         state.visible_pids = vec![10, 20];
         state.search_focused = true;
-        on_key(&mut state, KeyIn::Char(' '), false);
+        on_key(&mut state, KeyIn::Char(' '), false, false, false);
         assert!(state.held.is_none());
         assert_eq!(state.query, " ");
     }
@@ -860,9 +1480,249 @@ mod tests {
         let mut state = menu_state();
         open_menu(&mut state, 10, [0.0, 0.0]);
         state.menu.as_mut().unwrap().items = vec![MenuAction::EndTask, MenuAction::CopyPid];
-        on_key(&mut state, KeyIn::Down, false);
-        on_key(&mut state, KeyIn::Down, false);
-        let fx = on_key(&mut state, KeyIn::Enter, false);
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        let fx = on_key(&mut state, KeyIn::Enter, false, false, false);
         assert!(matches!(fx.as_slice(), [Effect::Copy(t)] if t == "10"));
+    }
+
+    #[test]
+    fn arrows_select_processes_and_shift_extends() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.kb_proc_rows = vec![
+            KbProcRow::Pid {
+                pid: 10,
+                group: None,
+            },
+            KbProcRow::Pid {
+                pid: 20,
+                group: None,
+            },
+            KbProcRow::Pid {
+                pid: 30,
+                group: None,
+            },
+        ];
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        assert_eq!(state.kb, KbFocus::Proc(10));
+        assert!(state.selected.contains(&10) && state.selected.len() == 1);
+        assert!(state.pinned.is_empty(), "keyboard select must not pin rows");
+        on_key(&mut state, KeyIn::Down, false, true, false);
+        assert_eq!(state.kb, KbFocus::Proc(20));
+        assert!(state.selected.contains(&10) && state.selected.contains(&20));
+        assert!(state.pinned.is_empty());
+        on_key(&mut state, KeyIn::Down, true, false, false);
+        assert_eq!(state.kb, KbFocus::Proc(30));
+        assert!(!state.selected.contains(&30), "ctrl moves focus only");
+    }
+
+    fn flat_rows(pids: &[i32]) -> Vec<KbProcRow> {
+        pids.iter()
+            .map(|&pid| KbProcRow::Pid { pid, group: None })
+            .collect()
+    }
+
+    #[test]
+    fn arrows_wrap_at_the_ends_of_the_list() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.kb_proc_rows = flat_rows(&[10, 20, 30]);
+        state.kb = KbFocus::Proc(10);
+        on_key(&mut state, KeyIn::Up, false, false, false);
+        assert_eq!(state.kb, KbFocus::Proc(30));
+        assert!(state.selected.contains(&30) && state.selected.len() == 1);
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        assert_eq!(state.kb, KbFocus::Proc(10));
+    }
+
+    #[test]
+    fn held_arrow_stops_at_the_end_and_shift_never_wraps() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.kb_proc_rows = flat_rows(&[10, 20, 30]);
+        state.kb = KbFocus::Proc(30);
+        on_key(&mut state, KeyIn::Down, false, false, true);
+        assert_eq!(state.kb, KbFocus::Proc(30), "auto-repeat stops at the edge");
+        state.kb = KbFocus::Proc(10);
+        on_key(&mut state, KeyIn::Up, false, true, false);
+        assert_eq!(state.kb, KbFocus::Proc(10), "range select does not wrap");
+    }
+
+    #[test]
+    fn startup_and_settings_wrap_too() {
+        let mut state = menu_state();
+        state.page = Page::Startup;
+        state.kb_startup_len = 3;
+        state.kb = KbFocus::Startup(2);
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        assert_eq!(state.kb, KbFocus::Startup(0));
+
+        state.page = Page::Settings;
+        state.kb_settings = (0..2)
+            .map(|row| KbSettingRow {
+                group: 0,
+                row,
+                ctl: KbSettingCtl::Reset,
+            })
+            .collect();
+        state.kb = KbFocus::Setting {
+            group: 0,
+            row: 0,
+            chip: 0,
+        };
+        on_key(&mut state, KeyIn::Up, false, false, false);
+        assert_eq!(
+            state.kb,
+            KbFocus::Setting {
+                group: 0,
+                row: 1,
+                chip: 0
+            }
+        );
+    }
+
+    #[test]
+    fn question_mark_opens_the_sheet_and_it_is_modal() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        on_key(&mut state, KeyIn::Char('?'), false, true, false);
+        assert!(state.keys_open);
+        on_key(&mut state, KeyIn::Char('2'), false, false, false);
+        assert_eq!(state.page, Page::Processes, "keys under the sheet are swallowed");
+        on_key(&mut state, KeyIn::Escape, false, false, false);
+        assert!(!state.keys_open);
+        on_key(&mut state, KeyIn::Help, false, false, false);
+        assert!(state.keys_open);
+        on_press(&mut state, HitKind::KeysPanel, false, false, [0.0, 0.0]);
+        assert!(state.keys_open, "clicks on the sheet keep it open");
+        on_press(&mut state, HitKind::KeysBackdrop, false, false, [0.0, 0.0]);
+        assert!(!state.keys_open);
+    }
+
+    #[test]
+    fn question_mark_types_into_search() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.search_focused = true;
+        on_key(&mut state, KeyIn::Char('?'), false, true, false);
+        assert!(!state.keys_open);
+        assert_eq!(state.query, "?");
+    }
+
+    #[test]
+    fn first_arrow_prefers_a_process_over_a_group_header() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.kb_proc_rows = vec![
+            KbProcRow::Group { id: 1 },
+            KbProcRow::Group { id: 2 },
+            KbProcRow::Pid {
+                pid: 10,
+                group: None,
+            },
+        ];
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        assert_eq!(state.kb, KbFocus::Proc(10));
+        assert!(state.selected.contains(&10));
+    }
+
+    #[test]
+    fn settings_space_activates_on_first_press() {
+        let mut state = menu_state();
+        state.page = Page::Settings;
+        state.kb_settings = vec![KbSettingRow {
+            group: 0,
+            row: 0,
+            ctl: KbSettingCtl::Switch {
+                opt: Opt::Heat,
+                on: true,
+            },
+        }];
+        assert!(state.settings.heat);
+        on_key(&mut state, KeyIn::Char(' '), false, false, false);
+        assert!(!state.settings.heat);
+        assert_eq!(
+            state.kb,
+            KbFocus::Setting {
+                group: 0,
+                row: 0,
+                chip: 0
+            }
+        );
+    }
+
+    #[test]
+    fn left_right_toggle_process_groups() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.kb_proc_rows = vec![
+            KbProcRow::Group { id: 7 },
+            KbProcRow::Pid {
+                pid: 10,
+                group: Some(7),
+            },
+        ];
+        state.open_groups.insert(7);
+        state.kb = KbFocus::Proc(10);
+        on_key(&mut state, KeyIn::Left, false, false, false);
+        assert!(!state.open_groups.contains(&7));
+        assert_eq!(state.kb, KbFocus::ProcGroup(7));
+        on_key(&mut state, KeyIn::Right, false, false, false);
+        assert!(state.open_groups.contains(&7));
+    }
+
+    #[test]
+    fn ctrl_a_selects_every_visible_process() {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        on_key(&mut state, KeyIn::Char('a'), true, false, false);
+        assert_eq!(state.selected.len(), 3);
+        assert!(state.selected.contains(&10));
+        assert!(state.selected.contains(&30));
+    }
+
+    #[test]
+    fn performance_arrows_cycle_sections() {
+        let mut state = menu_state();
+        state.page = Page::Performance;
+        state.section = Section::Cpu;
+        on_key(&mut state, KeyIn::Right, false, false, false);
+        assert_eq!(state.section, Section::Memory);
+        on_key(&mut state, KeyIn::Left, false, false, false);
+        assert_eq!(state.section, Section::Cpu);
+    }
+
+    #[test]
+    fn startup_space_flips_focused_entry() {
+        let mut state = menu_state();
+        state.page = Page::Startup;
+        state.kb_startup_len = 3;
+        state.kb = KbFocus::Startup(1);
+        let fx = on_key(&mut state, KeyIn::Char(' '), false, false, false);
+        assert!(matches!(fx.as_slice(), [Effect::FlipStartup(1)]));
+    }
+
+    #[test]
+    fn settings_arrows_cycle_a_choice() {
+        let mut state = menu_state();
+        state.page = Page::Settings;
+        state.kb_settings = vec![KbSettingRow {
+            group: 0,
+            row: 0,
+            ctl: KbSettingCtl::Choice {
+                opt: Opt::Glass,
+                count: 3,
+                current: 1,
+            },
+        }];
+        state.kb = KbFocus::Setting {
+            group: 0,
+            row: 0,
+            chip: 0,
+        };
+        let fx = on_key(&mut state, KeyIn::Right, false, false, false);
+        assert!(fx.iter().any(|e| matches!(e, Effect::Persist)));
+        assert_eq!(state.settings.glass, crate::settings::Glass::Solid);
     }
 }

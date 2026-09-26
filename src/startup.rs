@@ -74,14 +74,23 @@ fn load_dir(dir: &Path) -> Vec<(String, Loaded)> {
 /// `TryExec` would keep the session from launching them — those keys decide
 /// launch, not whether the file belongs in the Startup page.
 pub fn load_startup() -> Vec<StartupEntry> {
-    let user_dir = autostart_dir();
+    load_startup_from(
+        &system_autostart_dirs(),
+        &autostart_dir(),
+        &hypr_autostart_path(),
+    )
+}
+
+/// [`load_startup`] over explicit locations. `system_dirs` is lowest
+/// precedence first.
+fn load_startup_from(system_dirs: &[PathBuf], user_dir: &Path, hypr: &Path) -> Vec<StartupEntry> {
     let mut system: HashMap<String, Loaded> = HashMap::new();
-    for dir in system_autostart_dirs() {
-        for (file, loaded) in load_dir(&dir) {
+    for dir in system_dirs {
+        for (file, loaded) in load_dir(dir) {
             system.insert(file, loaded);
         }
     }
-    let mut user: HashMap<String, Loaded> = load_dir(&user_dir).into_iter().collect();
+    let mut user: HashMap<String, Loaded> = load_dir(user_dir).into_iter().collect();
 
     let mut out = Vec::new();
     let mut files: Vec<String> = system.keys().chain(user.keys()).cloned().collect();
@@ -113,7 +122,7 @@ pub fn load_startup() -> Vec<StartupEntry> {
             enabled,
         });
     }
-    out.extend(load_hypr_launches());
+    out.extend(load_hypr_launches(hypr));
     out.sort_by_key(|e| e.name.to_lowercase());
     out
 }
@@ -195,12 +204,11 @@ fn hypr_autostart_path() -> PathBuf {
         .join("autostart.lua")
 }
 
-fn load_hypr_launches() -> Vec<StartupEntry> {
-    let path = hypr_autostart_path();
-    let Ok(text) = fs::read_to_string(&path) else {
+fn load_hypr_launches(path: &Path) -> Vec<StartupEntry> {
+    let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    parse_hypr_launches(&text, &path)
+    parse_hypr_launches(&text, path)
 }
 
 fn parse_hypr_launches(text: &str, path: &Path) -> Vec<StartupEntry> {
@@ -527,13 +535,14 @@ mod tests {
         .unwrap();
         fs::write(usr.join("b.desktop"), "[Desktop Entry]\nHidden=true\n").unwrap();
 
-        // Process-wide env; tests in this module run in one process, and no
-        // other test in the crate touches XDG_CONFIG_*.
-        std::env::set_var("XDG_CONFIG_DIRS", root.join("sys"));
+        // write_enabled only edits files inside autostart_dir(), which follows
+        // XDG_CONFIG_HOME. No other test sets it, so parallel tests cannot race.
         std::env::set_var("XDG_CONFIG_HOME", root.join("home"));
 
-        let list = load_startup();
-        assert_eq!(list.len(), 2);
+        let hypr = root.join("home").join("hypr").join("autostart.lua");
+        let load = || load_startup_from(std::slice::from_ref(&sys), &usr, &hypr);
+        let list = load();
+        assert_eq!(list.len(), 2, "{list:?}");
         let a = list.iter().find(|e| e.name == "Alpha").unwrap();
         let b = list.iter().find(|e| e.name == "Beta").unwrap();
         assert!(a.enabled);
@@ -544,7 +553,7 @@ mod tests {
 
         write_enabled(&a.path, a.system_path.as_deref(), false).unwrap();
         assert!(a.path.exists());
-        let reloaded = load_startup();
+        let reloaded = load();
         assert!(!reloaded.iter().find(|e| e.name == "Alpha").unwrap().enabled);
         let _ = fs::remove_dir_all(&root);
     }
@@ -567,11 +576,10 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("XDG_CONFIG_DIRS", root.join("sys"));
-        std::env::set_var("XDG_CONFIG_HOME", root.join("home"));
         std::env::set_var("XDG_CURRENT_DESKTOP", "Hyprland");
 
-        let list = load_startup();
+        let hypr = root.join("home").join("hypr").join("autostart.lua");
+        let list = load_startup_from(std::slice::from_ref(&sys), &usr, &hypr);
         assert!(
             list.iter().any(|e| e.name == "GNOME Only"),
             "OnlyShowIn must not hide management entries: {list:?}"

@@ -189,6 +189,36 @@ pointer on the overlay layer.
 Suspended processes show a `MICRO` "suspended" tag after their name in
 `INK_4`, and their name drops to `INK_3`.
 
+## Shortcut sheet
+
+`keys_sheet()`. Opened by `?`, `F1`, or the Keys legend at the right of the
+version line in the nav foot. A modal panel centered on the window, on the
+overlay layer.
+
+- **Keys legend.** `keys_hint()`. A 16 px "?" cap drawn like the sheet's keys,
+  then "Keys" in `MICRO`, set like the version beside it. No container at
+  rest, `INK_3`; hover gives a radius 6 `HOVER` wash, like a nav item, and
+  `INK`. Its right edge lines up with the nav items.
+
+- **Backdrop.** The whole window dims under black at 120 alpha. Clicking it
+  closes the sheet.
+- **Panel.** Up to 860 wide with a 24 margin at every window edge, radius 14,
+  `MENU` fill, `GHOST_LINE` outline, 28 padding.
+- **Header.** "Keyboard" in `TITLE` over a `SUB` line in `INK_3`, "Esc to
+  close" right-aligned in `MICRO_NUM` / `INK_4`, closed by a full-width
+  hairline.
+- **Groups.** An eyebrow per page, General first, then the page you are on
+  (its eyebrow detail reads "This page"), then the rest. Two columns when each
+  can hold 340, one otherwise; each group goes to the shorter column.
+- **Rows.** 26 high. Keys sit in a 140 column as caps: 20 high, radius 5,
+  `HOVER` fill, `GHOST_LINE` outline, and `NUM_SMALL` / `INK` labels. `+` joins a chord and `/` separates
+  alternatives, both in `INK_4`. The action follows in `BODY` / `INK_2`.
+- **Overflow.** Content scrolls under the header by wheel, arrows, and page
+  keys, with a 2 px `GHOST_LINE` thumb at the right edge.
+- **Modal.** While it is open nothing beneath it hovers or takes keys.
+- **Motion.** Fades in while settling 6 px downward and fades out the same
+  way. With animations off it appears and disappears at once.
+
 ## Graph
 
 `DrawList::graph()`.

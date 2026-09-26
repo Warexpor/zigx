@@ -6,8 +6,9 @@ use crate::format::{
 };
 use crate::interact::selection_label;
 use crate::model::{
-    io_scale, theme, AppState, Col, ContextMenu, Density, Drag, MenuAction, Page,
-    Proc, ProcView, ScrollBar, Section, Snap, Sort, StartupEntry,
+    io_scale, theme, AppState, Col, ContextMenu, Density, Drag, KbFocus, KbProcRow, KbSettingCtl,
+    KbSettingRow, MenuAction, Page, Proc, ProcView, ScrollBar, ScrollTarget, Section, Snap, Sort,
+    StartupEntry,
 };
 use crate::settings::{Choice, Curve, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS};
 
@@ -120,6 +121,12 @@ pub enum HitKind {
     /// Interface scale stepper, -1 or +1.
     Zoom(i8),
     ResetSettings,
+    /// Opens the keyboard shortcut sheet.
+    Keys,
+    /// Body of the shortcut sheet: swallows the click.
+    KeysPanel,
+    /// Dimmed window behind the shortcut sheet: closes it.
+    KeysBackdrop,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1046,9 +1053,9 @@ pub fn build(
     d.anim
         .begin(state.settings.animations, (state.width, state.height));
     crate::format::set_decimal(state.settings.units == Units::Decimal);
-    // An open menu is modal: nothing beneath it hovers.
+    // An open menu or the shortcut sheet is modal: nothing beneath it hovers.
     let pointer = mouse;
-    let mouse = if state.menu.is_some() {
+    let mouse = if state.menu.is_some() || state.keys_open {
         [f32::NEG_INFINITY; 2]
     } else {
         mouse
@@ -1131,6 +1138,7 @@ pub fn build(
         state.menu = None;
         state.menu_ghost = None;
     }
+    keys_sheet(&mut d, state, root);
     d.anim.end();
     state.anim = std::mem::take(&mut d.anim);
     d
@@ -1676,6 +1684,274 @@ fn nav_items(d: &mut DrawList, state: &AppState, nav: Rect, mouse: [f32; 2]) {
         MICRO_NUM,
         theme::INK_4,
     );
+    keys_hint(d, nav, mouse);
+}
+
+/// Legend at the nav foot that opens the shortcut sheet: a "?" cap like the
+/// sheet's keys, then a micro label set like the version beside it. No
+/// container at rest; hover washes it like a nav item.
+fn keys_hint(d: &mut DrawList, nav: Rect, mouse: [f32; 2]) {
+    const H: f32 = 26.0;
+    const CAP: f32 = 16.0;
+    const PAD: f32 = 5.0;
+    const GAP: f32 = 8.0;
+    let label = "Keys";
+    let lw = measure(&label.to_uppercase(), MICRO);
+    let w = PAD + CAP + GAP + lw + PAD;
+    // Right edge flush with the nav items; centered on the version line.
+    let r = Rect::new(nav.right() - 10.0 - w, nav.bottom() - 23.0 - H * 0.5, w, H);
+    let h = d
+        .anim
+        .hover(key("keys-hint", ()), r.contains(mouse[0], mouse[1]));
+    d.fill(r, 6.0, mix_rgba(NONE, theme::HOVER, h));
+    let ink = mix_rgba(theme::INK_3, theme::INK, h);
+    keycap_sized(d, r.x + PAD, r.y + (H - CAP) * 0.5, CAP, "?", ink);
+    d.text(
+        label,
+        Rect::new(r.x + PAD + CAP + GAP, r.y, lw + 4.0, H),
+        MICRO,
+        ink,
+    );
+    d.hit(r, HitKind::Keys);
+}
+
+// --- Shortcut sheet -----------------------------------------------------------
+
+/// One row: key tokens and what they do. A `+` token joins a chord and a `/`
+/// token separates alternatives; both draw as faint glyphs between caps.
+type KeyRow = (&'static [&'static str], &'static str);
+
+const KEYS_GENERAL: &[KeyRow] = &[
+    (&["1", "/", "4"], "Switch page"),
+    (&["Ctrl", "+", "F"], "Search processes"),
+    (&["Ctrl", "+", ","], "Open Settings"),
+    (&["Ctrl", "+", "="], "Zoom in"),
+    (&["Ctrl", "+", "-"], "Zoom out"),
+    (&["Ctrl", "+", "0"], "Reset zoom"),
+    (&["PgUp", "/", "PgDn"], "Scroll the page"),
+    (&["?", "/", "F1"], "Show or hide this sheet"),
+];
+
+const KEYS_PROCESSES: &[KeyRow] = &[
+    (&["↑", "/", "↓"], "Move, wraps at the ends"),
+    (&["Home", "/", "End"], "First or last row"),
+    (&["Shift", "+", "↑↓"], "Extend the selection"),
+    (&["Ctrl", "+", "↑↓"], "Move without selecting"),
+    (&["Ctrl", "+", "Space"], "Add or drop the focused row"),
+    (&["Ctrl", "+", "A"], "Select everything shown"),
+    (&["←", "/", "→"], "Collapse or expand a group"),
+    (&["Enter"], "Open or close a group"),
+    (&["Shift", "+", "F10"], "Process menu"),
+    (&["Del"], "End task, press again to confirm"),
+    (&["Space"], "Hold to freeze the order"),
+    (&["V"], "Next list view"),
+    (&["Esc"], "Clear search or selection"),
+];
+
+const KEYS_PERFORMANCE: &[KeyRow] = &[
+    (&["←", "/", "→"], "Previous or next resource"),
+    (&["C", "M", "G", "D", "N"], "CPU, memory, GPU, disk, network"),
+    (&["Space"], "Pause or resume sampling"),
+];
+
+const KEYS_STARTUP: &[KeyRow] = &[
+    (&["↑", "/", "↓"], "Move, wraps at the ends"),
+    (&["Space", "/", "Enter"], "Turn the entry on or off"),
+];
+
+const KEYS_SETTINGS: &[KeyRow] = &[
+    (&["↑", "/", "↓"], "Move, wraps at the ends"),
+    (&["←", "/", "→"], "Change the value"),
+    (&["Space", "/", "Enter"], "Toggle or activate"),
+];
+
+const KEYS_MENU: &[KeyRow] = &[
+    (&["↑", "/", "↓"], "Move between actions"),
+    (&["Enter"], "Run the action"),
+    (&["Esc"], "Close the menu"),
+];
+
+const KEYS_W: f32 = 860.0;
+const KEYS_PAD: f32 = 28.0;
+const KEYS_HEAD_H: f32 = 92.0;
+const KEYS_ROW_H: f32 = 26.0;
+const KEYS_GROUP_HEAD: f32 = 26.0;
+const KEYS_GROUP_GAP: f32 = 22.0;
+const KEYS_COL_GAP: f32 = 40.0;
+const KEYS_KEY_W: f32 = 140.0;
+const CAP_H: f32 = 20.0;
+
+fn keys_group_h(rows: &[KeyRow]) -> f32 {
+    KEYS_GROUP_HEAD + rows.len() as f32 * KEYS_ROW_H
+}
+
+/// Modal sheet of every shortcut. It dims the window, fades in while
+/// settling a few pixels down, and lists the page you are on first.
+fn keys_sheet(d: &mut DrawList, state: &mut AppState, win: Rect) {
+    let a = d.anim.toggle(key("keys-open", ()), state.keys_open);
+    if a <= 0.001 && !state.keys_open {
+        return;
+    }
+    let here = match state.page {
+        Page::Processes => ("Processes", KEYS_PROCESSES),
+        Page::Performance => ("Performance", KEYS_PERFORMANCE),
+        Page::Startup => ("Startup", KEYS_STARTUP),
+        Page::Settings => ("Settings", KEYS_SETTINGS),
+    };
+    let mut groups: Vec<(&str, &[KeyRow], bool)> = vec![("General", KEYS_GENERAL, false)];
+    groups.push((here.0, here.1, true));
+    for (title, rows) in [
+        ("Processes", KEYS_PROCESSES),
+        ("Performance", KEYS_PERFORMANCE),
+        ("Startup", KEYS_STARTUP),
+        ("Settings", KEYS_SETTINGS),
+        ("Process menu", KEYS_MENU),
+    ] {
+        if title != here.0 {
+            groups.push((title, rows, false));
+        }
+    }
+
+    let w = KEYS_W.min(win.w - 48.0).max(280.0);
+    let inner_w = w - KEYS_PAD * 2.0;
+    let cols = if inner_w >= 2.0 * (KEYS_KEY_W + 200.0) + KEYS_COL_GAP {
+        2
+    } else {
+        1
+    };
+    let col_w = (inner_w - KEYS_COL_GAP * (cols - 1) as f32) / cols as f32;
+    // Each group goes to the shortest column, keeping reading order.
+    let mut col_h = vec![0.0_f32; cols];
+    let mut placed: Vec<(usize, f32)> = Vec::with_capacity(groups.len());
+    for (_, rows, _) in &groups {
+        let c = (0..cols)
+            .min_by(|a, b| col_h[*a].total_cmp(&col_h[*b]))
+            .unwrap_or(0);
+        let top = if col_h[c] > 0.0 {
+            col_h[c] + KEYS_GROUP_GAP
+        } else {
+            0.0
+        };
+        placed.push((c, top));
+        col_h[c] = top + keys_group_h(rows);
+    }
+    let content_h = col_h.iter().copied().fold(0.0, f32::max);
+    let h = (KEYS_HEAD_H + content_h + KEYS_PAD).min(win.h - 48.0);
+    let view_h = (h - KEYS_HEAD_H - KEYS_PAD).max(0.0);
+    let max_scroll = (content_h - view_h).max(0.0);
+    state.keys_scroll = state.keys_scroll.clamp(0.0, max_scroll);
+    let scroll = d
+        .anim
+        .slide(key("keys-scroll", ()), state.keys_scroll, anim::SCROLL);
+
+    let x = win.x + (win.w - w) * 0.5;
+    let y = win.y + (win.h - h) * 0.5 - 6.0 * (1.0 - a);
+
+    d.layer = OVERLAY;
+    let saved_fade = d.fade;
+    d.fade = a;
+    d.fill(win, 10.0, [0, 0, 0, 120]);
+    let panel = Rect::new(x, y, w, h);
+    d.slab(panel, 14.0, theme::MENU, theme::GHOST_LINE, 1.0);
+    if state.keys_open {
+        d.hit(win, HitKind::KeysBackdrop);
+        d.hit(panel, HitKind::KeysPanel);
+    }
+
+    let ix = x + KEYS_PAD;
+    d.text(
+        "Keyboard",
+        Rect::new(ix, y + 22.0, inner_w, 28.0),
+        TITLE,
+        theme::INK,
+    );
+    d.text(
+        "Everything works without a mouse",
+        Rect::new(ix, y + 54.0, inner_w, 16.0),
+        SUB,
+        theme::INK_3,
+    );
+    let close = "Esc to close";
+    d.text_r(
+        close,
+        Rect::new(ix, y + 30.0, inner_w, 14.0),
+        MICRO_NUM,
+        theme::INK_4,
+    );
+    d.fill(
+        Rect::new(x, y + KEYS_HEAD_H - 12.0, w, 1.0),
+        0.0,
+        theme::HAIRLINE,
+    );
+
+    let view = Rect::new(x, y + KEYS_HEAD_H, w, view_h);
+    let saved_clip = d.clip;
+    d.clip = Some(view);
+    for ((title, rows, current), (c, top)) in groups.iter().zip(&placed) {
+        let gx = ix + *c as f32 * (col_w + KEYS_COL_GAP);
+        let gy = view.y + top - scroll;
+        eyebrow(
+            d,
+            gx,
+            gy,
+            col_w,
+            title,
+            current.then_some("This page"),
+        );
+        for (i, (tokens, what)) in rows.iter().enumerate() {
+            let ry = gy + KEYS_GROUP_HEAD + i as f32 * KEYS_ROW_H;
+            let mut kx = gx;
+            for t in tokens.iter() {
+                if *t == "+" || *t == "/" {
+                    let r = Rect::new(kx, ry, 12.0, CAP_H);
+                    d.text_c(t, r, NUM_SMALL, theme::INK_4);
+                    kx += 12.0;
+                    continue;
+                }
+                kx += keycap(d, kx, ry, t) + 3.0;
+            }
+            d.text(
+                what,
+                Rect::new(gx + KEYS_KEY_W, ry, col_w - KEYS_KEY_W, CAP_H),
+                BODY,
+                theme::INK_2,
+            );
+        }
+    }
+    d.clip = saved_clip;
+
+    if max_scroll > 0.0 {
+        let thumb_h = (view_h * view_h / content_h).max(24.0);
+        let t = scroll / max_scroll;
+        let ty = view.y + (view_h - thumb_h) * t;
+        d.fill(
+            Rect::new(x + w - 8.0, ty, 2.0, thumb_h),
+            1.0,
+            theme::GHOST_LINE,
+        );
+    }
+    d.fade = saved_fade;
+    d.layer = BASE;
+}
+
+/// A key drawn as a small engraved cap. Returns its width.
+fn keycap(d: &mut DrawList, x: f32, y: f32, label: &str) -> f32 {
+    keycap_sized(d, x, y, CAP_H, label, theme::INK)
+}
+
+fn keycap_sized(
+    d: &mut DrawList,
+    x: f32,
+    y: f32,
+    size: f32,
+    label: &str,
+    ink: theme::Rgba,
+) -> f32 {
+    let w = (measure(label, NUM_SMALL) + size * 0.6).max(size);
+    let r = Rect::new(x, y, w, size);
+    d.slab(r, size * 0.25, theme::HOVER, theme::GHOST_LINE, 1.0);
+    d.text_c(label, r, NUM_SMALL, ink);
+    w
 }
 
 /// Floating notice. It rises in, re-fits its width when the message
@@ -1868,6 +2144,27 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
         }
     }
     let rows = visible_rows(state, snap);
+    state.kb_proc_rows = kb_rows_from(&rows);
+    // Drop focus that no longer exists in the list.
+    match state.kb {
+        KbFocus::Proc(pid)
+            if !state
+                .kb_proc_rows
+                .iter()
+                .any(|r| matches!(r, KbProcRow::Pid { pid: p, .. } if *p == pid)) =>
+        {
+            state.kb = KbFocus::None;
+        }
+        KbFocus::ProcGroup(id)
+            if !state
+                .kb_proc_rows
+                .iter()
+                .any(|r| matches!(r, KbProcRow::Group { id: g } if *g == id)) =>
+        {
+            state.kb = KbFocus::None;
+        }
+        _ => {}
+    }
     // Processes missing from the last list fade in where they land.
     let known: std::collections::HashSet<i32> = state.visible_pids.iter().copied().collect();
     state.visible_pids = rows
@@ -1877,11 +2174,15 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
             Row::Header { .. } => None,
         })
         .collect();
-    // After a view/group change cleared pins, freeze selected rows at their new spots.
-    if !state.selected.is_empty() && state.pinned.is_empty() {
-        for &pid in &state.selected {
-            if let Some(i) = state.visible_pids.iter().position(|p| *p == pid) {
-                state.pinned.insert(pid, i);
+    // After a view/group change asked for it, freeze selected rows at their new spots.
+    if state.needs_repin {
+        state.needs_repin = false;
+        if !state.selected.is_empty() {
+            state.pinned.clear();
+            for &pid in &state.selected {
+                if let Some(i) = state.visible_pids.iter().position(|p| *p == pid) {
+                    state.pinned.insert(pid, i);
+                }
             }
         }
     }
@@ -1895,6 +2196,7 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     if state.scroll > max_scroll {
         state.scroll = max_scroll;
     }
+    apply_proc_scroll_into_view(state, &rows, list.h, row_h, max_scroll);
     let scroll = smooth_scroll(d, state, ScrollBar::Processes, (), state.scroll);
     // List motion is its own switch; soft-disable Anim for the row block so
     // search, pills and scroll still follow the global Animations setting.
@@ -1962,6 +2264,13 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
                 id,
                 members,
             } => {
+                let focused = matches!(state.kb, KbFocus::ProcGroup(gid) if gid == *id);
+                let hot = focused || rr.contains(mouse[0], mouse[1]);
+                let h = d.anim.hover(key("row-hover", id), hot);
+                d.fill(rr, 6.0, mix_rgba(NONE, theme::HOVER, h));
+                if focused {
+                    state.menu_anchor = Some([rr.x + 40.0, ry + drawn_h * 0.5]);
+                }
                 let turn = d.anim.toggle(key("chevron", *id), *open);
                 chevron(
                     d,
@@ -1984,11 +2293,15 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
             }
             Row::Proc(p) => {
                 let on = state.selected.contains(&p.pid);
-                let hot = !on && rr.contains(mouse[0], mouse[1]);
+                let focused = matches!(state.kb, KbFocus::Proc(pid) if pid == p.pid);
+                let hot = !on && (focused || rr.contains(mouse[0], mouse[1]));
                 let h = d.anim.hover(key("row-hover", p.pid), hot);
                 let sel = d.anim.toggle(key("row-selected", p.pid), on);
                 let hover = mix_rgba(NONE, theme::HOVER, h);
                 d.fill(rr, 6.0, mix_rgba(hover, theme::SELECTED, sel));
+                if focused {
+                    state.menu_anchor = Some([rr.x + 40.0, ry + drawn_h * 0.5]);
+                }
                 draw_proc(d, &cols, rr, p, cpu_div, disk_total_bps(snap));
                 d.hit(rr, HitKind::Proc { pid: p.pid });
             }
@@ -2110,6 +2423,80 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
         (procs, true)
     };
     arrange_rows(state, procs, pin)
+}
+
+fn kb_rows_from(rows: &[Row<'_>]) -> Vec<KbProcRow> {
+    let mut out = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        match &rows[i] {
+            Row::Header { id, open, count, .. } => {
+                out.push(KbProcRow::Group { id: *id });
+                i += 1;
+                if *open {
+                    for _ in 0..*count {
+                        match rows.get(i) {
+                            Some(Row::Proc(p)) => {
+                                out.push(KbProcRow::Pid {
+                                    pid: p.pid,
+                                    group: Some(*id),
+                                });
+                                i += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            Row::Proc(p) => {
+                out.push(KbProcRow::Pid {
+                    pid: p.pid,
+                    group: None,
+                });
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn apply_proc_scroll_into_view(
+    state: &mut AppState,
+    rows: &[Row<'_>],
+    view_h: f32,
+    row_h: f32,
+    max_scroll: f32,
+) {
+    let take = matches!(
+        state.scroll_into_view,
+        Some(ScrollTarget::Proc(_) | ScrollTarget::ProcGroup(_))
+    );
+    if !take {
+        return;
+    }
+    let Some(target) = state.scroll_into_view.take() else {
+        return;
+    };
+    let idx = match target {
+        ScrollTarget::Proc(pid) => rows
+            .iter()
+            .position(|r| matches!(r, Row::Proc(p) if p.pid == pid)),
+        ScrollTarget::ProcGroup(id) => rows
+            .iter()
+            .position(|r| matches!(r, Row::Header { id: hid, .. } if *hid == id)),
+        _ => None,
+    };
+    let Some(i) = idx else {
+        return;
+    };
+    let y = i as f32 * row_h;
+    let bottom = y + row_h;
+    if y < state.scroll {
+        state.scroll = y;
+    } else if bottom > state.scroll + view_h {
+        state.scroll = (bottom - view_h).max(0.0);
+    }
+    state.scroll = state.scroll.clamp(0.0, max_scroll);
 }
 
 fn arrange_rows<'a>(state: &AppState, procs: Vec<&'a Proc>, pin: bool) -> Vec<Row<'a>> {
@@ -3289,6 +3676,12 @@ fn startup_page(
         (inner.bottom() - y - 1.0).max(20.0),
     );
     d.startup_rect = Some(list);
+    state.kb_startup_len = startup.len();
+    if let KbFocus::Startup(i) = state.kb {
+        if i >= startup.len() {
+            state.kb = KbFocus::None;
+        }
+    }
     if startup.is_empty() {
         d.text(
             "No autostart entries found",
@@ -3304,6 +3697,17 @@ fn startup_page(
     if state.startup_scroll > max_scroll {
         state.startup_scroll = max_scroll;
     }
+    if let Some(ScrollTarget::Startup(i)) = state.scroll_into_view {
+        state.scroll_into_view = None;
+        let y = i as f32 * row_h;
+        let bottom = y + row_h;
+        if y < state.startup_scroll {
+            state.startup_scroll = y;
+        } else if bottom > state.startup_scroll + list.h {
+            state.startup_scroll = (bottom - list.h).max(0.0);
+        }
+        state.startup_scroll = state.startup_scroll.clamp(0.0, max_scroll);
+    }
     let scroll = smooth_scroll(d, state, ScrollBar::Startup, (), state.startup_scroll);
     let first = (scroll / row_h).floor() as usize;
     let nvis = ((list.h / row_h).ceil() as usize) + 2;
@@ -3316,6 +3720,10 @@ fn startup_page(
             continue;
         }
         let rr = Rect::new(full.x, ry, full.w, row_h);
+        let focused = matches!(state.kb, KbFocus::Startup(idx) if idx == i);
+        let hot = focused || rr.contains(mouse[0], mouse[1]);
+        let h = d.anim.hover(key("startup-hover", i), hot);
+        d.fill(rr, 6.0, mix_rgba(NONE, theme::HOVER, h));
         let name_ink = if entry.enabled {
             theme::INK
         } else {
@@ -3593,7 +4001,52 @@ fn ctl_w(ctl: &Ctl) -> f32 {
     }
 }
 
-fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
+fn ctl_to_kb(ctl: &Ctl) -> KbSettingCtl {
+    match ctl {
+        Ctl::Choice(items) => {
+            let opt = items
+                .first()
+                .map(|(_, _, k)| match k {
+                    HitKind::Setting(o, _) => *o,
+                    _ => Opt::Glass,
+                })
+                .unwrap_or(Opt::Glass);
+            let current = items
+                .iter()
+                .position(|(_, on, _)| *on)
+                .unwrap_or(0) as u8;
+            KbSettingCtl::Choice {
+                opt,
+                count: items.len() as u8,
+                current,
+            }
+        }
+        Ctl::Switch(opt, on) => KbSettingCtl::Switch {
+            opt: *opt,
+            on: *on,
+        },
+        Ctl::Chips(items) => KbSettingCtl::Chips(
+            items
+                .iter()
+                .filter_map(|(_, on, kind)| match kind {
+                    HitKind::Setting(opt, _) => Some((*opt, *on)),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        Ctl::Scale(_) => KbSettingCtl::Scale,
+        Ctl::Reset(_) => KbSettingCtl::Reset,
+    }
+}
+
+fn draw_ctl(
+    d: &mut DrawList,
+    ctl: &Ctl,
+    x: f32,
+    y: f32,
+    mouse: [f32; 2],
+    kb_chip: Option<usize>,
+) {
     match ctl {
         Ctl::Choice(items) => {
             segmented(d, x, y, items, mouse);
@@ -3606,12 +4059,11 @@ fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2]) {
         ),
         Ctl::Chips(items) => {
             let mut cx = x;
-            for (label, on, kind) in items {
+            for (i, (label, on, kind)) in items.iter().enumerate() {
                 let r = Rect::new(cx, y, pill_w(label, false), PILL_H);
-                // Chip ids flip with their value, so key on the label.
-                let h = d
-                    .anim
-                    .hover(key("chip-hover", label), r.contains(mouse[0], mouse[1]));
+                let focused = kb_chip == Some(i);
+                let hot = focused || r.contains(mouse[0], mouse[1]);
+                let h = d.anim.hover(key("chip-hover", label), hot);
                 let o = d.anim.toggle(key("chip-on", label), *on);
                 let rest = mix_rgba(NONE, theme::HOVER, h);
                 let line = mix_rgba(theme::GHOST_LINE, theme::ACCENT_LINE, h);
@@ -3691,6 +4143,26 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
     d.settings_rect = Some(list);
 
     let groups = settings_groups(state);
+    state.kb_settings = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(gi, (_, rows))| {
+            rows.iter().enumerate().map(move |(ri, row)| KbSettingRow {
+                group: gi,
+                row: ri,
+                ctl: ctl_to_kb(&row.ctl),
+            })
+        })
+        .collect();
+    if let KbFocus::Setting { group, row, .. } = state.kb {
+        if !state
+            .kb_settings
+            .iter()
+            .any(|r| r.group == group && r.row == row)
+        {
+            state.kb = KbFocus::None;
+        }
+    }
     let list_full = list;
     let list = Rect::new(list.x, list.y, (list.w - SCROLL_GUTTER).max(40.0), list.h);
     // Controls that would crowd the label drop below it.
@@ -3711,17 +4183,44 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
     if state.settings_scroll > max_scroll {
         state.settings_scroll = max_scroll;
     }
+    if let Some(ScrollTarget::Setting { group, row }) = state.scroll_into_view {
+        state.scroll_into_view = None;
+        let mut y = 0.0_f32;
+        'find: for (gi, (_, rows)) in groups.iter().enumerate() {
+            y += SET_GROUP_H;
+            for (ri, r) in rows.iter().enumerate() {
+                let h = row_h(&r.ctl);
+                if gi == group && ri == row {
+                    let bottom = y + h;
+                    if y < state.settings_scroll {
+                        state.settings_scroll = y;
+                    } else if bottom > state.settings_scroll + list.h {
+                        state.settings_scroll = (bottom - list.h).max(0.0);
+                    }
+                    state.settings_scroll = state.settings_scroll.clamp(0.0, max_scroll);
+                    break 'find;
+                }
+                y += h;
+            }
+        }
+    }
     let scroll = smooth_scroll(d, state, ScrollBar::Settings, (), state.settings_scroll);
 
     d.clip = Some(list_full);
     let mut cursor = list.y - scroll;
-    for (title, rows) in &groups {
+    for (gi, (title, rows)) in groups.iter().enumerate() {
         eyebrow(d, list.x, cursor + 20.0, list.w, title, None);
         cursor += SET_GROUP_H;
-        for row in rows {
+        for (ri, row) in rows.iter().enumerate() {
             let y = cursor;
             let h = row_h(&row.ctl);
             let rr = Rect::new(list.x, y, list.w, h);
+            let focused = matches!(
+                state.kb,
+                KbFocus::Setting { group, row, .. } if group == gi && row == ri
+            );
+            let hov = d.anim.hover(key("set-hover", (gi, ri)), focused);
+            d.fill(rr, 6.0, mix_rgba(NONE, theme::HOVER, hov));
             let cw = ctl_w(&row.ctl);
             let stack = stacked(&row.ctl);
             let text_w = if stack {
@@ -3750,7 +4249,15 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
             } else {
                 (list.right() - cw, y + (SET_ROW_H - PILL_H) * 0.5)
             };
-            draw_ctl(d, &row.ctl, cx, cy, mouse);
+            let kb_chip = match state.kb {
+                KbFocus::Setting {
+                    group,
+                    row,
+                    chip,
+                } if group == gi && row == ri => Some(chip),
+                _ => None,
+            };
+            draw_ctl(d, &row.ctl, cx, cy, mouse, kb_chip);
             d.hairline(Rect::new(list.x, y + h - 1.0, list.w, 1.0));
             cursor += h;
         }
@@ -3897,12 +4404,12 @@ mod tests {
         let order = state.visible_pids.clone();
         assert_eq!(order, vec![2, 3, 1]);
 
-        on_key(&mut state, KeyIn::Char(' '), false);
+        on_key(&mut state, KeyIn::Char(' '), false, false, false);
         assert_eq!(state.held.as_deref(), Some(order.as_slice()));
         snap.procs.iter_mut().find(|p| p.pid == 1).unwrap().cpu = 99.0;
         snap.procs.retain(|p| p.pid != 3);
         // A repeat must keep the original capture, not the list after a death.
-        on_key(&mut state, KeyIn::Char(' '), false);
+        on_key(&mut state, KeyIn::Char(' '), false, false, false);
         build(&mut state, &snap, &[], [0.0, 0.0]);
         assert_eq!(state.visible_pids, vec![2, 1]);
         assert_eq!(state.held.as_deref(), Some(order.as_slice()));
@@ -3988,6 +4495,53 @@ mod tests {
             users.iter().all(|l| (l.w - w0).abs() < 0.5),
             "USER cell width diverges across rows"
         );
+    }
+
+    #[test]
+    fn keys_sheet_stays_inside_its_panel_and_settles() {
+        use super::{HitKind, OVERLAY};
+        let snap = Snap::placeholder();
+        for (w, h) in [(1240.0, 780.0), (420.0, 320.0)] {
+            for page in [Page::Processes, Page::Performance, Page::Startup, Page::Settings] {
+                let mut state = AppState::new(w, h);
+                state.page = page;
+                state.settings.animations = false;
+                state.keys_open = true;
+                let d = build(&mut state, &snap, &[], [0.0, 0.0]);
+                let panel = d
+                    .hits
+                    .iter()
+                    .find(|h| h.kind == HitKind::KeysPanel)
+                    .expect("sheet takes hits while open")
+                    .rect;
+                let labels = &d.layers[OVERLAY].labels;
+                assert!(labels.iter().any(|l| l.text == "Keyboard"));
+                for l in labels {
+                    let x1 = l.x + l.w;
+                    let y1 = l.y + l.h;
+                    let (cy0, cy1) = l.clip.map_or((l.y, y1), |c| (c.y, c.y + c.h));
+                    // Clipped rows only need their visible part inside.
+                    let (vy0, vy1) = (l.y.max(cy0), y1.min(cy1));
+                    assert!(
+                        l.x >= panel.x - 0.5 && x1 <= panel.right() + 0.5,
+                        "{w}x{h} {page:?}: {:?} spills sideways",
+                        l.text
+                    );
+                    if vy1 > vy0 {
+                        assert!(
+                            vy0 >= panel.y - 0.5 && vy1 <= panel.bottom() + 0.5,
+                            "{w}x{h} {page:?}: {:?} spills vertically",
+                            l.text
+                        );
+                    }
+                }
+            }
+        }
+        let mut state = AppState::new(1240.0, 780.0);
+        state.keys_open = true;
+        assert!(settles(&mut state, &snap), "sheet entrance never settled");
+        state.keys_open = false;
+        assert!(settles(&mut state, &snap), "sheet exit never settled");
     }
 
     #[test]

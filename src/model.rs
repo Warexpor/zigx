@@ -33,12 +33,88 @@ pub enum Section {
     Net,
 }
 
+impl Section {
+    pub const ALL: [Section; 5] = [
+        Section::Cpu,
+        Section::Memory,
+        Section::Gpu,
+        Section::Disk,
+        Section::Net,
+    ];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ProcView {
     Grouped,
     Flat,
     User,
     System,
+}
+
+impl ProcView {
+    pub const ALL: [ProcView; 4] = [
+        ProcView::Grouped,
+        ProcView::Flat,
+        ProcView::User,
+        ProcView::System,
+    ];
+}
+
+/// Keyboard cursor. Cleared when the page changes or the list is emptied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KbFocus {
+    None,
+    ProcGroup(u64),
+    Proc(i32),
+    Startup(usize),
+    /// `chip` indexes a chip on a Chips row; unused (0) on other setting rows.
+    Setting { group: usize, row: usize, chip: usize },
+}
+
+/// Request for the next frame to bring a focused row into the viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollTarget {
+    ProcGroup(u64),
+    Proc(i32),
+    Startup(usize),
+    Setting { group: usize, row: usize },
+}
+
+/// One focusable process-list row, filled while building the frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KbProcRow {
+    Group {
+        id: u64,
+    },
+    Pid {
+        pid: i32,
+        /// Parent program group in Grouped view, if any.
+        group: Option<u64>,
+    },
+}
+
+/// Settings control shape for keyboard activate / cycle.
+#[derive(Clone, Debug)]
+pub enum KbSettingCtl {
+    Choice {
+        opt: crate::settings::Opt,
+        count: u8,
+        current: u8,
+    },
+    Switch {
+        opt: crate::settings::Opt,
+        on: bool,
+    },
+    Chips(Vec<(crate::settings::Opt, bool)>),
+    Scale,
+    Reset,
+}
+
+#[derive(Clone, Debug)]
+pub struct KbSettingRow {
+    pub group: usize,
+    pub row: usize,
+    pub ctl: KbSettingCtl,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -294,6 +370,8 @@ pub struct AppState {
     pub selected: BTreeSet<i32>,
     /// Selected PIDs stay at these `visible_pids` indices until deselected.
     pub pinned: BTreeMap<i32, usize>,
+    /// After a layout change cleared pins, re-freeze the selection on the next frame.
+    pub needs_repin: bool,
     /// Order captured when Space is held on Processes. Rows stay in this
     /// arrangement until the key is released; numbers keep updating.
     pub held: Option<Vec<i32>>,
@@ -327,6 +405,21 @@ pub struct AppState {
     /// Interface zoom. Layout stays in design pixels; this scales them onto the window.
     pub ui_scale: f32,
     pub visible_pids: Vec<i32>,
+    /// Keyboard cursor on the current page.
+    pub kb: KbFocus,
+    /// Process-list focus targets from the last frame build.
+    pub kb_proc_rows: Vec<KbProcRow>,
+    /// Startup entry count from the last frame build.
+    pub kb_startup_len: usize,
+    /// Settings rows from the last frame build, in walk order.
+    pub kb_settings: Vec<KbSettingRow>,
+    /// Bring this target into view on the next frame.
+    pub scroll_into_view: Option<ScrollTarget>,
+    /// Last drawn keyboard-focused row, for opening the context menu.
+    pub menu_anchor: Option<[f32; 2]>,
+    /// The keyboard shortcut sheet is open. Modal while it is.
+    pub keys_open: bool,
+    pub keys_scroll: f32,
     /// Graph playback clock and eased bars; advanced on each paint of that page.
     pub perf_smooth: PerfSmooth,
     /// Interface animation values, carried from frame to frame.
@@ -536,6 +629,7 @@ impl AppState {
             search_focused: false,
             selected: BTreeSet::new(),
             pinned: BTreeMap::new(),
+            needs_repin: false,
             held: None,
             anchor: None,
             scroll: 0.0,
@@ -559,6 +653,14 @@ impl AppState {
             height,
             ui_scale: 1.0,
             visible_pids: Vec::new(),
+            kb: KbFocus::None,
+            kb_proc_rows: Vec::new(),
+            kb_startup_len: 0,
+            kb_settings: Vec::new(),
+            scroll_into_view: None,
+            menu_anchor: None,
+            keys_open: false,
+            keys_scroll: 0.0,
             perf_smooth: PerfSmooth::default(),
             anim: Anim::default(),
         }

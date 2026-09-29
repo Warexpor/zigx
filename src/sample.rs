@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +26,13 @@ pub struct Hub {
     snap: Arc<Mutex<Arc<Snap>>>,
     /// Sampling period in ms; 0 halts sampling.
     period: Arc<AtomicU64>,
+    /// `spawn_later` parks until this is set, so NVML and `/proc` stay off
+    /// the first frame.
+    ready: Arc<AtomicBool>,
+    /// Set once the sampler has passed the gate, before any read. Tests use
+    /// it to tell "still parked" from "slow first sample".
+    #[cfg(test)]
+    passed: Arc<AtomicBool>,
 }
 
 impl Hub {
@@ -38,17 +45,49 @@ impl Hub {
     pub fn set_period(&self, ms: u64) {
         self.period.store(ms, Ordering::Relaxed);
     }
+
+    /// Let a [`spawn_later`] sampler open NVML and read `/proc`. Idempotent.
+    pub fn release(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
 }
 
 pub fn spawn(period_ms: u64, wake: impl Fn() + Send + 'static) -> Hub {
+    start(period_ms, wake, true)
+}
+
+/// Sampler thread that stays parked until [`Hub::release`]. The window uses
+/// this so the first frame is not competing with NVML init or the process walk.
+pub fn spawn_later(period_ms: u64, wake: impl Fn() + Send + 'static) -> Hub {
+    start(period_ms, wake, false)
+}
+
+fn start(period_ms: u64, wake: impl Fn() + Send + 'static, open: bool) -> Hub {
     let snap = Arc::new(Mutex::new(Arc::new(Snap::placeholder())));
     let slot = Arc::clone(&snap);
     let period = Arc::new(AtomicU64::new(period_ms));
     let shared = Arc::clone(&period);
-    let hub = Hub { snap, period };
+    let ready = Arc::new(AtomicBool::new(open));
+    let gate = Arc::clone(&ready);
+    #[cfg(test)]
+    let passed = Arc::new(AtomicBool::new(false));
+    #[cfg(test)]
+    let passed_thr = Arc::clone(&passed);
+    let hub = Hub {
+        snap,
+        period,
+        ready,
+        #[cfg(test)]
+        passed,
+    };
     thread::Builder::new()
         .name("zigx-sample".into())
         .spawn(move || {
+            while !gate.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(4));
+            }
+            #[cfg(test)]
+            passed_thr.store(true, Ordering::Release);
             let mut engine = Engine::new();
             let mut ms = shared.load(Ordering::Relaxed);
             // Deadline clock: ticks stay on a fixed grid instead of drifting by
@@ -471,15 +510,15 @@ impl Engine {
                     ),
                     _ => (None, None, None, None, false),
                 };
-            let (read_bps, write_bps, read_bytes, write_bytes, io_denied) =
-                if !advance && !priming {
-                    // Short fall-through: leave baselines alone.
-                    (None, None, prev_read, prev_write, prev_denied)
-                } else if prev_denied {
-                    (None, None, None, None, true)
-                } else {
-                    self.proc_io(pid, prev_read, prev_write, prev_at)
-                };
+            let (read_bps, write_bps, read_bytes, write_bytes, io_denied) = if !advance && !priming
+            {
+                // Short fall-through: leave baselines alone.
+                (None, None, prev_read, prev_write, prev_denied)
+            } else if prev_denied {
+                (None, None, None, None, true)
+            } else {
+                self.proc_io(pid, prev_read, prev_write, prev_at)
+            };
             let at = Instant::now();
             let dt = prev_at
                 .map(|t| at.saturating_duration_since(t).as_secs_f64())
@@ -785,9 +824,9 @@ impl Engine {
                 if advance {
                     // Always push so util_hist stays aligned with hist_seq even
                     // when a single NVML/sysfs read misses.
-                    let u = g.util.unwrap_or_else(|| {
-                        self.gpu_hist[i].back().copied().unwrap_or(0.0)
-                    });
+                    let u = g
+                        .util
+                        .unwrap_or_else(|| self.gpu_hist[i].back().copied().unwrap_or(0.0));
                     push_hist(&mut self.gpu_hist[i], u);
                 }
                 Gpu {
@@ -1673,6 +1712,28 @@ mod tests {
             "NVML is installed but no GPU was reported"
         );
         assert!(snap.gpus[0].mem_total > 0);
+    }
+
+    #[test]
+    fn sampler_stays_parked_until_the_first_frame() {
+        use std::sync::atomic::AtomicUsize;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&ticks);
+        let hub = spawn_later(50, move || {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            !hub.passed.load(Ordering::Acquire),
+            "sampler opened NVML before release"
+        );
+        assert_eq!(ticks.load(Ordering::Relaxed), 0);
+        hub.release();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !hub.passed.load(Ordering::Acquire) {
+            assert!(Instant::now() < until, "timed out waiting for the sampler");
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

@@ -316,6 +316,10 @@ impl ApplicationHandler<UserEvent> for App {
             winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "zigx", "zigx");
         attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, "zigx", "zigx");
         let window = Arc::new(event_loop.create_window(attrs).expect("window"));
+        // NVML and the process walk run while the device and fonts come up,
+        // so the first frame already has rows. Releasing after that frame
+        // flashed an empty list.
+        self.hub.release();
         self.gfx = Some(Gfx::new(window.clone(), event_loop));
         self.window = Some(window);
         self.redraw();
@@ -571,7 +575,7 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut state = AppState::new(1240.0, 780.0);
     load_ui(&mut state);
-    let hub = spawn(state.settings.speed.ms(), move || {
+    let hub = spawn_later(state.settings.speed.ms(), move || {
         let _ = proxy.send_event(UserEvent::Sample);
     });
     let mut app = App::new(hub, state);

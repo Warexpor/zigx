@@ -933,7 +933,9 @@ fn ghost_pill(
 
 /// Frosted accent pill, cross-faded in by `t` from a resting fill and edge.
 fn accent_pill(d: &mut DrawList, r: Rect, t: f32, rest: theme::Rgba, rest_line: theme::Rgba) {
-    d.faded(t, |d| d.outline(r.inset(-1.0), r.h * 0.5 + 1.0, theme::ACCENT_HALO));
+    d.faded(t, |d| {
+        d.outline(r.inset(-1.0), r.h * 0.5 + 1.0, theme::ACCENT_HALO)
+    });
     d.slab(
         r,
         r.h * 0.5,
@@ -1750,7 +1752,10 @@ const KEYS_PROCESSES: &[KeyRow] = &[
 
 const KEYS_PERFORMANCE: &[KeyRow] = &[
     (&["←", "/", "→"], "Previous or next resource"),
-    (&["C", "M", "G", "D", "N"], "CPU, memory, GPU, disk, network"),
+    (
+        &["C", "M", "G", "D", "N"],
+        "CPU, memory, GPU, disk, network",
+    ),
     (&["Space"], "Pause or resume sampling"),
 ];
 
@@ -1890,14 +1895,7 @@ fn keys_sheet(d: &mut DrawList, state: &mut AppState, win: Rect) {
     for ((title, rows, current), (c, top)) in groups.iter().zip(&placed) {
         let gx = ix + *c as f32 * (col_w + KEYS_COL_GAP);
         let gy = view.y + top - scroll;
-        eyebrow(
-            d,
-            gx,
-            gy,
-            col_w,
-            title,
-            current.then_some("This page"),
-        );
+        eyebrow(d, gx, gy, col_w, title, current.then_some("This page"));
         for (i, (tokens, what)) in rows.iter().enumerate() {
             let ry = gy + KEYS_GROUP_HEAD + i as f32 * KEYS_ROW_H;
             let mut kx = gx;
@@ -1939,14 +1937,7 @@ fn keycap(d: &mut DrawList, x: f32, y: f32, label: &str) -> f32 {
     keycap_sized(d, x, y, CAP_H, label, theme::INK)
 }
 
-fn keycap_sized(
-    d: &mut DrawList,
-    x: f32,
-    y: f32,
-    size: f32,
-    label: &str,
-    ink: theme::Rgba,
-) -> f32 {
+fn keycap_sized(d: &mut DrawList, x: f32, y: f32, size: f32, label: &str, ink: theme::Rgba) -> f32 {
     let w = (measure(label, NUM_SMALL) + size * 0.6).max(size);
     let r = Rect::new(x, y, w, size);
     d.slab(r, size * 0.25, theme::HOVER, theme::GHOST_LINE, 1.0);
@@ -2200,7 +2191,9 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     let scroll = smooth_scroll(d, state, ScrollBar::Processes, (), state.scroll);
     // List motion is its own switch; soft-disable Anim for the row block so
     // search, pills and scroll still follow the global Animations setting.
-    let list_anim = d.anim.enable(d.anim.enabled() && state.settings.list_animations);
+    let list_anim = d
+        .anim
+        .enable(d.anim.enabled() && state.settings.list_animations);
     let drawn_h = d.anim.slide(key("row-h", ()), row_h, anim::REORDER);
     // Under the rows: empty list space clears selection / unfreezes pins.
     d.hit(list, HitKind::Deselect);
@@ -2430,7 +2423,9 @@ fn kb_rows_from(rows: &[Row<'_>]) -> Vec<KbProcRow> {
     let mut i = 0;
     while i < rows.len() {
         match &rows[i] {
-            Row::Header { id, open, count, .. } => {
+            Row::Header {
+                id, open, count, ..
+            } => {
                 out.push(KbProcRow::Group { id: *id });
                 i += 1;
                 if *open {
@@ -3040,16 +3035,7 @@ fn performance(
     for (i, (ic, label, section)) in items.into_iter().enumerate() {
         let r = slot(i);
         let id = HitKind::Section(section);
-        side_item(
-            d,
-            id,
-            r,
-            ic,
-            label,
-            None,
-            state.section == section,
-            mouse,
-        );
+        side_item(d, id, r, ic, label, None, state.section == section, mouse);
         d.hit(r, id);
     }
 
@@ -3264,7 +3250,7 @@ fn cpu_page(d: &mut DrawList, snap: &Snap, view: Rect, mut y: f32, head: f32) ->
         .iter()
         .map(|h| {
             let idx = h.len() as f32 - 1.0 + head;
-            if idx < 0.0 {
+            if h.is_empty() || idx < 0.0 {
                 0.0
             } else {
                 curve_at(h, idx, prefs.curve)
@@ -3569,11 +3555,7 @@ fn io_page(
     );
     if disk {
         let space = if snap.disk_total > 0 {
-            format!(
-                "{} / {}",
-                bytes(snap.disk_free),
-                bytes(snap.disk_total)
-            )
+            format!("{} / {}", bytes(snap.disk_free), bytes(snap.disk_total))
         } else {
             "—".into()
         };
@@ -3600,12 +3582,7 @@ fn io_page(
             theme::INK_3,
         );
         y += 26.0;
-        let goal = io_scale(
-            a_hist,
-            b_hist,
-            head,
-            state.settings.window(),
-        );
+        let goal = io_scale(a_hist, b_hist, head, state.settings.window());
         let key = format!("{}:{name}", if disk { "disk" } else { "net" });
         let max = state.perf_smooth.io_max(&key).unwrap_or(goal);
         let gr = Rect::new(view.x, y, view.w, graph_h);
@@ -4011,20 +3988,14 @@ fn ctl_to_kb(ctl: &Ctl) -> KbSettingCtl {
                     _ => Opt::Glass,
                 })
                 .unwrap_or(Opt::Glass);
-            let current = items
-                .iter()
-                .position(|(_, on, _)| *on)
-                .unwrap_or(0) as u8;
+            let current = items.iter().position(|(_, on, _)| *on).unwrap_or(0) as u8;
             KbSettingCtl::Choice {
                 opt,
                 count: items.len() as u8,
                 current,
             }
         }
-        Ctl::Switch(opt, on) => KbSettingCtl::Switch {
-            opt: *opt,
-            on: *on,
-        },
+        Ctl::Switch(opt, on) => KbSettingCtl::Switch { opt: *opt, on: *on },
         Ctl::Chips(items) => KbSettingCtl::Chips(
             items
                 .iter()
@@ -4039,14 +4010,7 @@ fn ctl_to_kb(ctl: &Ctl) -> KbSettingCtl {
     }
 }
 
-fn draw_ctl(
-    d: &mut DrawList,
-    ctl: &Ctl,
-    x: f32,
-    y: f32,
-    mouse: [f32; 2],
-    kb_chip: Option<usize>,
-) {
+fn draw_ctl(d: &mut DrawList, ctl: &Ctl, x: f32, y: f32, mouse: [f32; 2], kb_chip: Option<usize>) {
     match ctl {
         Ctl::Choice(items) => {
             segmented(d, x, y, items, mouse);
@@ -4250,11 +4214,7 @@ fn settings_page(d: &mut DrawList, state: &mut AppState, main: Rect, mouse: [f32
                 (list.right() - cw, y + (SET_ROW_H - PILL_H) * 0.5)
             };
             let kb_chip = match state.kb {
-                KbFocus::Setting {
-                    group,
-                    row,
-                    chip,
-                } if group == gi && row == ri => Some(chip),
+                KbFocus::Setting { group, row, chip } if group == gi && row == ri => Some(chip),
                 _ => None,
             };
             draw_ctl(d, &row.ctl, cx, cy, mouse, kb_chip);
@@ -4349,10 +4309,7 @@ mod tests {
         state.open_groups.insert(group_id("chrome"));
         let rows = arrange_rows(&state, procs, false);
         match &rows[..] {
-            [Row::Header {
-                open: true,
-                ..
-            }, Row::Proc(a), Row::Proc(b), Row::Proc(solo)] => {
+            [Row::Header { open: true, .. }, Row::Proc(a), Row::Proc(b), Row::Proc(solo)] => {
                 assert_eq!(a.pid, 1);
                 assert_eq!(b.pid, 2);
                 assert_eq!(solo.pid, 3);
@@ -4502,7 +4459,12 @@ mod tests {
         use super::{HitKind, OVERLAY};
         let snap = Snap::placeholder();
         for (w, h) in [(1240.0, 780.0), (420.0, 320.0)] {
-            for page in [Page::Processes, Page::Performance, Page::Startup, Page::Settings] {
+            for page in [
+                Page::Processes,
+                Page::Performance,
+                Page::Startup,
+                Page::Settings,
+            ] {
                 let mut state = AppState::new(w, h);
                 state.page = page;
                 state.settings.animations = false;
@@ -4583,7 +4545,9 @@ mod tests {
 
     #[test]
     fn curve_stays_inside_its_samples() {
-        let v = [0.0, 100.0, 0.0, 40.0, 45.0, 90.0, 90.0, 90.0, 90.0, 90.0, 10.0];
+        let v = [
+            0.0, 100.0, 0.0, 40.0, 45.0, 90.0, 90.0, 90.0, 90.0, 90.0, 10.0,
+        ];
         for s in 0..=1000 {
             let idx = s as f32 / 100.0;
             let i = (idx.floor() as usize).min(v.len() - 2);
@@ -4606,7 +4570,13 @@ mod tests {
     #[test]
     fn overshoot_is_cut_at_the_plot_top_not_flattened() {
         // A hill rising past y = 10 and back down.
-        let pts = [[0.0, 50.0], [1.0, 20.0], [2.0, 0.0], [3.0, 20.0], [4.0, 50.0]];
+        let pts = [
+            [0.0, 50.0],
+            [1.0, 20.0],
+            [2.0, 0.0],
+            [3.0, 20.0],
+            [4.0, 50.0],
+        ];
         let runs = clip_polyline_top(&pts, 10.0);
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0], vec![[0.0, 50.0], [1.0, 20.0], [1.5, 10.0]]);

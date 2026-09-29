@@ -595,11 +595,7 @@ fn cycle_section(state: &mut AppState, right: bool) -> Vec<Effect> {
         .position(|s| *s == state.section)
         .unwrap_or(0);
     let n = Section::ALL.len();
-    let next = if right {
-        (i + 1) % n
-    } else {
-        (i + n - 1) % n
-    };
+    let next = if right { (i + 1) % n } else { (i + n - 1) % n };
     go_section(state, Section::ALL[next])
 }
 
@@ -869,12 +865,7 @@ fn cycle_setting(state: &mut AppState, right: bool) -> Vec<Effect> {
             if chips.is_empty() {
                 return vec![];
             }
-            let KbFocus::Setting {
-                group,
-                row,
-                chip,
-            } = state.kb
-            else {
+            let KbFocus::Setting { group, row, chip } = state.kb else {
                 return vec![];
             };
             let n = chips.len();
@@ -933,9 +924,7 @@ fn find_setting_hit(state: &AppState, opt: Opt, v: u8) -> Option<(usize, usize, 
     for row in &state.kb_settings {
         match &row.ctl {
             KbSettingCtl::Choice {
-                opt: o,
-                current,
-                ..
+                opt: o, current, ..
             } if *o == opt && *current == v => {
                 return Some((row.group, row.row, 0));
             }
@@ -1589,7 +1578,11 @@ mod tests {
         on_key(&mut state, KeyIn::Char('?'), false, true, false);
         assert!(state.keys_open);
         on_key(&mut state, KeyIn::Char('2'), false, false, false);
-        assert_eq!(state.page, Page::Processes, "keys under the sheet are swallowed");
+        assert_eq!(
+            state.page,
+            Page::Processes,
+            "keys under the sheet are swallowed"
+        );
         on_key(&mut state, KeyIn::Escape, false, false, false);
         assert!(!state.keys_open);
         on_key(&mut state, KeyIn::Help, false, false, false);

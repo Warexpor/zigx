@@ -260,19 +260,13 @@ pub struct Gfx {
 
 impl Gfx {
     pub fn new(window: Arc<Window>, event_loop: &winit::event_loop::ActiveEventLoop) -> Self {
-        let instance = wgpu::Instance::new(InstanceDescriptor::new_with_display_handle(Box::new(
-            event_loop.owned_display_handle(),
-        )));
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("window surface");
-        let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
-            power_preference: PowerPreference::LowPower,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-            apply_limit_buckets: false,
-        }))
-        .expect("gpu adapter");
+        // Parse the few families we draw while the device comes up. A full
+        // fontconfig walk is hundreds of faces and used to sit on this path.
+        let fonts = std::thread::Builder::new()
+            .name("zigx-fonts".into())
+            .spawn(load_preferred_fonts)
+            .expect("font thread");
+        let (instance, surface, adapter) = open_surface(&window, event_loop);
         let (device, queue) =
             pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
                 .expect("gpu device");
@@ -319,7 +313,11 @@ impl Gfx {
             color_space: SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
-        Self::with_device(instance, Some(surface), device, queue, config)
+        let preferred = fonts
+            .join()
+            .unwrap_or_else(|err| std::panic::resume_unwind(err));
+        let font_system = font_system_from(preferred);
+        Self::with_device(instance, Some(surface), device, queue, config, font_system)
     }
 
     /// Offscreen renderer with the same pipelines, for snapshots. `None` when
@@ -348,7 +346,14 @@ impl Gfx {
             desired_maximum_frame_latency: 2,
             color_space: SurfaceColorSpace::Auto,
         };
-        Some(Self::with_device(instance, None, device, queue, config))
+        Some(Self::with_device(
+            instance,
+            None,
+            device,
+            queue,
+            config,
+            font_system_from(load_preferred_fonts()),
+        ))
     }
 
     fn with_device(
@@ -357,6 +362,7 @@ impl Gfx {
         device: Device,
         queue: Queue,
         config: SurfaceConfiguration,
+        mut font_system: FontSystem,
     ) -> Self {
         let format = config.format;
         let globals = device.create_buffer_init(&util::BufferInitDescriptor {
@@ -420,7 +426,6 @@ impl Gfx {
             mapped_at_creation: false,
         });
 
-        let mut font_system = FontSystem::new();
         let fonts = choose_families(&mut font_system);
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
@@ -682,8 +687,8 @@ impl Gfx {
         self.atlas.trim();
         // Atlas trim drops GPU glyphs; SwashHashMaps stay forever. Cap them
         // without thrashing: only clear when well over the soft cap.
-        let swash_n = self.swash_cache.image_cache.len()
-            + self.swash_cache.outline_command_cache.len();
+        let swash_n =
+            self.swash_cache.image_cache.len() + self.swash_cache.outline_command_cache.len();
         if swash_n > SWASH_CACHE_CAP {
             self.swash_cache.image_cache.clear();
             self.swash_cache.outline_command_cache.clear();
@@ -948,31 +953,143 @@ struct Fonts {
     mono: WeightSet,
 }
 
+const SANS: &[&str] = &[
+    "Inter",
+    "Inter Variable",
+    "Adwaita Sans",
+    "Cantarell",
+    "Noto Sans",
+    "Liberation Sans",
+    "DejaVu Sans",
+];
+const MONO: &[&str] = &[
+    "JetBrainsMono Nerd Font",
+    "JetBrains Mono",
+    "Adwaita Mono",
+    "CaskaydiaMono Nerd Font",
+    "Cascadia Mono",
+    "Fira Code",
+    "Noto Sans Mono",
+    "Liberation Mono",
+    "DejaVu Sans Mono",
+];
+
+/// Vulkan first. A miss falls back to every backend, which also probes GLES.
+fn open_surface(
+    window: &Arc<Window>,
+    event_loop: &winit::event_loop::ActiveEventLoop,
+) -> (Instance, Surface<'static>, Adapter) {
+    let display = event_loop.owned_display_handle();
+    let mut last = String::from("no backend");
+    for vulkan_only in [true, false] {
+        let mut desc = InstanceDescriptor::new_with_display_handle(Box::new(display.clone()));
+        if vulkan_only {
+            desc.backends = Backends::VULKAN;
+        }
+        let instance = wgpu::Instance::new(desc);
+        let surface = match instance.create_surface(window.clone()) {
+            Ok(surface) => surface,
+            Err(err) => {
+                last = err.to_string();
+                continue;
+            }
+        };
+        match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+            apply_limit_buckets: false,
+        })) {
+            Ok(adapter) => return (instance, surface, adapter),
+            Err(err) => last = err.to_string(),
+        }
+    }
+    panic!("gpu adapter: {last}");
+}
+
+fn font_system_from(preferred: Option<glyphon::fontdb::Database>) -> FontSystem {
+    match preferred {
+        Some(db) => FontSystem::new_with_locale_and_db(String::from("en-US"), db),
+        // fc-list missing or no preferred family installed.
+        None => FontSystem::new(),
+    }
+}
+
+/// Parse only the families the UI can pick. `None` means fall back to a full scan.
+fn load_preferred_fonts() -> Option<glyphon::fontdb::Database> {
+    let rows = fc_families()?;
+    let wanted = wanted_families();
+    let mut paths = std::collections::HashSet::new();
+    for (names, path) in rows {
+        if names.iter().any(|name| wanted.iter().any(|w| w == name)) {
+            paths.insert(path);
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    let mut db = glyphon::fontdb::Database::new();
+    for path in paths {
+        let _ = db.load_font_file(path);
+    }
+    (!db.is_empty()).then_some(db)
+}
+
+fn wanted_families() -> Vec<String> {
+    let mut names: Vec<String> = SANS
+        .iter()
+        .chain(MONO.iter())
+        .map(|s| (*s).to_string())
+        .collect();
+    for key in ["ZIGX_SANS", "ZIGX_MONO"] {
+        if let Ok(name) = std::env::var(key) {
+            let name = name.trim();
+            if !name.is_empty() && !names.iter().any(|n| n == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn fc_families() -> Option<Vec<(Vec<String>, std::path::PathBuf)>> {
+    let out = std::process::Command::new("fc-list")
+        .args(["-f", "%{family}\t%{file}\n"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let Some((family, file)) = line.split_once('\t') else {
+            continue;
+        };
+        if file.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = family
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        rows.push((names, std::path::PathBuf::from(file)));
+    }
+    (!rows.is_empty()).then_some(rows)
+}
+
 /// cosmic-text's built-in generic families ("Open Sans", "Noto Sans Mono") are
 /// rarely installed. When the family is missing, every face on the machine is
 /// ranked by weight distance alone, so a 600-weight label can land in a serif.
 /// Bind the generic families to fonts that actually exist instead.
 fn choose_families(font_system: &mut FontSystem) -> Fonts {
-    const SANS: &[&str] = &[
-        "Inter",
-        "Inter Variable",
-        "Adwaita Sans",
-        "Cantarell",
-        "Noto Sans",
-        "Liberation Sans",
-        "DejaVu Sans",
-    ];
-    const MONO: &[&str] = &[
-        "JetBrainsMono Nerd Font",
-        "JetBrains Mono",
-        "Adwaita Mono",
-        "CaskaydiaMono Nerd Font",
-        "Cascadia Mono",
-        "Fira Code",
-        "Noto Sans Mono",
-        "Liberation Mono",
-        "DejaVu Sans Mono",
-    ];
     let installed: std::collections::HashSet<String> = font_system
         .db()
         .faces()
@@ -1343,6 +1460,32 @@ mod tests {
             let (e0, e1, e2) = (edge(a, b), edge(b, c), edge(c, a));
             (e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0) || (e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0)
         })
+    }
+
+    #[test]
+    fn preferred_fonts_are_a_slice_of_the_machine() {
+        let db = super::load_preferred_fonts().expect("fc-list");
+        assert!(!db.is_empty());
+        // The full scan on this class of machine is many hundreds of faces.
+        // Staying under this keeps launch off that walk.
+        assert!(db.len() < 160, "loaded {} faces", db.len());
+        let names: std::collections::HashSet<&str> = db
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
+            .collect();
+        assert!(
+            [
+                "Adwaita Sans",
+                "DejaVu Sans",
+                "Noto Sans",
+                "Inter",
+                "Cantarell",
+                "Liberation Sans"
+            ]
+            .iter()
+            .any(|name| names.contains(name)),
+            "no preferred sans in {names:?}"
+        );
     }
 
     #[test]

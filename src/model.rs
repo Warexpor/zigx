@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+#[cfg(test)]
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::anim::{Anim, Spring};
@@ -68,7 +70,11 @@ pub enum KbFocus {
     Proc(i32),
     Startup(usize),
     /// `chip` indexes a chip on a Chips row; unused (0) on other setting rows.
-    Setting { group: usize, row: usize, chip: usize },
+    Setting {
+        group: usize,
+        row: usize,
+        chip: usize,
+    },
 }
 
 /// Request for the next frame to bring a focused row into the viewport.
@@ -478,35 +484,46 @@ impl PerfSmooth {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.at).as_secs_f32();
         self.at = now;
-        let period = settings.speed.ms() as f64 / 1000.0;
+        let period = (settings.speed.ms() as f64 / 1000.0).max(0.05);
         let reduced = settings.reduced();
         self.stepped = reduced;
         self.window = settings.window();
+        let seq = snap.hist_seq as f64;
+        // A speed change drops the rings and restarts the sequence.
+        if seq < self.seq as f64 {
+            self.primed = false;
+        }
         // Capped so a resume after a pause glides back instead of jumping ahead.
         let lag = (snap.hist_at.elapsed().as_secs_f64() / period).min(1.5);
-        // During grow-in the ring is shorter than the steady delay: stay closer
-        // to the tip so the first ink appears promptly instead of waiting out
-        // a full GRAPH_DELAY with an empty plot.
-        let delay = GRAPH_DELAY.min(snap.hist_seq as f64);
-        let target = snap.hist_seq as f64 - delay + lag;
+        // Same trail as the settled graph, including the first samples. A delay
+        // that grew with the ring, or that started at the tip and ramped, made
+        // launch either lurch backward or kink once a second until it caught up.
+        let target = seq - GRAPH_DELAY + lag;
 
         // Advance at exactly one sample per period, then bleed off drift and
         // jitter slowly so the scroll speed never visibly changes. Paused
-        // holds the playhead where it is.
-        let fresh = !self.primed || (target - self.pos).abs() > 2.0;
+        // holds the playhead where it is. Snap only forward: a backward snap
+        // is the launch lurch.
+        let fresh = !self.primed || target - self.pos > 2.0;
         if fresh {
             self.pos = target;
         } else if !paused {
             self.pos += dt as f64 / period;
             self.pos += (target - self.pos) * rate(dt, CLOCK_TAU) as f64;
         }
-        self.pos = self.pos.min(snap.hist_seq as f64);
+        // Never run past now. The steady target is already a full delay behind,
+        // so this only binds if the clock runs ahead. Leaving `pos` negative
+        // before the first sample keeps the clock moving, so the line enters
+        // at full scroll speed instead of starting from a standstill.
+        self.pos = self.pos.min(seq + lag);
         self.seq = snap.hist_seq;
 
-        let bar = if fresh || reduced {
+        // Meters ease in. Snapping them on the first frame read as a pop
+        // before the same motion settled into the slow trail.
+        let bar = if reduced {
             1.0
         } else {
-            rate(dt, BAR_TAU)
+            rate(dt.min(1.0 / 60.0), BAR_TAU)
         };
         let vram: Vec<f32> = snap
             .gpus
@@ -558,7 +575,8 @@ impl PerfSmooth {
         self.primed = true;
     }
 
-    /// Right edge of the graphs, in samples relative to the newest one (<= 0).
+    /// Right edge of the graphs, in samples relative to the newest one.
+    /// Negative trails the tip by about [`GRAPH_DELAY`].
     pub fn head(&self) -> f32 {
         let pos = if self.stepped {
             self.pos.floor()
@@ -575,6 +593,13 @@ impl PerfSmooth {
 
     pub fn io_max(&self, key: &str) -> Option<f32> {
         self.io_max.get(key).map(|d| d.value.exp())
+    }
+
+    /// Pretend the last tick was `dt` ago, so tests can step the clock
+    /// without sleeping.
+    #[cfg(test)]
+    fn rewind(&mut self, dt: Duration) {
+        self.at = self.at.checked_sub(dt).unwrap_or(self.at);
     }
 }
 
@@ -606,8 +631,9 @@ fn rate(dt: f32, tau: f32) -> f32 {
 
 fn ease_vec(dst: &mut Vec<f32>, src: &[f32], a: f32) {
     if dst.len() != src.len() {
-        *dst = src.to_vec();
-        return;
+        // Start at zero so a meter fills in instead of appearing at full height.
+        dst.clear();
+        dst.resize(src.len(), 0.0);
     }
     for (d, s) in dst.iter_mut().zip(src) {
         *d += (*s - *d) * a;
@@ -747,7 +773,10 @@ pub mod theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{io_scale, snap_ui_scale, step_ui_scale};
+    use std::time::{Duration, Instant};
+
+    use super::{io_scale, snap_ui_scale, step_ui_scale, PerfSmooth, Snap};
+    use crate::settings::Settings;
 
     #[test]
     fn zoom_steps_and_clamps() {
@@ -771,5 +800,49 @@ mod tests {
         // Scrolled well past the left edge: zoom back to quiet traffic.
         let gone = io_scale(&hist, &hist, 0.0, 30);
         assert!((gone - 1_000_000.0).abs() < 1.0, "gone={gone}");
+    }
+
+    #[test]
+    fn launch_playhead_scrolls_forward_onto_the_first_samples() {
+        let settings = Settings::default();
+        let mut play = PerfSmooth::default();
+        let mut snap = Snap::placeholder();
+        snap.hist_seq = 1;
+        snap.hist_at = Instant::now();
+        play.tick(&snap, &settings, false);
+        let head = play.head();
+        assert!(
+            (head - (-super::GRAPH_DELAY as f32)).abs() < 0.2,
+            "launch should already be on the settled trail, head={head}"
+        );
+
+        // Right-edge index in the ring. It has to move forward through the
+        // grow-in; the old delay tracked hist_seq and yanked this backward
+        // on every sample.
+        let mut edge = play.head() as f64 + snap.hist_seq as f64 - 1.0;
+        let mut since = 0u64;
+        let mut seq = 1u64;
+        for _ in 0..400 {
+            play.rewind(Duration::from_millis(20));
+            since += 20;
+            if since >= 1000 {
+                since = 0;
+                seq += 1;
+            }
+            snap.hist_seq = seq;
+            snap.hist_at = Instant::now() - Duration::from_millis(since);
+            play.tick(&snap, &settings, false);
+            let next = play.head() as f64 + seq as f64 - 1.0;
+            assert!(
+                next + 0.02 >= edge,
+                "playhead slid backward {edge} -> {next} at seq {seq}"
+            );
+            edge = next;
+        }
+        assert!(
+            play.head() < -2.0,
+            "delay should have settled in, head={}",
+            play.head()
+        );
     }
 }

@@ -22,6 +22,10 @@ deadline clock.
 - The period lives in an atomic on the `Hub`. The sampler re-reads it at least
   every 50 ms while it waits, so a new speed or a pause applies at once instead
   of after the old period.
+- The window releases the sampler (`spawn_later`) when the surface exists,
+  before the device and fonts are ready. NVML init and the process-table walk
+  then overlap that work, and `PRIME_MS` still delays the priming read, so the
+  first painted frame already has rows.
 - **Pause** sets the period to 0: no reads, no new snapshot, and the graph
   playhead holds still. Resuming re-primes the engine, so no rate is averaged
   across the gap and the first sample after it is an honest one-period read.
@@ -37,9 +41,10 @@ deadline clock.
 - Rates (CPU %, disk, network, per-process CPU) are averages over the last
   second, which is also what makes them calm.
 - History begins at launch. Graphs start empty and the trace grows in from the
-  right edge. While the ring is shorter than `GRAPH_DELAY`, playback stays
-  closer to the tip so the first ink appears promptly instead of waiting out
-  a full delay on an empty plot.
+  right edge on the same `GRAPH_DELAY` clock the settled graph uses. The
+  playhead does not sit on the newest sample first: that hold kinks the line
+  and the bars once a second until the delay catches up. It also does not
+  snap backward when a sample lands.
 
 ## Text
 
@@ -68,20 +73,22 @@ samples, for two reasons:
 2. It then bleeds off the difference from the ideal position (newest sample
    minus the delay, plus time since that sample) with a 0.6 s time constant. Sampler jitter
    and drift are absorbed without a visible change in speed.
-3. It is clamped so it never passes the newest sample. If the sampler is late
-   by more than the 0.15 margin, the graph holds rather than invents data. The
-   time-since-sample term is capped at 1.5 samples, so resuming from a pause
-   glides back into place rather than jumping.
-4. If it is more than two samples off, for example after the page was hidden,
-   it snaps.
+3. It is clamped so it never passes now: the newest sample plus the time
+   since it. That time is capped at 1.5 samples, so a late sampler holds
+   rather than inventing data, and resuming from a pause glides back into
+   place rather than jumping.
+4. If it falls more than two samples behind, for example after the page was
+   hidden, it snaps forward. It does not snap backward: that was the launch
+   lurch.
 5. While paused it does not advance at all.
 
 `head()` exposes the right edge relative to the newest sample (always <= 0).
 Graphs and per-core bars both read from it, so they move on one clock.
 
 The trade-off: a change appears in the numbers immediately and in the graph
-about three samples later, when the trace draws up to it. At launch the effective
-delay is capped by how many samples exist, so the grow-in is not held back.
+about three samples later, when the trace draws up to it. Launch uses that
+same delay, so the first ink is already on the smooth clock instead of a
+snappy tip that later settles.
 
 ## Curves
 

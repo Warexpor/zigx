@@ -24,6 +24,6 @@ pub use interact::{
 };
 pub use model::*;
 pub use persist::{load_ui, save_ui, save_ui_bg};
-pub use sample::{spawn, Hub};
+pub use sample::{spawn, spawn_later, Hub};
 pub use settings::{load_settings, History, Settings};
 pub use startup::{load_startup, write_enabled, write_hypr_enabled};

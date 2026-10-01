@@ -10,7 +10,9 @@ use crate::model::{
     KbSettingRow, MenuAction, Page, Proc, ProcView, ScrollBar, ScrollTarget, Section, Snap, Sort,
     StartupEntry,
 };
-use crate::settings::{Choice, Curve, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS};
+use crate::settings::{
+    Choice, Curve, DiskGraph, Opt, ProcCpu, Settings, Speed, Units, OPTIONAL_COLS,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rect {
@@ -1171,7 +1173,7 @@ fn caret_blinks(state: &AppState) -> bool {
 
 fn caret_on(state: &AppState) -> bool {
     !caret_blinks(state)
-        || (state.typed_at.elapsed().as_millis() / CARET_BLINK.as_millis()) % 2 == 0
+        || (state.typed_at.elapsed().as_millis() / CARET_BLINK.as_millis()).is_multiple_of(2)
 }
 
 /// Next moment a still screen must repaint without input: a notice or an
@@ -1255,8 +1257,13 @@ fn menu_panel(
     if procs.is_empty() {
         return false;
     }
+    if live && procs.len() < menu.pids.len() {
+        // Exited members leave the menu, so its counts match what it signals.
+        menu.pids = procs.iter().map(|p| p.pid).collect();
+    }
     let n = procs.len();
     let single = n == 1;
+    let group = menu.group.is_some();
     let any_running = procs.iter().any(|p| !p.stopped);
     let any_stopped = procs.iter().any(|p| p.stopped);
 
@@ -1265,6 +1272,8 @@ fn menu_panel(
             action: MenuAction::EndTask,
             label: if single {
                 "End task".into()
+            } else if group {
+                format!("End all {n}")
             } else {
                 format!("End {n} tasks")
             },
@@ -1277,6 +1286,8 @@ fn menu_panel(
                 "Click again to force kill".into()
             } else if single {
                 "Force kill".into()
+            } else if group {
+                format!("Force kill all {n}")
             } else {
                 format!("Force kill {n}")
             },
@@ -1302,13 +1313,38 @@ fn menu_panel(
         });
     }
     rows.push(MenuRow::Sep);
-    if single {
+    if group {
+        rows.push(MenuRow::Item {
+            action: MenuAction::ToggleGroup,
+            label: if menu.group_open {
+                "Collapse group".into()
+            } else {
+                "Expand group".into()
+            },
+            hint: None,
+            danger: false,
+        });
+        rows.push(MenuRow::Item {
+            action: MenuAction::SelectGroup,
+            label: if single {
+                "Select process".into()
+            } else {
+                format!("Select all {n}")
+            },
+            hint: None,
+            danger: false,
+        });
+    }
+    if single || group {
+        // A group is one program by name, so its first member's file stands for all.
         rows.push(MenuRow::Item {
             action: MenuAction::OpenLocation,
             label: "Open file location".into(),
             hint: None,
             danger: false,
         });
+    }
+    if single {
         rows.push(MenuRow::Item {
             action: MenuAction::CopyCommand,
             label: "Copy command line".into(),
@@ -1337,7 +1373,10 @@ fn menu_panel(
         menu.focus = None;
     }
 
-    let (title, detail) = if single {
+    let (title, detail) = if group {
+        let what = if single { "process" } else { "processes" };
+        (procs[0].name.clone(), format!("Group · {n} {what}"))
+    } else if single {
         (procs[0].name.clone(), format!("PID {}", procs[0].pid))
     } else {
         (format!("{n} processes"), "Selection".to_string())
@@ -1377,7 +1416,6 @@ fn menu_panel(
     let y = y.clamp(margin, (win.bottom() - margin - h).max(margin));
 
     let y = y - 6.0 * (1.0 - a);
-    let focus = menu.focus;
     let confirm = menu.confirm_kill;
     let id = menu.opened;
 
@@ -1421,10 +1459,15 @@ fn menu_panel(
             }
         }
     }
-    let hot_index = item_rects
+    // The pointer takes the keyboard highlight with it, so Enter runs the
+    // item under the mouse rather than one left behind by the arrow keys.
+    let hovered = item_rects
         .iter()
-        .position(|r| r.contains(mouse[0], mouse[1]))
-        .or(focus);
+        .position(|r| r.contains(mouse[0], mouse[1]));
+    if live && hovered.is_some() {
+        menu.focus = hovered;
+    }
+    let hot_index = hovered.or(menu.focus);
     let hl = key("menu-highlight", id);
     let ha = d
         .anim
@@ -1578,9 +1621,8 @@ fn title_bar(d: &mut DrawList, state: &AppState, snap: &Snap, bar: Rect, mouse: 
                 theme::INK_3,
             )
         });
-        if state.settings.readout {
-            right -= rw + 24.0;
-        }
+        // Paused slides into the readout's place as it fades, not after.
+        right -= (rw + 24.0) * shown;
     }
     // Frozen numbers must never pass for live ones, so this shows either way.
     let paused = d.anim.toggle(key("paused", ()), state.paused);
@@ -1741,10 +1783,12 @@ const KEYS_PROCESSES: &[KeyRow] = &[
     (&["Ctrl", "+", "↑↓"], "Move without selecting"),
     (&["Ctrl", "+", "Space"], "Add or drop the focused row"),
     (&["Ctrl", "+", "A"], "Select everything shown"),
+    (&["Ctrl", "+", "⌫"], "Empty the search"),
     (&["←", "/", "→"], "Collapse or expand a group"),
     (&["Enter"], "Open or close a group"),
-    (&["Shift", "+", "F10"], "Process menu"),
+    (&["Shift", "+", "F10"], "Process or group menu"),
     (&["Del"], "End task, press again to confirm"),
+    (&["Del"], "On a group header, end the group"),
     (&["Space"], "Hold to freeze the order"),
     (&["V"], "Next list view"),
     (&["Esc"], "Clear search or selection"),
@@ -1752,6 +1796,7 @@ const KEYS_PROCESSES: &[KeyRow] = &[
 
 const KEYS_PERFORMANCE: &[KeyRow] = &[
     (&["←", "/", "→"], "Previous or next resource"),
+    (&["↑", "/", "↓"], "Scroll the sheet"),
     (
         &["C", "M", "G", "D", "N"],
         "CPU, memory, GPU, disk, network",
@@ -2136,6 +2181,13 @@ fn processes(d: &mut DrawList, state: &mut AppState, snap: &Snap, main: Rect, mo
     }
     let rows = visible_rows(state, snap);
     state.kb_proc_rows = kb_rows_from(&rows);
+    state.group_members = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Header { id, members, .. } => Some((*id, members.iter().map(|p| p.pid).collect())),
+            Row::Proc(_) => None,
+        })
+        .collect();
     // Drop focus that no longer exists in the list.
     match state.kb {
         KbFocus::Proc(pid)
@@ -2375,7 +2427,7 @@ enum Row<'a> {
 }
 
 /// Stable id for a program group; case-insensitive so `Chrome` and `chrome` merge.
-fn group_id(name: &str) -> u64 {
+pub fn group_id(name: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     name.to_ascii_lowercase().hash(&mut h);
@@ -2394,7 +2446,9 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
             .collect();
         (procs, false)
     } else {
-        let q = state.query.to_ascii_lowercase();
+        // Surrounding spaces are not part of the search: a query of only
+        // whitespace lists everything, like an empty one.
+        let q = state.query.trim().to_ascii_lowercase();
         let mut procs: Vec<&Proc> = snap
             .procs
             .iter()
@@ -2409,7 +2463,7 @@ fn visible_rows<'a>(state: &AppState, snap: &'a Snap) -> Vec<Row<'a>> {
                 }
                 p.name.to_ascii_lowercase().contains(&q)
                     || p.user.to_ascii_lowercase().contains(&q)
-                    || p.pid.to_string().contains(q.trim())
+                    || p.pid.to_string().contains(&q)
             })
             .collect();
         sort_procs(&mut procs, state.sort.col, state.sort.desc);
@@ -2863,6 +2917,7 @@ fn draw_proc(d: &mut DrawList, cols: &[ColSpec], row: Rect, p: &Proc, cpu_div: f
 
 /// Program group header: same columns as a process row, values summed across
 /// members. Name sits past the chevron; the process count tags it like a badge.
+#[allow(clippy::too_many_arguments)]
 fn draw_group(
     d: &mut DrawList,
     cols: &[ColSpec],
@@ -3494,6 +3549,9 @@ fn io_page(
     head: f32,
 ) -> f32 {
     type Dev<'a> = (&'a str, f64, f64, &'a [f32], &'a [f32]);
+    if disk && state.settings.disk_graph == DiskGraph::Active {
+        return disk_active_page(d, view, y, snap, head);
+    }
     let top = y;
     let (title, sub, a_legend, b_legend, la, lb) = if disk {
         ("Disk", "Block devices", "read", "write", "R", "W")
@@ -3607,8 +3665,90 @@ fn io_page(
         );
         lx += 17.0;
         d.text(b_legend, Rect::new(lx, ly, 90.0, 12.0), MICRO, theme::INK_3);
+        // The note states the scale actually drawn: a peak touching the top
+        // line is at this rate. A rounded-up figure read 2x high.
         d.text_r(
-            &rate(crate::format::nice_ceil(max) as f64),
+            &rate(max as f64),
+            Rect::new(gr.x, ly, gr.w, 12.0),
+            MICRO_NUM,
+            theme::INK_4,
+        );
+        y += graph_h + 24.0;
+    }
+    y
+}
+
+/// Disk page plotting active time: the share of each interval a disk had I/O
+/// in flight, on a fixed 0 to 100% scale like CPU and GPU utilization.
+fn disk_active_page(d: &mut DrawList, view: Rect, mut y: f32, snap: &Snap, head: f32) -> f32 {
+    let top = y;
+    if snap.disks.is_empty() {
+        return page_title(d, "Disk", "No disks", view, y);
+    }
+    let busiest = snap.disks.iter().map(|dk| dk.busy).fold(0.0_f32, f32::max);
+    let (read, write) = snap.disks.iter().fold((0.0, 0.0), |acc, dk| {
+        (acc.0 + dk.read_bps, acc.1 + dk.write_bps)
+    });
+    y = page_title(d, "Disk", "Block devices", view, y);
+    let slot = view.w / 4.0;
+    stat(d, view.x, y, slot - 16.0, &percent(busiest), "Busiest");
+    stat(d, view.x + slot, y, slot - 16.0, &rate(read), "read");
+    stat(
+        d,
+        view.x + slot * 2.0,
+        y,
+        slot - 16.0,
+        &rate(write),
+        "write",
+    );
+    let space = if snap.disk_total > 0 {
+        format!("{} / {}", bytes(snap.disk_free), bytes(snap.disk_total))
+    } else {
+        "—".into()
+    };
+    stat(d, view.x + slot * 3.0, y, slot - 16.0, &space, "Free");
+    y += 64.0;
+
+    let n = snap.disks.len() as f32;
+    let per_dev = spare_height(view, y - top, 0.0) / n;
+    let graph_h = (per_dev - 26.0 - 24.0).clamp(80.0, 320.0);
+    let legend = "active time";
+    for dk in &snap.disks {
+        d.text(
+            &dk.name,
+            Rect::new(view.x, y, view.w * 0.5, 18.0),
+            NUM,
+            theme::INK,
+        );
+        let c = heat(d, dk.busy, theme::INK_3);
+        d.text_r(
+            &format!(
+                "{} active     R {}     W {}",
+                percent(dk.busy),
+                rate(dk.read_bps),
+                rate(dk.write_bps)
+            ),
+            Rect::new(view.x + view.w * 0.3, y, view.w * 0.7, 18.0),
+            NUM_SMALL,
+            c,
+        );
+        y += 26.0;
+        let gr = Rect::new(view.x, y, view.w, graph_h);
+        d.graph(gr, &[(&dk.busy_hist, theme::TRACE)], 100.0, head);
+        let ly = gr.y + 4.0;
+        d.line(
+            &[[gr.x, ly + 6.0], [gr.x + 12.0, ly + 6.0]],
+            1.25,
+            theme::TRACE,
+        );
+        d.text(
+            legend,
+            Rect::new(gr.x + 17.0, ly, 120.0, 12.0),
+            MICRO,
+            theme::INK_3,
+        );
+        d.text_r(
+            "100%",
             Rect::new(gr.x, ly, gr.w, 12.0),
             MICRO_NUM,
             theme::INK_4,
@@ -3875,6 +4015,11 @@ fn settings_groups(state: &AppState) -> Vec<(&'static str, Vec<SetRow>)> {
                     "Grid",
                     "Quarter lines behind large graphs",
                     Ctl::Switch(Opt::Grid, s.grid),
+                ),
+                row(
+                    "Disk graph",
+                    "Read and write speed, or the share of time each disk is busy",
+                    choice(Opt::DiskGraph, s.disk_graph),
                 ),
             ],
         ),
@@ -4333,6 +4478,35 @@ mod tests {
             }
             other => panic!("groups should precede singletons by name: {other:?}"),
         }
+    }
+
+    #[test]
+    fn pinned_rows_hold_their_slot_while_the_rest_resort() {
+        use super::pin_procs;
+        use std::collections::BTreeMap;
+        let (a, b, c, d) = (proc(1, 1.0), proc(2, 2.0), proc(3, 3.0), proc(4, 4.0));
+        let sorted = vec![&d, &c, &b, &a];
+        // Selected `a` while it sat at index 0; it stays there as others move.
+        let mut pinned = BTreeMap::new();
+        pinned.insert(1, 0);
+        let pids: Vec<i32> = pin_procs(sorted.clone(), &pinned, 0)
+            .iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids, vec![1, 4, 3, 2]);
+        // A pin outside this slice (another group's index) is ignored, and
+        // two pins on one slot keep the first and let the other flow.
+        let mut pinned = BTreeMap::new();
+        pinned.insert(1, 9);
+        pinned.insert(2, 1);
+        pinned.insert(3, 1);
+        let pids: Vec<i32> = pin_procs(sorted, &pinned, 0)
+            .iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids.len(), 4);
+        assert_eq!(pids[1], 3, "first pin on the slot wins in list order");
+        assert!(pids.contains(&2) && pids.contains(&1));
     }
 
     /// Paint frames at roughly display rate until nothing moves.

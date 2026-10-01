@@ -15,7 +15,7 @@ frame from scratch every paint; there is no retained widget tree.
 | Startup   |                                                      |
 |           |                                                      |
 | Settings  |                                                      |
-| v0.6.0 ?K |                                                      |
+| v0.6.2 ?K |                                                      |
 +-----------+------------------------------------------------------+
    nav 200
 ```
@@ -37,7 +37,8 @@ frame from scratch every paint; there is no retained widget tree.
 - **Dividers.** Hairlines under the title bar, right of the nav, and right of
   the Performance sub-nav. Resize handles are 5 px hit strips centered on
   their hairlines.
-- **Minimum window.** 420 x 320. The first window opens at 70% of the primary
+- **Minimum window.** 420 x 320 design pixels, so the real minimum scales
+  with the interface zoom. The first window opens at 70% of the primary
   monitor, keeping its aspect ratio.
 
 ## Processes
@@ -108,6 +109,9 @@ window losing focus, sorts again. A key repeat does not recapture.
   or RX/TX rates, then a two-series graph. Disk adds a Free slot (`free / total`
   across distinct mounted local filesystems). The legend sits at the top left and
   the scale note at the top right. Spare height is split evenly between devices.
+  With Disk graph set to Active time, the Disk stat row reads Busiest, read,
+  write and Free, each device line reads "n% active" (status colored) before
+  its rates, and each graph is one active-time trace on a fixed 100% scale.
 - **GPU page.** One section per GPU. With several GPUs, each utilization graph
   is a fixed 120. VRAM is a 2 px meter: an `INK` fill on a `GRID` track.
 

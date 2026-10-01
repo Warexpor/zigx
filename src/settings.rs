@@ -65,6 +65,11 @@ choice!(Curve {
     Linear => "linear", "Linear",
 });
 
+choice!(DiskGraph {
+    Throughput => "throughput", "Throughput",
+    Active => "active", "Active time",
+});
+
 choice!(Speed {
     Fast => "500", "0.5 s",
     Normal => "1000", "1 s",
@@ -141,6 +146,7 @@ pub enum Opt {
     Curve,
     Fill,
     Grid,
+    DiskGraph,
     /// Segments are the `Speed` values plus a trailing Pause.
     Speed,
     ProcCpu,
@@ -169,6 +175,8 @@ pub struct Settings {
     /// Wash under graph traces.
     pub fill: bool,
     pub grid: bool,
+    /// What the Performance disk graphs plot.
+    pub disk_graph: DiskGraph,
     pub speed: Speed,
     pub proc_cpu: ProcCpu,
     pub units: Units,
@@ -198,6 +206,7 @@ impl Default for Settings {
             curve: Curve::Smooth,
             fill: true,
             grid: true,
+            disk_graph: DiskGraph::Active,
             speed: Speed::Normal,
             proc_cpu: ProcCpu::Machine,
             units: Units::Binary,
@@ -255,7 +264,13 @@ impl Settings {
 
     fn parse(text: &str) -> Self {
         let mut s = Self::default();
-        let on = |v: &str| matches!(v, "on" | "true" | "yes" | "1");
+        // A flag that is neither on nor off (a typo by hand) keeps its default
+        // instead of silently turning the feature off.
+        let flag = |slot: &mut bool, v: &str| match v {
+            "on" | "true" | "yes" | "1" => *slot = true,
+            "off" | "false" | "no" | "0" => *slot = false,
+            _ => {}
+        };
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('#') {
@@ -272,14 +287,15 @@ impl Settings {
             }
             match k {
                 "glass" => set(&mut s.glass, v),
-                "animations" => s.animations = on(v),
+                "animations" => flag(&mut s.animations, v),
                 "motion" => set(&mut s.motion, v),
-                "heat" => s.heat = on(v),
-                "readout" => s.readout = on(v),
+                "heat" => flag(&mut s.heat, v),
+                "readout" => flag(&mut s.readout, v),
                 "history" => set(&mut s.history, v),
                 "curve" => set(&mut s.curve, v),
-                "fill" => s.fill = on(v),
-                "grid" => s.grid = on(v),
+                "fill" => flag(&mut s.fill, v),
+                "grid" => flag(&mut s.grid, v),
+                "disk_graph" => set(&mut s.disk_graph, v),
                 "speed" => set(&mut s.speed, v),
                 "process_cpu" => set(&mut s.proc_cpu, v),
                 "units" => set(&mut s.units, v),
@@ -291,8 +307,8 @@ impl Settings {
                         }
                     }
                 }
-                "list_animations" => s.list_animations = on(v),
-                "confirm" => s.confirm = on(v),
+                "list_animations" => flag(&mut s.list_animations, v),
+                "confirm" => flag(&mut s.confirm, v),
                 "open_on" => set(&mut s.open_on, v),
                 _ => {}
             }
@@ -310,7 +326,7 @@ impl Settings {
         format!(
             "# ZIGX settings. Written by the Settings page; safe to edit by hand.\n\
              glass={}\nanimations={}\nmotion={}\nheat={}\nreadout={}\n\
-             history={}\ncurve={}\nfill={}\ngrid={}\n\
+             history={}\ncurve={}\nfill={}\ngrid={}\ndisk_graph={}\n\
              speed={}\nprocess_cpu={}\nunits={}\ntemperature={}\n\
              columns={}\nlist_animations={}\nconfirm={}\nopen_on={}\n",
             self.glass.key(),
@@ -322,6 +338,7 @@ impl Settings {
             self.curve.key(),
             flag(self.fill),
             flag(self.grid),
+            self.disk_graph.key(),
             self.speed.key(),
             self.proc_cpu.key(),
             self.units.key(),
@@ -378,6 +395,7 @@ mod tests {
             curve: Curve::Linear,
             fill: false,
             grid: false,
+            disk_graph: DiskGraph::Throughput,
             speed: Speed::Fast,
             proc_cpu: ProcCpu::Machine,
             units: Units::Decimal,
@@ -400,10 +418,13 @@ mod tests {
 
     #[test]
     fn unknown_or_broken_lines_keep_defaults() {
-        let s = Settings::parse("glass=neon\nhistory\n# fill=off\nspeed=2000\n");
+        let s =
+            Settings::parse("glass=neon\nhistory\n# fill=off\nspeed=2000\ngrid=maybe\nheat=no\n");
         assert_eq!(s.glass, Glass::Frost);
         assert!(s.fill);
         assert!(s.animations);
+        assert!(s.grid, "a flag that is not on or off keeps its default");
+        assert!(!s.heat);
         assert_eq!(s.speed, Speed::Slow);
     }
 

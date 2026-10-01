@@ -147,23 +147,28 @@ frame-rate independent exponential, `1 - exp(-dt / tau)`.
 
 ### I/O graph scale
 
-Disk and network graphs autoscale to the nice ceiling (1, 2, 5 x 10^n) of recent
-traffic.
+Disk and network throughput graphs autoscale to the peak of the traffic on
+screen. The disk active-time graph does not: like CPU and GPU utilization it
+is fixed at 100%.
 
-- **Target.** The target covers roughly a quarter of the drawn window (clamped
-  to 6–16 samples) plus the three samples the curve is heading into. The scale
-  grows before a burst is drawn, and shrinks again when recent traffic is
-  quieter — even while an older spike is still scrolling off on the left.
-- **Easing.** The scale follows its target in log space with a critically
-  damped smooth-damp, 0.35 s when growing and 0.5 s when shrinking. Log space
-  makes a 100x rescale read as an even zoom instead of an instant squash, and
-  critical damping never overshoots.
-- **Overshoot.** Zooming back means an older burst can still be on screen
-  above the scale. Its line runs off the top of the plot and is cut there
-  (`clip_polyline_top`), so it reads as larger than the scale. It is never
-  flattened into a plateau, which would read as a value held at the scale. The
-  wash stays inside the plot, and nothing enters the top pad with the legend.
-- **Label.** The scale label shows the target.
+- **Target.** The raw peak over the drawn window plus the three samples the
+  curve is heading into, so the scale is ready before a burst is drawn and
+  only shrinks once the burst has scrolled fully off the left edge. The
+  target is not rounded to a nice ceiling: stepping between 1 / 2 / 5 stops
+  made every shrink hitch.
+- **Easing.** The scale follows its target in log space: a critically damped
+  spring (0.28 s) when growing, and a slower exponential approach (1.1 s)
+  when shrinking so zooming back into quiet traffic stays continuous. Log
+  space makes a 100x rescale read as an even zoom instead of an instant
+  squash.
+- **Overshoot.** A speed change or a late sample can still put a burst on
+  screen above the scale. Its line runs off the top of the plot and is cut
+  there (`clip_polyline_top`), so it reads as larger than the scale. It is
+  never flattened into a plateau, which would read as a value held at the
+  scale. The wash stays inside the plot, and nothing enters the top pad with
+  the legend.
+- **Label.** The scale note states the rate actually drawn at the top line, so
+  a peak touching it is at that rate. It eases with the scale.
 - The per-core bars do not ease. They sample each core's history at the
   playback head, so they glide on the same clock and curve as the utilization
   graph, and their warning colors switch as the bar crosses 70% and 90%.
@@ -196,8 +201,8 @@ sample.
 
 ### Snapshots
 
-`cargo test --bin zigx snapshots -- --ignored` renders fixed Disk and CPU
-frames through the real pipelines offscreen (`Gfx::headless`, `Gfx::capture`)
+`cargo test --bin zigx snapshots -- --ignored` renders fixed Disk (throughput
+and active time) and CPU frames, plus the list pages and menus, through the real pipelines offscreen (`Gfx::headless`, `Gfx::capture`)
 and writes them to `target/snapshots/`: each page at 1x, plus its detail pane
 at 4x, where single stroke pixels are visible. The fixtures in
 `src/snapshot.rs` include lone one-sample bursts, plateaus, and ramps. Look at

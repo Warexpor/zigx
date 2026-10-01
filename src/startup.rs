@@ -151,7 +151,12 @@ pub fn write_enabled(path: &Path, system_path: Option<&Path>, enable: bool) -> i
         Err(err) if err.kind() == io::ErrorKind::NotFound => None,
         Err(err) => return Err(err),
     };
+    // A user file that only masks the system entry (`Hidden=true` and
+    // nothing else, as some tools write) would stay an invalid override once
+    // enabled: it shadows the system file but has no Exec of its own. Seed
+    // those from the system entry; a user file with its own Exec is kept.
     let base = match (&previous, system_path) {
+        (Some(text), Some(sys)) if parse_desktop(text).exec.is_none() => fs::read_to_string(sys)?,
         (Some(text), _) => text.clone(),
         (None, Some(sys)) => fs::read_to_string(sys)?,
         (None, None) => "[Desktop Entry]\nType=Application\n".to_string(),
@@ -295,29 +300,18 @@ fn find_hypr_launches(text: &str) -> Vec<HyprLaunch> {
     out
 }
 
+/// First Lua string literal in `block`, double or single quoted, with
+/// backslash escapes collapsed.
 fn extract_lua_string(block: &str) -> Option<String> {
-    let bytes = block.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            i += 1;
-            let mut out = String::new();
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' if i + 1 < bytes.len() => {
-                        out.push(bytes[i + 1] as char);
-                        i += 2;
-                    }
-                    b'"' => return Some(out),
-                    b => {
-                        out.push(b as char);
-                        i += 1;
-                    }
-                }
-            }
-            return None;
+    let mut chars = block.chars();
+    let quote = chars.find(|c| *c == '"' || *c == '\'')?;
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            c if c == quote => return Some(out),
+            c => out.push(c),
         }
-        i += 1;
     }
     None
 }
@@ -331,8 +325,9 @@ fn hypr_launch_name(cmd: &str) -> String {
             .unwrap_or(first)
             .to_string();
     }
-    if cmd.len() > 42 {
-        format!("{}...", &cmd[..39])
+    if cmd.chars().count() > 42 {
+        let head: String = cmd.chars().take(39).collect();
+        format!("{head}...")
     } else {
         cmd.to_string()
     }
@@ -555,6 +550,14 @@ mod tests {
         assert!(a.path.exists());
         let reloaded = load();
         assert!(!reloaded.iter().find(|e| e.name == "Alpha").unwrap().enabled);
+
+        // Enabling a bare mask seeds the override from the system file so
+        // the session still finds an Exec line in the file that wins.
+        write_enabled(&b.path, b.system_path.as_deref(), true).unwrap();
+        let text = fs::read_to_string(&b.path).unwrap();
+        assert!(text.contains("Exec=beta"), "{text}");
+        assert!(text.contains("Hidden=false"), "{text}");
+        assert!(load().iter().find(|e| e.name == "Beta").unwrap().enabled);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -615,10 +618,21 @@ o.launch_on_start(
         let off = set_hypr_launch_enabled(src, 1, false).unwrap();
         let again = parse_hypr_launches(&off, &path);
         assert!(!again[1].enabled);
-        assert!(again[1].enabled == false);
         let on = set_hypr_launch_enabled(&off, 1, true).unwrap();
         let restored = parse_hypr_launches(&on, &path);
         assert!(restored[1].enabled);
         assert!(restored[1].exec.contains("v2rayN"));
+    }
+
+    #[test]
+    fn hypr_names_survive_quotes_and_multibyte_text() {
+        let src = "o.launch_on_start('single \\'quoted\\' tool')\n\
+                   o.launch_on_start(\"notify-send — ééééééééééééééééééééééééééééééééééééééé\")\n";
+        let list = parse_hypr_launches(src, Path::new("/tmp/x.lua"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].exec, "single 'quoted' tool");
+        // Long command with multibyte characters: trimmed by character, no panic.
+        assert!(list[1].name.ends_with("..."));
+        assert_eq!(list[1].name.chars().count(), 42);
     }
 }

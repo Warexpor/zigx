@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::model::{AppState, Col, Density, Page, ProcView, Section, Sort};
 use crate::settings::OpenOn;
@@ -33,14 +35,28 @@ pub fn save_ui(state: &AppState) -> io::Result<()> {
     crate::settings::save_settings(&state.settings)
 }
 
+/// Ticket for each background save, and the newest one that has landed.
+/// Saves are serialized under the lock so two quick clicks cannot fight over
+/// the same temp file, and ordered so an older state never overwrites a newer
+/// one that happened to finish first.
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+static SAVE_DONE: Mutex<u64> = Mutex::new(0);
+
 /// Serialize on the UI thread, fsync on a worker so page/section clicks are
 /// not stalled by disk (atomic_write syncs before rename).
 pub fn save_ui_bg(state: &AppState) {
     let layout = layout_body(state);
     let settings = state.settings.render();
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = std::thread::Builder::new()
         .name("zigx-save".into())
         .spawn(move || {
+            let mut done = SAVE_DONE.lock().unwrap_or_else(|e| e.into_inner());
+            if seq <= *done {
+                // A newer state is already on disk.
+                return;
+            }
+            *done = seq;
             if let Err(err) = commit_save(&layout, &settings) {
                 eprintln!("zigx: could not save settings: {err}");
             }

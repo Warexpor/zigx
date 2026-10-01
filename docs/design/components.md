@@ -152,16 +152,20 @@ when a new message replaces the old one.
 
 ## Context menu
 
-`context_menu()`. Right-clicking a process row opens a floating panel at the
-pointer on the overlay layer.
+`context_menu()`. Right-clicking a process row or a group header opens a
+floating panel at the pointer on the overlay layer.
 
 - **Target.** A row outside the selection becomes the selection first. The
-  menu acts on the selection as it was when the menu opened.
+  menu acts on the selection as it was when the menu opened. On a group
+  header the selection clears, the header takes focus, and the menu acts on
+  every member the list shows under the current view and search. Members
+  that exit while it is open drop out of its counts.
 - **Panel.** Radius 10, `MENU` fill, `GHOST_LINE` outline, 6 padding, 200 to
   320 wide from its longest label. It opens down and right of the pointer and
   flips at the window edges with an 8 margin.
-- **Header.** 44 high: the process name (`BODY` / `INK`) over "PID n" or
-  "Selection" (`MICRO_NUM` / `INK_4`), closed by a full-width hairline with a
+- **Header.** 44 high: the process name (`BODY` / `INK`) over "PID n",
+  "Selection" or "Group · n processes" (`MICRO_NUM` / `INK_4`), closed by a
+  full-width hairline with a
   5 gap before the first item so its highlight clears the rule.
 - **Items.** 30 high, radius 6, `BODY` label 10 in, optional right-aligned
   `MICRO_NUM` hint in `INK_4` naming the signal. At rest the label is `INK_2`;
@@ -171,8 +175,11 @@ pointer on the overlay layer.
   - End task (SIGTERM) and Force kill (SIGKILL).
   - Suspend (SIGSTOP) and Resume (SIGCONT), each shown only when some target
     can use it.
-  - Open file location and Copy command line (single process only), then Copy
-    PID or PIDs.
+  - Group menu only: Expand or Collapse group, and Select all n, which opens
+    the group and selects its members.
+  - Open file location (single process or group), Copy command line (single
+    process only), then Copy PID or PIDs.
+  - A group menu labels the signals "End all n" and "Force kill all n".
 - **Force kill.** The label is `DANGER_INK` on hover. The first click arms it:
   a `DANGER_LINE` outline and "Click again to force kill". The second click
   sends the signal. With Confirm ending off, the first click sends it.

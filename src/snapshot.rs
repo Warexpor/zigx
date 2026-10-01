@@ -42,6 +42,15 @@ fn history(tail: &[f32]) -> Vec<f32> {
     h
 }
 
+/// Active time that follows the traffic, saturating on the big bursts.
+fn busy(read_kb: &[f32], write_kb: &[f32]) -> Vec<f32> {
+    read_kb
+        .iter()
+        .zip(write_kb)
+        .map(|(r, w)| (r * 1.2 + w * 0.8).min(100.0))
+        .collect()
+}
+
 fn base_snap() -> Snap {
     let mut snap = Snap::placeholder();
     snap.hist_seq = 10_000;
@@ -56,8 +65,10 @@ fn disk_snap() -> Snap {
         name: "nvme0n1".into(),
         read_bps: 2048.0,
         write_bps: 1024.0,
+        busy: 35.0,
         read_hist: history(&kb(&READ_KB)),
         write_hist: history(&kb(&WRITE_KB)),
+        busy_hist: history(&busy(&READ_KB, &WRITE_KB)),
     }];
     snap
 }
@@ -78,8 +89,10 @@ fn disk_burst_snap() -> Snap {
         name: "nvme0n1".into(),
         read_bps: 6144.0,
         write_bps: 1024.0,
+        busy: 4.0,
         read_hist: history(&kb(&read)),
         write_hist: history(&kb(&write)),
+        busy_hist: history(&busy(&read, &write)),
     }];
     snap
 }
@@ -107,11 +120,12 @@ fn cpu_snap() -> Snap {
     snap
 }
 
-fn frame(section: Section, snap: &Snap) -> (DrawList, Rect) {
+fn frame(section: Section, snap: &Snap, disk_graph: DiskGraph) -> (DrawList, Rect) {
     let mut state = AppState::new(W, H);
     state.page = Page::Performance;
     state.section = section;
     state.settings.animations = false;
+    state.settings.disk_graph = disk_graph;
     // One sample per second over a minute: where lone bursts are narrowest.
     state.settings.history = History::S60;
     let draw = build(&mut state, snap, &[], [-1.0, -1.0]);
@@ -151,12 +165,18 @@ fn snapshots() {
         eprintln!("no GPU adapter; skipping snapshots");
         return;
     };
-    for (name, section, snap) in [
-        ("disk", Section::Disk, disk_snap()),
-        ("disk-burst", Section::Disk, disk_burst_snap()),
-        ("cpu", Section::Cpu, cpu_snap()),
+    for (name, section, snap, graph) in [
+        ("disk", Section::Disk, disk_snap(), DiskGraph::Throughput),
+        (
+            "disk-burst",
+            Section::Disk,
+            disk_burst_snap(),
+            DiskGraph::Throughput,
+        ),
+        ("disk-active", Section::Disk, disk_snap(), DiskGraph::Active),
+        ("cpu", Section::Cpu, cpu_snap(), DiskGraph::Throughput),
     ] {
-        let (draw, detail) = frame(section, &snap);
+        let (draw, detail) = frame(section, &snap, graph);
         let rgba = gfx.capture(&draw, 1.0);
         write_png(&dir.join(format!("{name}.png")), W as u32, H as u32, &rgba);
 
@@ -201,4 +221,108 @@ fn snapshots() {
     let rgba = gfx.capture(&draw, 1.0);
     write_png(&dir.join("keys.png"), W as u32, H as u32, &rgba);
     println!("wrote {}", dir.join("keys.png").display());
+
+    // The list pages: a grouped process table with a selection and an open
+    // context menu, the startup list, and the settings sheet.
+    let snap = procs_snap();
+    let startup = fake_startup();
+    for (name, page) in [
+        ("processes", Page::Processes),
+        ("startup", Page::Startup),
+        ("settings", Page::Settings),
+    ] {
+        let mut state = AppState::new(W, H);
+        state.settings.animations = false;
+        state.page = page;
+        state.open_groups.insert(group_id("chrome"));
+        if page == Page::Processes {
+            build(&mut state, &snap, &startup, [-1.0, -1.0]);
+            state.selected.insert(102);
+            open_menu(&mut state, 102, [700.0, 300.0]);
+        }
+        let draw = build(&mut state, &snap, &startup, [-1.0, -1.0]);
+        let rgba = gfx.capture(&draw, 1.0);
+        write_png(&dir.join(format!("{name}.png")), W as u32, H as u32, &rgba);
+        println!("wrote {}", dir.join(format!("{name}.png")).display());
+    }
+
+    // The menu on a collapsed group header.
+    let mut state = AppState::new(W, H);
+    state.settings.animations = false;
+    state.page = Page::Processes;
+    build(&mut state, &snap, &startup, [-1.0, -1.0]);
+    open_group_menu(&mut state, group_id("chrome"), [500.0, 200.0]);
+    let draw = build(&mut state, &snap, &startup, [-1.0, -1.0]);
+    let rgba = gfx.capture(&draw, 1.0);
+    write_png(&dir.join("group-menu.png"), W as u32, H as u32, &rgba);
+    println!("wrote {}", dir.join("group-menu.png").display());
+}
+
+fn procs_snap() -> Snap {
+    let mut snap = base_snap();
+    snap.cpu_per = vec![0.0; 8];
+    let mk = |pid: i32, name: &str, cpu: f32, mem: u64, user: &str| Proc {
+        pid,
+        uid: if user == "root" { 0 } else { 1000 },
+        user: user.into(),
+        name: name.into(),
+        cpu,
+        gpu: if name == "chrome" { 12.0 } else { 0.0 },
+        mem: mem << 20,
+        read_bps: Some(0.0),
+        write_bps: Some(if pid == 102 { 4096.0 } else { 0.0 }),
+        threads: 4,
+        is_user: user != "root",
+        stopped: pid == 300,
+    };
+    snap.procs = vec![
+        mk(101, "chrome", 180.0, 1200, "warexpor"),
+        mk(102, "chrome", 40.0, 300, "warexpor"),
+        mk(103, "chrome", 2.0, 150, "warexpor"),
+        mk(200, "zigx", 9.0, 40, "warexpor"),
+        mk(300, "sleep", 0.0, 1, "warexpor"),
+        mk(1, "systemd", 0.0, 12, "root"),
+        mk(400, "Xwayland", 1.0, 90, "root"),
+        mk(
+            500,
+            "very-long-process-name-that-does-not-fit-anywhere-at-all",
+            0.3,
+            8,
+            "nobody",
+        ),
+    ];
+    snap.disks = vec![Disk {
+        name: "nvme0n1".into(),
+        read_bps: 1024.0,
+        write_bps: 8192.0,
+        busy: 3.0,
+        read_hist: Vec::new(),
+        write_hist: Vec::new(),
+        busy_hist: Vec::new(),
+    }];
+    snap
+}
+
+fn fake_startup() -> Vec<StartupEntry> {
+    let entry = |name: &str, exec: &str, enabled: bool, hypr: Option<usize>| StartupEntry {
+        name: name.into(),
+        exec: exec.into(),
+        path: "/tmp/zigx-fake.desktop".into(),
+        system_path: hypr
+            .is_none()
+            .then(|| "/etc/xdg/autostart/x.desktop".into()),
+        hypr_index: hypr,
+        enabled,
+    };
+    vec![
+        entry("Discord", "discord --start-minimized", true, None),
+        entry(
+            "Polkit agent",
+            "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+            true,
+            None,
+        ),
+        entry("Steam", "steam -silent %U", false, None),
+        entry("v2rayN", "/opt/v2rayn-bin/v2rayN", true, Some(0)),
+    ]
 }

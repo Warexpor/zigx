@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::model::{
@@ -51,10 +52,16 @@ impl Sig {
 pub enum Effect {
     Exit,
     Minimize,
+    /// Second click on the title bar within [`DOUBLE_CLICK`].
+    ToggleMaximize,
     DragWindow,
     Signal(Vec<i32>, Sig),
     OpenLocation(i32),
-    Copy(String),
+    /// Put `text` on the clipboard; `what` names it in the notice.
+    Copy {
+        text: String,
+        what: &'static str,
+    },
     CopyCommand(i32),
     FlipStartup(usize),
     Persist,
@@ -64,6 +71,9 @@ pub enum Effect {
 /// How long an expired notice may stay on screen while it fades out. The
 /// toast normally clears itself sooner, once the fade settles.
 const NOTICE_LINGER: Duration = Duration::from_millis(600);
+
+/// Two title-bar presses this close together maximize instead of dragging.
+pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 pub fn expire(state: &mut AppState) {
     let now = Instant::now();
@@ -108,7 +118,19 @@ pub fn on_press(
         state.search_focused = false;
     }
     match kind {
-        HitKind::DragWindow => vec![Effect::DragWindow],
+        HitKind::DragWindow => {
+            let now = Instant::now();
+            let again = state
+                .bar_pressed
+                .take()
+                .is_some_and(|t| now.duration_since(t) <= DOUBLE_CLICK);
+            if again {
+                vec![Effect::ToggleMaximize]
+            } else {
+                state.bar_pressed = Some(now);
+                vec![Effect::DragWindow]
+            }
+        }
         HitKind::Close => vec![Effect::Exit],
         HitKind::Minimize => vec![Effect::Minimize],
         HitKind::Page(page) => {
@@ -153,7 +175,7 @@ pub fn on_press(
         HitKind::EndTask => end_task(state),
         HitKind::MenuItem(_) | HitKind::MenuPanel => vec![],
         HitKind::Setting(opt, v) => {
-            if let Some((group, row, chip)) = find_setting_hit(state, opt, v) {
+            if let Some((group, row, chip)) = find_setting_hit(state, opt) {
                 state.kb = KbFocus::Setting { group, row, chip };
             }
             set_option(state, opt, v)
@@ -511,15 +533,15 @@ pub fn on_key(
                     move_setting_focus(state, dir, wrap);
                     vec![]
                 }
-                Page::Performance if matches!(key, KeyIn::Home | KeyIn::End) => {
-                    if matches!(key, KeyIn::Home) {
-                        state.perf_scroll = 0.0;
-                    } else {
-                        nudge_scroll(state, 1.0e6);
+                Page::Performance => {
+                    // Nothing to focus here: the arrows scroll the sheet.
+                    match key {
+                        KeyIn::Home => state.perf_scroll = 0.0,
+                        KeyIn::End => nudge_scroll(state, 1.0e6),
+                        _ => nudge_scroll(state, dir as f32 * 48.0),
                     }
                     vec![]
                 }
-                _ => vec![],
             }
         }
         KeyIn::Left | KeyIn::Right => {
@@ -744,16 +766,20 @@ fn set_group_open(state: &mut AppState, open: bool) {
 }
 
 fn open_menu_keyboard(state: &mut AppState) -> Vec<Effect> {
+    let pos = state
+        .menu_anchor
+        .unwrap_or([state.nav_w + 80.0, state.height * 0.4]);
     let pid = match state.kb {
         KbFocus::Proc(pid) => pid,
+        KbFocus::ProcGroup(id) if state.selected.is_empty() => {
+            open_group_menu(state, id, pos);
+            return vec![];
+        }
         _ => match state.selected.iter().next().copied() {
             Some(pid) => pid,
             None => return vec![],
         },
     };
-    let pos = state
-        .menu_anchor
-        .unwrap_or([state.nav_w + 80.0, state.height * 0.4]);
     open_menu(state, pid, pos);
     vec![]
 }
@@ -920,18 +946,14 @@ fn activate_setting(state: &mut AppState) -> Vec<Effect> {
     }
 }
 
-fn find_setting_hit(state: &AppState, opt: Opt, v: u8) -> Option<(usize, usize, usize)> {
+/// Settings row (and chip) that a clicked control belongs to, so keyboard
+/// focus follows the mouse.
+fn find_setting_hit(state: &AppState, opt: Opt) -> Option<(usize, usize, usize)> {
     for row in &state.kb_settings {
         match &row.ctl {
-            KbSettingCtl::Choice {
-                opt: o, current, ..
-            } if *o == opt && *current == v => {
-                return Some((row.group, row.row, 0));
-            }
-            KbSettingCtl::Choice { opt: o, .. } if *o == opt => {
-                return Some((row.group, row.row, 0));
-            }
-            KbSettingCtl::Switch { opt: o, .. } if *o == opt => {
+            KbSettingCtl::Choice { opt: o, .. } | KbSettingCtl::Switch { opt: o, .. }
+                if *o == opt =>
+            {
                 return Some((row.group, row.row, 0));
             }
             KbSettingCtl::Chips(chips) => {
@@ -942,7 +964,6 @@ fn find_setting_hit(state: &AppState, opt: Opt, v: u8) -> Option<(usize, usize, 
             _ => {}
         }
     }
-    let _ = v;
     None
 }
 
@@ -957,6 +978,29 @@ pub fn open_menu(state: &mut AppState, pid: i32, mouse: [f32; 2]) {
     if !state.selected.contains(&pid) {
         select_proc(state, pid, false, false);
     }
+    let pids = state.selected.iter().copied().collect();
+    show_menu(state, pids, None, mouse);
+}
+
+/// Open the menu for a whole program group. The selection clears and the
+/// header takes focus, so the highlighted row is again what the menu acts on.
+pub fn open_group_menu(state: &mut AppState, id: u64, mouse: [f32; 2]) {
+    let Some(pids) = state
+        .group_members
+        .get(&id)
+        .filter(|p| !p.is_empty())
+        .cloned()
+    else {
+        return;
+    };
+    state.selected.clear();
+    clear_pins(state, false);
+    state.anchor = None;
+    state.kb = KbFocus::ProcGroup(id);
+    show_menu(state, pids, Some(id), mouse);
+}
+
+fn show_menu(state: &mut AppState, pids: Vec<i32>, group: Option<u64>, mouse: [f32; 2]) {
     state.armed = None;
     state.search_focused = false;
     // A menu already open fades out where it was while the new one appears.
@@ -964,7 +1008,9 @@ pub fn open_menu(state: &mut AppState, pid: i32, mouse: [f32; 2]) {
     state.menu = Some(ContextMenu {
         x: mouse[0],
         y: mouse[1],
-        pids: state.selected.iter().copied().collect(),
+        pids,
+        group,
+        group_open: group.is_some_and(|g| state.open_groups.contains(&g)),
         opened: Instant::now(),
         items: Vec::new(),
         focus: None,
@@ -1009,6 +1055,7 @@ fn menu_action(state: &mut AppState, action: MenuAction) -> Vec<Effect> {
         return vec![];
     };
     let pids = menu.pids.clone();
+    let group = menu.group;
     if action == MenuAction::ForceKill && !menu.confirm_kill && state.settings.confirm {
         menu.confirm_kill = true;
         return vec![];
@@ -1016,6 +1063,29 @@ fn menu_action(state: &mut AppState, action: MenuAction) -> Vec<Effect> {
     close_menu(state);
     let first = pids.first().copied();
     match action {
+        MenuAction::ToggleGroup => {
+            if let Some(id) = group {
+                if !state.open_groups.insert(id) {
+                    state.open_groups.remove(&id);
+                }
+                state.kb = KbFocus::ProcGroup(id);
+                clear_pins(state, true);
+                state.scroll_into_view = Some(ScrollTarget::ProcGroup(id));
+            }
+            vec![]
+        }
+        MenuAction::SelectGroup => {
+            if let Some(id) = group {
+                // Open the group so the selection it makes is on screen.
+                state.open_groups.insert(id);
+                state.selected = pids.iter().copied().collect();
+                state.anchor = first;
+                clear_pins(state, false);
+                state.kb = KbFocus::ProcGroup(id);
+                state.scroll_into_view = Some(ScrollTarget::ProcGroup(id));
+            }
+            vec![]
+        }
         MenuAction::EndTask => vec![Effect::Signal(pids, Sig::Term)],
         MenuAction::ForceKill => vec![Effect::Signal(pids, Sig::Kill)],
         MenuAction::Suspend => vec![Effect::Signal(pids, Sig::Stop)],
@@ -1023,12 +1093,13 @@ fn menu_action(state: &mut AppState, action: MenuAction) -> Vec<Effect> {
         MenuAction::OpenLocation => first.map(Effect::OpenLocation).into_iter().collect(),
         MenuAction::CopyCommand => first.map(Effect::CopyCommand).into_iter().collect(),
         MenuAction::CopyPid => {
+            let what = if pids.len() == 1 { "PID" } else { "PIDs" };
             let text = pids
                 .iter()
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
-            vec![Effect::Copy(text)]
+            vec![Effect::Copy { text, what }]
         }
     }
 }
@@ -1059,6 +1130,7 @@ fn set_option(state: &mut AppState, opt: Opt, v: u8) -> Vec<Effect> {
         Opt::Curve => pick(&mut s.curve, v),
         Opt::Fill => s.fill = on,
         Opt::Grid => s.grid = on,
+        Opt::DiskGraph => pick(&mut s.disk_graph, v),
         Opt::Speed => {
             // The trailing segment is Pause; picking a speed also resumes.
             if (v as usize) < Speed::ALL.len() {
@@ -1264,31 +1336,48 @@ fn sync_pins(state: &mut AppState) {
     }
 }
 
+/// Delete, Enter while armed, or the End task pill. Acts on the selection, or
+/// with nothing selected, on every member of the focused group header.
 fn end_task(state: &mut AppState) -> Vec<Effect> {
-    if state.selected.is_empty() {
+    let group = match state.kb {
+        KbFocus::ProcGroup(id) if state.selected.is_empty() => state.group_members.get(&id),
+        _ => None,
+    };
+    let is_group = group.is_some();
+    let targets: BTreeSet<i32> = match group {
+        Some(members) => members.iter().copied().collect(),
+        None => state.selected.clone(),
+    };
+    if targets.is_empty() {
         return vec![];
     }
     if !state.settings.confirm {
         state.armed = None;
-        return vec![Effect::Signal(
-            state.selected.iter().copied().collect(),
-            Sig::Term,
-        )];
+        return vec![Effect::Signal(targets.into_iter().collect(), Sig::Term)];
     }
     let now = Instant::now();
     if let Some(armed) = &state.armed {
-        if armed.until > now && armed.pids == state.selected {
-            let pids: Vec<i32> = state.selected.iter().copied().collect();
+        if armed.until > now && armed.pids == targets {
             state.armed = None;
-            return vec![Effect::Signal(pids, Sig::Term)];
+            return vec![Effect::Signal(targets.into_iter().collect(), Sig::Term)];
         }
     }
+    let n = targets.len();
     state.armed = Some(crate::model::Armed {
-        until: now + Duration::from_secs(4),
-        pids: state.selected.clone(),
+        until: now + ARM_FOR,
+        pids: targets,
     });
+    // The End task pill shows an armed selection; a group has no pill, so say it.
+    if is_group {
+        return vec![Effect::Notify(format!(
+            "Press Delete again to end {n} processes"
+        ))];
+    }
     vec![]
 }
+
+/// How long a first End task press waits for its confirming second.
+const ARM_FOR: Duration = Duration::from_secs(4);
 
 /// Signal each PID, skipping init and ZIGX itself. Returns how many succeeded.
 pub fn send_signal(pids: &[i32], sig: Sig) -> usize {
@@ -1363,6 +1452,95 @@ mod tests {
         assert!(matches!(second.as_slice(), [Effect::Signal(p, Sig::Kill)] if p == &vec![10]));
         assert!(state.menu.is_none());
         assert!(state.menu_ghost.is_some(), "a closed menu fades out");
+    }
+
+    const GROUP: u64 = 7;
+
+    fn group_state() -> AppState {
+        let mut state = menu_state();
+        state.page = Page::Processes;
+        state.group_members.insert(GROUP, vec![20, 30]);
+        state
+    }
+
+    #[test]
+    fn group_menu_acts_on_every_member_and_drops_the_selection() {
+        let mut state = group_state();
+        state.selected.insert(10);
+        open_group_menu(&mut state, GROUP, [5.0, 5.0]);
+        let menu = state.menu.as_ref().unwrap();
+        assert_eq!(menu.pids, vec![20, 30]);
+        assert_eq!(menu.group, Some(GROUP));
+        assert!(
+            state.selected.is_empty(),
+            "the header is what is highlighted"
+        );
+        assert!(matches!(state.kb, KbFocus::ProcGroup(GROUP)));
+
+        let kill = HitKind::MenuItem(MenuAction::ForceKill);
+        on_press(&mut state, kill, false, false, [0.0, 0.0]);
+        let fx = on_press(&mut state, kill, false, false, [0.0, 0.0]);
+        assert!(matches!(fx.as_slice(), [Effect::Signal(p, Sig::Kill)] if p == &vec![20, 30]));
+
+        open_group_menu(&mut state, GROUP, [5.0, 5.0]);
+        let end = HitKind::MenuItem(MenuAction::EndTask);
+        let fx = on_press(&mut state, end, false, false, [0.0, 0.0]);
+        assert!(matches!(fx.as_slice(), [Effect::Signal(p, Sig::Term)] if p == &vec![20, 30]));
+    }
+
+    #[test]
+    fn unknown_group_opens_no_menu() {
+        let mut state = group_state();
+        open_group_menu(&mut state, GROUP + 1, [5.0, 5.0]);
+        assert!(state.menu.is_none());
+    }
+
+    #[test]
+    fn group_menu_expands_and_selects() {
+        let mut state = group_state();
+        open_group_menu(&mut state, GROUP, [5.0, 5.0]);
+        assert!(!state.menu.as_ref().unwrap().group_open);
+        let toggle = HitKind::MenuItem(MenuAction::ToggleGroup);
+        on_press(&mut state, toggle, false, false, [0.0, 0.0]);
+        assert!(state.open_groups.contains(&GROUP));
+        assert!(state.menu.is_none());
+
+        state.open_groups.clear();
+        open_group_menu(&mut state, GROUP, [5.0, 5.0]);
+        let select = HitKind::MenuItem(MenuAction::SelectGroup);
+        on_press(&mut state, select, false, false, [0.0, 0.0]);
+        assert!(state.open_groups.contains(&GROUP), "selection is shown");
+        assert_eq!(
+            state.selected.iter().copied().collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+    }
+
+    #[test]
+    fn menu_key_on_a_group_header_opens_the_group_menu() {
+        let mut state = group_state();
+        state.kb = KbFocus::ProcGroup(GROUP);
+        on_key(&mut state, KeyIn::Menu, false, false, false);
+        assert_eq!(state.menu.as_ref().unwrap().group, Some(GROUP));
+    }
+
+    #[test]
+    fn delete_on_a_group_header_ends_the_group_after_confirming() {
+        let mut state = group_state();
+        state.kb = KbFocus::ProcGroup(GROUP);
+        let fx = on_key(&mut state, KeyIn::Delete, false, false, false);
+        assert!(
+            matches!(fx.as_slice(), [Effect::Notify(_)]),
+            "arming says so"
+        );
+        let fx = on_key(&mut state, KeyIn::Delete, false, false, false);
+        assert!(matches!(fx.as_slice(), [Effect::Signal(p, Sig::Term)] if p == &vec![20, 30]));
+
+        // A selection still wins over the focused header.
+        state.selected.insert(10);
+        state.settings.confirm = false;
+        let fx = on_key(&mut state, KeyIn::Delete, false, false, false);
+        assert!(matches!(fx.as_slice(), [Effect::Signal(p, Sig::Term)] if p == &vec![10]));
     }
 
     #[test]
@@ -1472,7 +1650,7 @@ mod tests {
         on_key(&mut state, KeyIn::Down, false, false, false);
         on_key(&mut state, KeyIn::Down, false, false, false);
         let fx = on_key(&mut state, KeyIn::Enter, false, false, false);
-        assert!(matches!(fx.as_slice(), [Effect::Copy(t)] if t == "10"));
+        assert!(matches!(fx.as_slice(), [Effect::Copy { text, what: "PID" }] if text == "10"));
     }
 
     #[test]
@@ -1676,7 +1854,7 @@ mod tests {
     }
 
     #[test]
-    fn performance_arrows_cycle_sections() {
+    fn performance_arrows_cycle_sections_and_scroll() {
         let mut state = menu_state();
         state.page = Page::Performance;
         state.section = Section::Cpu;
@@ -1684,6 +1862,12 @@ mod tests {
         assert_eq!(state.section, Section::Memory);
         on_key(&mut state, KeyIn::Left, false, false, false);
         assert_eq!(state.section, Section::Cpu);
+        on_key(&mut state, KeyIn::Down, false, false, false);
+        assert!(state.perf_scroll > 0.0);
+        on_key(&mut state, KeyIn::Up, false, false, false);
+        assert_eq!(state.perf_scroll, 0.0);
+        on_key(&mut state, KeyIn::Up, false, false, false);
+        assert_eq!(state.perf_scroll, 0.0, "never scrolls above the top");
     }
 
     #[test]

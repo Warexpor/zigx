@@ -16,14 +16,15 @@ mod startup;
 
 pub use anim::{Spring, ZOOM};
 pub use frame::{
-    animating, build, hit_at, wake_at, DrawList, Hit, HitKind, Label, Layer, Rect, Slab, Stroke,
+    animating, build, group_id, hit_at, wake_at, DrawList, Hit, HitKind, Label, Layer, Rect, Slab,
+    Stroke,
 };
 pub use interact::{
     clear_selection, close_menu, end_hold, expire, note_drag_origin, on_key, on_move, on_press,
-    on_release, on_wheel, open_menu, send_signal, Effect, KeyIn, Sig,
+    on_release, on_wheel, open_group_menu, open_menu, send_signal, Effect, KeyIn, Sig,
 };
 pub use model::*;
 pub use persist::{load_ui, save_ui, save_ui_bg};
 pub use sample::{spawn, spawn_later, Hub};
-pub use settings::{load_settings, History, Settings};
+pub use settings::{load_settings, DiskGraph, History, Settings};
 pub use startup::{load_startup, write_enabled, write_hypr_enabled};

@@ -125,7 +125,7 @@ fn start(period_ms: u64, wake: impl Fn() + Send + 'static, open: bool) -> Hub {
                 let snap = engine.tick(ms);
                 {
                     let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-                    *guard = Arc::new(snap);
+                    *guard = snap;
                 }
                 wake();
                 let now = Instant::now();
@@ -158,6 +158,14 @@ struct ProcPrev {
     io_denied: bool,
 }
 
+/// Graph rings for one disk.
+#[derive(Default)]
+struct DiskHist {
+    read: VecDeque<f32>,
+    write: VecDeque<f32>,
+    busy: VecDeque<f32>,
+}
+
 pub struct Engine {
     primed: bool,
     prev_at: Instant,
@@ -167,13 +175,14 @@ pub struct Engine {
     cpu_model: String,
     prev_cpu: Vec<(u64, u64)>,
     prev_proc: HashMap<i32, ProcPrev>,
-    prev_disk: HashMap<String, (u64, u64)>,
+    /// Sectors read, sectors written, busy ms.
+    prev_disk: HashMap<String, (u64, u64, u64)>,
     prev_net: HashMap<String, (u64, u64)>,
     cpu_hist: VecDeque<f32>,
     cpu_per_hist: Vec<VecDeque<f32>>,
     mem_hist: VecDeque<f32>,
     swap_hist: VecDeque<f32>,
-    disk_hist: HashMap<String, (VecDeque<f32>, VecDeque<f32>)>,
+    disk_hist: HashMap<String, DiskHist>,
     net_hist: HashMap<String, (VecDeque<f32>, VecDeque<f32>)>,
     gpu_hist: Vec<VecDeque<f32>>,
     users: HashMap<u32, String>,
@@ -185,7 +194,7 @@ pub struct Engine {
     last_cpu_per: Vec<f32>,
     /// Last published snapshot. Republished unchanged when a tick arrives too
     /// soon to form an honest rate, so counters are not eaten.
-    last_snap: Option<Snap>,
+    last_snap: Option<Arc<Snap>>,
     cached_proc_gpu: HashMap<i32, f32>,
     sample_avg: f32,
     hist_at: Instant,
@@ -245,7 +254,9 @@ impl Engine {
         self.primed = false;
     }
 
-    pub fn tick(&mut self, period_ms: u64) -> Snap {
+    /// One sample. Shared, so the hub publishes it without copying the
+    /// process table again.
+    pub fn tick(&mut self, period_ms: u64) -> Arc<Snap> {
         self.align_period(period_ms);
         let started = Instant::now();
         let now = Instant::now();
@@ -343,7 +354,7 @@ impl Engine {
             self.sample_avg * 0.8 + ms * 0.2
         };
 
-        let snap = Snap {
+        let snap = Arc::new(Snap {
             cpu_model: self.cpu_model.clone(),
             cpu_total,
             cpu_per,
@@ -373,8 +384,8 @@ impl Engine {
             sample_ms: self.sample_avg,
             hist_at: self.hist_at,
             hist_seq: self.hist_seq,
-        };
-        self.last_snap = Some(snap.clone());
+        });
+        self.last_snap = Some(Arc::clone(&snap));
         snap
     }
 
@@ -420,7 +431,7 @@ impl Engine {
         m
     }
 
-    fn read_disks(&mut self) -> Vec<(String, u64, u64)> {
+    fn read_disks(&mut self) -> Vec<DiskRaw> {
         let mut out = Vec::new();
         if !slurp(Path::new("/proc/diskstats"), &mut self.text) {
             return out;
@@ -488,8 +499,9 @@ impl Engine {
             if !self.read_proc_file(pid, "stat") {
                 continue;
             }
-            let stat_text = String::from_utf8_lossy(&self.bytes).into_owned();
-            let Some(stat) = parse_proc_stat(&stat_text) else {
+            // Parse straight from the read buffer; the borrow ends before the
+            // next read, so no copy of every stat line per tick.
+            let Some(stat) = parse_proc_stat(&String::from_utf8_lossy(&self.bytes)) else {
                 continue;
             };
             if stat.flags & PF_KTHREAD != 0 {
@@ -696,55 +708,55 @@ impl Engine {
 
     fn finish_disks(
         &mut self,
-        raw: Vec<(String, u64, u64)>,
+        raw: Vec<DiskRaw>,
         dt: f64,
         advance: bool,
         priming: bool,
     ) -> Vec<Disk> {
         let mut out = Vec::new();
         let mut keep = HashSet::new();
-        for (name, sectors_r, sectors_w) in raw {
+        for row in raw {
+            let name = row.name;
             keep.insert(name.clone());
-            let (read_bps, write_bps) = if advance {
-                let rates = if let Some((pr, pw)) = self.prev_disk.get(&name) {
+            let now = (row.sectors_read, row.sectors_written, row.busy_ms);
+            let (read_bps, write_bps, busy) = if advance {
+                let rates = if let Some((pr, pw, pb)) = self.prev_disk.get(&name) {
                     (
-                        (sectors_r.saturating_sub(*pr) as f64) * 512.0 / dt,
-                        (sectors_w.saturating_sub(*pw) as f64) * 512.0 / dt,
+                        (now.0.saturating_sub(*pr) as f64) * 512.0 / dt,
+                        (now.1.saturating_sub(*pw) as f64) * 512.0 / dt,
+                        busy_pct(now.2, *pb, dt),
                     )
                 } else {
-                    (0.0, 0.0)
+                    (0.0, 0.0, 0.0)
                 };
-                self.prev_disk.insert(name.clone(), (sectors_r, sectors_w));
-                let hist = self
-                    .disk_hist
-                    .entry(name.clone())
-                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
-                push_hist(&mut hist.0, rates.0 as f32);
-                push_hist(&mut hist.1, rates.1 as f32);
+                self.prev_disk.insert(name.clone(), now);
+                let hist = self.disk_hist.entry(name.clone()).or_default();
+                push_hist(&mut hist.read, rates.0 as f32);
+                push_hist(&mut hist.write, rates.1 as f32);
+                push_hist(&mut hist.busy, rates.2);
                 rates
             } else if priming {
-                self.prev_disk.insert(name.clone(), (sectors_r, sectors_w));
-                self.disk_hist
-                    .entry(name.clone())
-                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
-                (0.0, 0.0)
+                self.prev_disk.insert(name.clone(), now);
+                self.disk_hist.entry(name.clone()).or_default();
+                (0.0, 0.0, 0.0)
             } else {
-                let hist = self
-                    .disk_hist
-                    .entry(name.clone())
-                    .or_insert_with(|| (VecDeque::new(), VecDeque::new()));
+                let hist = self.disk_hist.entry(name.clone()).or_default();
+                let last = |h: &VecDeque<f32>| h.back().copied().unwrap_or(0.0);
                 (
-                    hist.0.back().copied().unwrap_or(0.0) as f64,
-                    hist.1.back().copied().unwrap_or(0.0) as f64,
+                    last(&hist.read) as f64,
+                    last(&hist.write) as f64,
+                    last(&hist.busy),
                 )
             };
-            let hist = self.disk_hist.get(&name).unwrap();
+            let hist = &self.disk_hist[&name];
             out.push(Disk {
                 name,
                 read_bps,
                 write_bps,
-                read_hist: dump(&hist.0),
-                write_hist: dump(&hist.1),
+                busy,
+                read_hist: dump(&hist.read),
+                write_hist: dump(&hist.write),
+                busy_hist: dump(&hist.busy),
             });
         }
         if advance || priming {
@@ -954,7 +966,17 @@ fn parse_cpu_line(line: &str) -> Option<(u64, u64)> {
     None
 }
 
-fn parse_disk_line(line: &str) -> Option<(String, u64, u64)> {
+/// One `/proc/diskstats` row, cumulative since boot.
+#[derive(Debug, PartialEq)]
+struct DiskRaw {
+    name: String,
+    sectors_read: u64,
+    sectors_written: u64,
+    /// Milliseconds with at least one I/O in flight (`io_ticks`).
+    busy_ms: u64,
+}
+
+fn parse_disk_line(line: &str) -> Option<DiskRaw> {
     let mut it = line.split_whitespace();
     let _major = it.next()?;
     let _minor = it.next()?;
@@ -962,12 +984,27 @@ fn parse_disk_line(line: &str) -> Option<(String, u64, u64)> {
     if !is_physical_disk(name) {
         return None;
     }
+    // reads completed, merged, sectors read, ms reading, writes completed,
+    // merged, sectors written, ms writing, I/Os in flight, ms doing I/O
     let mut nums = [0u64; 8];
     for slot in &mut nums {
         *slot = it.next()?.parse().ok()?;
     }
-    // reads completed, merged, sectors read, ms, writes, merged, sectors written
-    Some((name.to_string(), nums[2], nums[6]))
+    let busy_ms = it.nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    Some(DiskRaw {
+        name: name.to_string(),
+        sectors_read: nums[2],
+        sectors_written: nums[6],
+        busy_ms,
+    })
+}
+
+/// Share of `dt` seconds a disk spent with I/O in flight, in percent.
+fn busy_pct(busy_ms: u64, prev_ms: u64, dt: f64) -> f32 {
+    if dt <= MIN_DT_SECS {
+        return 0.0;
+    }
+    (busy_ms.saturating_sub(prev_ms) as f64 / (dt * 10.0)).clamp(0.0, 100.0) as f32
 }
 
 /// Free and total bytes across distinct mounted local filesystems.
@@ -1057,24 +1094,26 @@ fn path_statvfs(path: &str) -> Option<(u64, u64)> {
     Some((vfs.f_bavail as u64 * fr, vfs.f_blocks as u64 * fr))
 }
 
+/// Whole block devices only: partitions, mapper targets, loop and ram
+/// devices would count the same bytes twice.
 fn is_physical_disk(name: &str) -> bool {
-    if name.starts_with("loop")
-        || name.starts_with("ram")
-        || name.starts_with("dm-")
-        || name.starts_with("zram")
-        || name.starts_with("sr")
-        || name.starts_with("fd")
-    {
-        return false;
-    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let letters = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_lowercase());
     if let Some(rest) = name.strip_prefix("nvme") {
-        return rest.contains('n') && !rest.contains('p');
+        // nvme0n1, not nvme0n1p2 and not the hidden multipath nvme0c0n1.
+        return rest
+            .split_once('n')
+            .is_some_and(|(ctl, ns)| digits(ctl) && digits(ns));
     }
-    if name.starts_with("sd") || name.starts_with("hd") || name.starts_with("vd") {
-        return !name.chars().last().is_some_and(|c| c.is_ascii_digit());
+    if let Some(rest) = name.strip_prefix("mmcblk") {
+        // mmcblk0, not mmcblk0p1 / mmcblk0boot0 / mmcblk0rpmb.
+        return digits(rest);
     }
-    if name.starts_with("mmcblk") {
-        return !name.contains('p');
+    for prefix in ["sd", "hd", "vd", "xvd"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            // sda, sdab; sda1 is a partition.
+            return letters(rest);
+        }
     }
     false
 }
@@ -1377,6 +1416,41 @@ struct NvmlProcSample {
 
 unsafe impl Send for Nvml {}
 
+/// Everything in [`Nvml`] but the library handle, so a failed bind can still
+/// call `nvmlShutdown` through the library before dropping it.
+struct NvmlBound {
+    devices: Vec<*mut std::ffi::c_void>,
+    util: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtil) -> i32,
+    mem: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlMem) -> i32,
+    temp: unsafe extern "C" fn(*mut std::ffi::c_void, i32, *mut u32) -> i32,
+    power: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32) -> i32,
+    clock: unsafe extern "C" fn(*mut std::ffi::c_void, i32, *mut u32) -> i32,
+    enc: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32>,
+    dec: Option<unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32>,
+    proc_util: Option<
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlProcSample, *mut u32, u64) -> i32,
+    >,
+    names: Vec<String>,
+}
+
+impl NvmlBound {
+    fn with_lib(self, lib: libloading::Library) -> Nvml {
+        Nvml {
+            _lib: lib,
+            devices: self.devices,
+            util: self.util,
+            mem: self.mem,
+            temp: self.temp,
+            power: self.power,
+            clock: self.clock,
+            enc: self.enc,
+            dec: self.dec,
+            proc_util: self.proc_util,
+            names: self.names,
+        }
+    }
+}
+
 impl Nvml {
     fn open() -> Option<Self> {
         unsafe {
@@ -1386,6 +1460,22 @@ impl Nvml {
             if init_v2() != 0 {
                 return None;
             }
+            let opened = Self::bind(&lib);
+            if opened.is_none() {
+                // Initialized but unusable (no devices, missing symbol): shut
+                // the driver session down before the library unloads.
+                if let Ok(shutdown) = lib.get::<unsafe extern "C" fn() -> i32>(b"nvmlShutdown\0") {
+                    let _ = shutdown();
+                }
+                return None;
+            }
+            opened.map(|bound| bound.with_lib(lib))
+        }
+    }
+
+    /// Resolve devices and entry points on an initialized library.
+    unsafe fn bind(lib: &libloading::Library) -> Option<NvmlBound> {
+        unsafe {
             let get_count: libloading::Symbol<unsafe extern "C" fn(*mut u32) -> i32> =
                 lib.get(b"nvmlDeviceGetCount_v2\0").ok()?;
             let mut count = 0u32;
@@ -1421,7 +1511,7 @@ impl Nvml {
             if devices.is_empty() {
                 return None;
             }
-            Some(Self {
+            Some(NvmlBound {
                 util: *lib.get(b"nvmlDeviceGetUtilizationRates\0").ok()?,
                 mem: *lib.get(b"nvmlDeviceGetMemoryInfo\0").ok()?,
                 temp: *lib.get(b"nvmlDeviceGetTemperature\0").ok()?,
@@ -1439,7 +1529,6 @@ impl Nvml {
                     .get(b"nvmlDeviceGetProcessUtilization\0")
                     .ok()
                     .map(|s| *s),
-                _lib: lib,
                 devices,
                 names,
             })
@@ -1571,14 +1660,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn disk_active_time_is_busy_ms_over_the_interval() {
+        assert_eq!(busy_pct(1250, 1000, 1.0), 25.0);
+        assert_eq!(busy_pct(3000, 1000, 1.0), 100.0, "clamped at full");
+        assert_eq!(busy_pct(500, 1000, 1.0), 0.0, "counter reset");
+        assert_eq!(busy_pct(1500, 1000, 2.0), 25.0);
+        assert_eq!(busy_pct(1500, 1000, 0.0), 0.0);
+    }
+
+    #[test]
     fn parses_cpu_and_disk_and_stat() {
         let (idle, total) = parse_cpu_line("cpu0 10 0 5 80 5 0 0 0").unwrap();
         assert_eq!(idle, 85);
         assert_eq!(total, 100);
         assert!(parse_disk_line("259 0 nvme0n1 1 0 10 0 1 0 20 0").is_some());
         assert!(parse_disk_line("259 1 nvme0n1p1 1 0 10 0 1 0 20 0").is_none());
+        let row = parse_disk_line("259 0 nvme0n1 1 0 10 0 1 0 20 0 2 750 900").unwrap();
+        assert_eq!(
+            (row.sectors_read, row.sectors_written, row.busy_ms),
+            (10, 20, 750)
+        );
+        // A short row without io_ticks reads as never busy.
+        let short = parse_disk_line("259 0 nvme0n1 1 0 10 0 1 0 20 0").unwrap();
+        assert_eq!(short.busy_ms, 0);
         assert!(!is_physical_disk("sda1"));
         assert!(is_physical_disk("sda"));
+        assert!(is_physical_disk("sdab"));
+        assert!(is_physical_disk("xvda"));
+        assert!(is_physical_disk("nvme1n2"));
+        assert!(!is_physical_disk("nvme0c0n1"), "multipath path device");
+        assert!(is_physical_disk("mmcblk0"));
+        assert!(!is_physical_disk("mmcblk0p1"));
+        assert!(!is_physical_disk("mmcblk0boot0"));
+        assert!(!is_physical_disk("mmcblk0rpmb"));
+        for junk in ["loop0", "ram0", "dm-0", "zram0", "sr0", "fd0", "md127"] {
+            assert!(!is_physical_disk(junk), "{junk}");
+        }
         assert!(is_local_block_source("/dev/mapper/root"));
         assert!(is_local_block_source("/dev/sda1"));
         assert!(!is_local_block_source("/dev/loop0"));

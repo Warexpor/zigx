@@ -171,8 +171,11 @@ pub struct Disk {
     pub name: String,
     pub read_bps: f64,
     pub write_bps: f64,
+    /// Active time: percent of the last interval with I/O in flight.
+    pub busy: f32,
     pub read_hist: Vec<f32>,
     pub write_hist: Vec<f32>,
+    pub busy_hist: Vec<f32>,
 }
 
 #[derive(Clone, Debug)]
@@ -346,16 +349,25 @@ pub enum MenuAction {
     OpenLocation,
     CopyPid,
     CopyCommand,
+    /// Group menu: expand or collapse the group.
+    ToggleGroup,
+    /// Group menu: select every member, opening the group to show them.
+    SelectGroup,
 }
 
-/// Right-click menu on the process list. Acts on `pids`, the selection at the
-/// moment it opened.
+/// Right-click menu on the process list. Acts on `pids`: the selection at the
+/// moment it opened, or every member of a group header.
 #[derive(Clone, Debug)]
 pub struct ContextMenu {
     /// Pointer position at open, design pixels.
     pub x: f32,
     pub y: f32,
     pub pids: Vec<i32>,
+    /// Opened on this group header (hashed name) rather than on process rows.
+    pub group: Option<u64>,
+    /// That group was expanded when the menu opened. Fixed so a fading menu
+    /// keeps its label after Expand or Collapse runs.
+    pub group_open: bool,
     pub opened: Instant,
     /// Actions in display order, set while building the frame.
     pub items: Vec<MenuAction>,
@@ -403,9 +415,13 @@ pub struct AppState {
     pub menu_ghost: Option<ContextMenu>,
     /// Last search keystroke or focus; the caret blinks from here.
     pub typed_at: Instant,
+    /// Last press on the title bar, for double-click to maximize.
+    pub bar_pressed: Option<Instant>,
     /// Program groups the user has expanded in Grouped view (hashed names).
     /// Empty means every group starts collapsed.
     pub open_groups: BTreeSet<u64>,
+    /// Members of each group header in the last frame build, in list order.
+    pub group_members: BTreeMap<u64, Vec<i32>>,
     pub width: f32,
     pub height: f32,
     /// Interface zoom. Layout stays in design pixels; this scales them onto the window.
@@ -674,7 +690,9 @@ impl AppState {
             menu: None,
             menu_ghost: None,
             typed_at: Instant::now(),
+            bar_pressed: None,
             open_groups: BTreeSet::new(),
+            group_members: BTreeMap::new(),
             width,
             height,
             ui_scale: 1.0,

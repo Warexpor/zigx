@@ -259,17 +259,22 @@ pub struct Gfx {
 }
 
 impl Gfx {
-    pub fn new(window: Arc<Window>, event_loop: &winit::event_loop::ActiveEventLoop) -> Self {
+    /// Open the GPU for `window`. The error is a sentence for the user: no
+    /// usable adapter, or a device that would not open.
+    pub fn new(
+        window: Arc<Window>,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> Result<Self, String> {
         // Parse the few families we draw while the device comes up. A full
         // fontconfig walk is hundreds of faces and used to sit on this path.
         let fonts = std::thread::Builder::new()
             .name("zigx-fonts".into())
             .spawn(load_preferred_fonts)
-            .expect("font thread");
-        let (instance, surface, adapter) = open_surface(&window, event_loop);
+            .map_err(|err| format!("font thread: {err}"))?;
+        let (instance, surface, adapter) = open_surface(&window, event_loop)?;
         let (device, queue) =
             pollster::block_on(adapter.request_device(&DeviceDescriptor::default()))
-                .expect("gpu device");
+                .map_err(|err| format!("gpu device: {err}"))?;
 
         let caps = surface.get_capabilities(&adapter);
         // Non-sRGB target on purpose: the theme's alpha tokens are authored
@@ -317,7 +322,14 @@ impl Gfx {
             .join()
             .unwrap_or_else(|err| std::panic::resume_unwind(err));
         let font_system = font_system_from(preferred);
-        Self::with_device(instance, Some(surface), device, queue, config, font_system)
+        Ok(Self::with_device(
+            instance,
+            Some(surface),
+            device,
+            queue,
+            config,
+            font_system,
+        ))
     }
 
     /// Offscreen renderer with the same pipelines, for snapshots. `None` when
@@ -577,7 +589,7 @@ impl Gfx {
         for y in 0..h as usize {
             let line = &data[y * row as usize..][..w as usize * 4];
             // Premultiplied over black is the color channels as stored.
-            for px in line.chunks_exact(4) {
+            for px in line.as_chunks::<4>().0 {
                 out.extend_from_slice(&[px[0], px[1], px[2], 255]);
             }
         }
@@ -978,7 +990,7 @@ const MONO: &[&str] = &[
 fn open_surface(
     window: &Arc<Window>,
     event_loop: &winit::event_loop::ActiveEventLoop,
-) -> (Instance, Surface<'static>, Adapter) {
+) -> Result<(Instance, Surface<'static>, Adapter), String> {
     let display = event_loop.owned_display_handle();
     let mut last = String::from("no backend");
     for vulkan_only in [true, false] {
@@ -1000,11 +1012,11 @@ fn open_surface(
             compatible_surface: Some(&surface),
             apply_limit_buckets: false,
         })) {
-            Ok(adapter) => return (instance, surface, adapter),
+            Ok(adapter) => return Ok((instance, surface, adapter)),
             Err(err) => last = err.to_string(),
         }
     }
-    panic!("gpu adapter: {last}");
+    Err(format!("no GPU adapter ({last})"))
 }
 
 fn font_system_from(preferred: Option<glyphon::fontdb::Database>) -> FontSystem {

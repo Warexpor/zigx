@@ -38,9 +38,19 @@ struct App {
     /// Interface zoom as drawn; glides to `state.ui_scale`.
     zoom: Spring,
     zoom_at: Instant,
+    /// Zoom the window's minimum size was last set for.
+    min_size_for: f32,
+    /// Fully covered or minimized (X11 reports this; Wayland never does).
+    /// Timed animation frames stop while nothing can be seen.
+    occluded: bool,
     gfx: Option<Gfx>,
     window: Option<Arc<Window>>,
 }
+
+/// Smallest window at 100% zoom, in logical pixels. Layout is designed down
+/// to this; the real minimum scales with the zoom so the chrome never spills.
+const MIN_W: f64 = 420.0;
+const MIN_H: f64 = 320.0;
 
 impl App {
     fn new(hub: Hub, state: AppState) -> Self {
@@ -58,9 +68,23 @@ impl App {
             cursor: CursorIcon::Default,
             zoom: Spring::new(state.ui_scale),
             zoom_at: Instant::now(),
+            min_size_for: 0.0,
+            occluded: false,
             state,
             gfx: None,
             window: None,
+        }
+    }
+
+    /// Keep the minimum window size in step with the zoom.
+    fn sync_min_size(&mut self) {
+        let z = self.state.ui_scale;
+        if z == self.min_size_for {
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.set_min_inner_size(Some(LogicalSize::new(MIN_W * z as f64, MIN_H * z as f64)));
+            self.min_size_for = z;
         }
     }
 
@@ -100,6 +124,7 @@ impl App {
 
     fn paint(&mut self) {
         self.step_zoom();
+        self.sync_min_size();
         self.sync_size();
         expire(&mut self.state);
         let snap = self.hub.load();
@@ -140,12 +165,14 @@ impl App {
                         let _ = window.drag_window();
                     }
                 }
+                Effect::ToggleMaximize => {
+                    if let Some(window) = &self.window {
+                        window.set_maximized(!window.is_maximized());
+                    }
+                }
                 Effect::Signal(pids, sig) => self.signal(&pids, sig),
                 Effect::OpenLocation(pid) => self.open_location(pid),
-                Effect::Copy(text) => {
-                    let what = if text.contains(' ') { "PIDs" } else { "PID" };
-                    self.copy(&text, what);
-                }
+                Effect::Copy { text, what } => self.copy(&text, what),
                 Effect::CopyCommand(pid) => match read_cmdline(pid) {
                     Some(cmd) => self.copy(&cmd, "command line"),
                     None => self.notify("Command line is not readable", 4),
@@ -215,11 +242,17 @@ impl App {
     }
 
     fn copy(&mut self, text: &str, what: &str) {
-        let tools: [(&str, &[&str]); 3] = [
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ];
+        const WL: (&str, &[&str]) = ("wl-copy", &[]);
+        const XCLIP: (&str, &[&str]) = ("xclip", &["-selection", "clipboard"]);
+        const XSEL: (&str, &[&str]) = ("xsel", &["--clipboard", "--input"]);
+        // Try the tool for the session first: wl-copy spawns fine under X11,
+        // then fails after the write, which used to read as a success.
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        let tools = if wayland {
+            [WL, XCLIP, XSEL]
+        } else {
+            [XCLIP, XSEL, WL]
+        };
         let mut spawned = false;
         for (bin, args) in tools {
             let child = Command::new(bin)
@@ -309,18 +342,32 @@ impl ApplicationHandler<UserEvent> for App {
         let mut attrs = WindowAttributes::default()
             .with_title("ZIGX")
             .with_inner_size(LogicalSize::new(w, h))
-            .with_min_inner_size(LogicalSize::new(420.0, 320.0))
+            .with_min_inner_size(LogicalSize::new(MIN_W, MIN_H))
             .with_transparent(true)
             .with_decorations(false);
         attrs =
             winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, "zigx", "zigx");
         attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, "zigx", "zigx");
-        let window = Arc::new(event_loop.create_window(attrs).expect("window"));
+        let window = match event_loop.create_window(attrs) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                eprintln!("zigx: cannot create a window: {err}");
+                event_loop.exit();
+                return;
+            }
+        };
         // NVML and the process walk run while the device and fonts come up,
         // so the first frame already has rows. Releasing after that frame
         // flashed an empty list.
         self.hub.release();
-        self.gfx = Some(Gfx::new(window.clone(), event_loop));
+        match Gfx::new(window.clone(), event_loop) {
+            Ok(gfx) => self.gfx = Some(gfx),
+            Err(err) => {
+                eprintln!("zigx: {err}");
+                event_loop.exit();
+                return;
+            }
+        }
         self.window = Some(window);
         self.redraw();
     }
@@ -343,7 +390,8 @@ impl ApplicationHandler<UserEvent> for App {
         let perf_live = self.state.page == Page::Performance
             && !self.state.paused
             && (!self.state.settings.reduced() || animating(&self.state));
-        if perf_live || animating(&self.state) || self.zooming() {
+        let moving = perf_live || animating(&self.state) || self.zooming();
+        if moving && !self.occluded {
             // Keep graph playback and transitions advancing at display rate.
             self.redraw();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
@@ -406,6 +454,9 @@ impl ApplicationHandler<UserEvent> for App {
                             Some(HitKind::Proc { pid }) if self.state.page == Page::Processes => {
                                 open_menu(&mut self.state, pid, self.mouse);
                             }
+                            Some(HitKind::Group(id)) if self.state.page == Page::Processes => {
+                                open_group_menu(&mut self.state, id, self.mouse);
+                            }
                             _ => close_menu(&mut self.state),
                         }
                         self.redraw();
@@ -444,7 +495,12 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 let dy = match delta {
                     MouseScrollDelta::LineDelta(_, y) => -y * 48.0,
-                    MouseScrollDelta::PixelDelta(p) => -p.y as f32,
+                    // Touchpad deltas arrive in physical pixels; the pages
+                    // scroll in design pixels, so a HiDPI or zoomed window
+                    // used to fly twice as far per swipe.
+                    MouseScrollDelta::PixelDelta(p) => {
+                        -p.y as f32 / pixel_scale(&window, self.zoom.value).max(0.1)
+                    }
                 };
                 let [x, y] = self.mouse;
                 let panes = [
@@ -460,8 +516,22 @@ impl ApplicationHandler<UserEvent> for App {
                 on_wheel(&mut self.state, over, dy);
                 self.redraw();
             }
+            WindowEvent::Occluded(hidden) => {
+                self.occluded = hidden;
+                if !hidden {
+                    // Motion paused while covered; pick it up where it is.
+                    self.redraw();
+                }
+            }
             WindowEvent::Focused(false) => {
-                if end_hold(&mut self.state) {
+                // The release for a held key or a dragged splitter goes to
+                // whoever took focus; finish both here so nothing sticks.
+                let held = end_hold(&mut self.state);
+                let effects = on_release(&mut self.state);
+                let dragged = !effects.is_empty();
+                self.apply(effects, event_loop);
+                self.mods = ModifiersState::empty();
+                if held || dragged {
                     self.redraw();
                 }
             }
@@ -555,6 +625,27 @@ fn read_cmdline(pid: i32) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+fn main() {
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+        Ok(event_loop) => event_loop,
+        Err(err) => {
+            eprintln!("zigx: cannot open a display: {err}");
+            std::process::exit(1);
+        }
+    };
+    let proxy = event_loop.create_proxy();
+    let mut state = AppState::new(1240.0, 780.0);
+    load_ui(&mut state);
+    let hub = spawn_later(state.settings.speed.ms(), move || {
+        let _ = proxy.send_event(UserEvent::Sample);
+    });
+    let mut app = App::new(hub, state);
+    if let Err(err) = event_loop.run_app(&mut app) {
+        eprintln!("zigx: event loop failed: {err}");
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::strip_unlinked;
@@ -566,18 +657,4 @@ mod tests {
         let live = strip_unlinked("/usr/bin/foo".into());
         assert_eq!(live, std::path::PathBuf::from("/usr/bin/foo"));
     }
-}
-
-fn main() {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .expect("event loop");
-    let proxy = event_loop.create_proxy();
-    let mut state = AppState::new(1240.0, 780.0);
-    load_ui(&mut state);
-    let hub = spawn_later(state.settings.speed.ms(), move || {
-        let _ = proxy.send_event(UserEvent::Sample);
-    });
-    let mut app = App::new(hub, state);
-    event_loop.run_app(&mut app).expect("run");
 }
